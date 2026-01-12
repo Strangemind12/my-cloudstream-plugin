@@ -1,25 +1,15 @@
-package com.example
+package com.darkdemon
 
-import android.content.Context
-import androidx.appcompat.app.AppCompatActivity
+import com.lagradost.cloudstream3.plugins.BasePlugin
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
-import com.lagradost.cloudstream3.plugins.Plugin
 
 @CloudstreamPlugin
-class ExamplePlugin: Plugin() {
-    private var activity: AppCompatActivity? = null
-
-    override fun load(context: Context) {
-        activity = context as? AppCompatActivity
-
-        // All providers should be added in this manner
-        registerMainAPI(ExampleProvider())
-
-        openSettings = {
-            val frag = BlankFragment(this)
-            activity?.let {
-                frag.show(it.supportFragmentManager, "Frag")
-            }
-        }
+class moviezwapPlugin: BasePlugin() {
+    override fun load() {
+        // All providers should be added in this manner. Please don't edit the providers list directly.
+        registerExtractorAPI(Filelion())
+        registerMainAPI(moviezwapProvider())
+        registerExtractorAPI(StreamwishHG())
+        registerExtractorAPI(mivalyo())
     }
 }
