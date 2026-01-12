@@ -1,4 +1,4 @@
-package com.durgam
+package com.example
 
 import com.lagradost.api.Log
 import com.lagradost.cloudstream3.*
