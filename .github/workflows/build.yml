@@ -9,7 +9,8 @@ on:
   push:
     branches:
       # choose your default branch
-      - Prime
+      - master
+      - main
       - Prime
     paths-ignore:
       - '*.md'
