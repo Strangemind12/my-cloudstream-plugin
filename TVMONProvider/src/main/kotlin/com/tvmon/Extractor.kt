@@ -11,13 +11,13 @@ import android.webkit.CookieManager
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.AcraApplication
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.mapper
-import com.lagradost.cloudstream3.AcraApplication
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.delay
@@ -40,11 +40,10 @@ import kotlin.concurrent.thread
 import kotlin.coroutines.resume
 
 /**
- * Version: v22.4 (Build Fix & Manual WebView)
+ * Version: v22.5 (Context Reference Fix)
  * Modification:
- * 1. [FIX] Removed 'object : WebViewResolver' inheritance (caused build error 42).
- * 2. [NEW] Added 'runWebViewHook' function to manually create and control WebView.
- * 3. [FIX] Solved 'onWebViewCreated' override error by using direct WebView instance.
+ * 1. [FIX] 'app.context' -> 'app' (app itself is the Context).
+ * 2. [FIX] Cleaned up AcraApplication reference logic.
  */
 class BunnyPoorCdn : ExtractorApi() {
     override val name = "TVMON"
@@ -67,7 +66,7 @@ class BunnyPoorCdn : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        println("[TVMON][v22.4] getUrl 호출됨. URL: $url")
+        println("[TVMON][v22.5] getUrl 호출됨. URL: $url")
         extract(url, referer, subtitleCallback, callback)
     }
 
@@ -100,7 +99,6 @@ class BunnyPoorCdn : ExtractorApi() {
         var capturedUrl: String? = cleanUrl
 
         // 2. WebView 후킹 (직접 구현 모드)
-        // c.html URL이 아니거나 토큰이 없으면 WebView를 띄워 획득 시도
         if (!cleanUrl.contains("/c.html")) {
             println("[TVMON] [STEP 2] WebView 직접 실행하여 키 후킹 시도...")
             capturedKeys.clear()
@@ -208,7 +206,6 @@ class BunnyPoorCdn : ExtractorApi() {
         return false
     }
 
-    // [NEW] 수동 WebView 실행 함수 (WebViewResolver 상속 문제 해결)
     private suspend fun runWebViewHook(url: String, referer: String) = suspendCancellableCoroutine<Unit> { cont ->
         val hookScript = """
             (function() {
@@ -225,20 +222,20 @@ class BunnyPoorCdn : ExtractorApi() {
             })();
         """.trimIndent()
 
-        // 메인 스레드에서 WebView 생성
         Handler(Looper.getMainLooper()).post {
             try {
-                // Context 확보 (app.context가 없으면 AcraApplication 사용)
-                val context = AcraApplication.context ?: app.context
+                // [수정] app 객체 자체가 Context이므로 바로 사용
+                val context = try { AcraApplication.context ?: app } catch(e: Exception) { app }
                 val webView = WebView(context)
                 
                 webView.settings.apply {
                     javaScriptEnabled = true
                     domStorageEnabled = true
                     userAgentString = DESKTOP_UA
+                    // 미디어 자동 재생 허용 (필요시)
+                    mediaPlaybackRequiresUserGesture = false
                 }
 
-                // Console.log 납치
                 webView.webChromeClient = object : WebChromeClient() {
                     override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
                         val msg = consoleMessage?.message() ?: ""
@@ -264,12 +261,9 @@ class BunnyPoorCdn : ExtractorApi() {
                 println("[TVMON] Manual WebView 로드 시작: $url")
                 webView.loadUrl(url, mapOf("Referer" to referer))
 
-                // 10초 후 자동 종료 및 코루틴 재개
                 Handler(Looper.getMainLooper()).postDelayed({
                     println("[TVMON] WebView 타임아웃 (10초). 종료합니다.")
-                    try {
-                        webView.destroy()
-                    } catch (e: Exception) {}
+                    try { webView.destroy() } catch (e: Exception) {}
                     if (cont.isActive) cont.resume(Unit)
                 }, 10000)
 
