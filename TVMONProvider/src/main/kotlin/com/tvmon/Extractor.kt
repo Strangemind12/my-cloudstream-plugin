@@ -1,6 +1,5 @@
 package com.tvmon
 
-// [FIX] Context 명시적 임포트 추가
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
@@ -42,10 +41,11 @@ import kotlin.concurrent.thread
 import kotlin.coroutines.resume
 
 /**
- * Version: v22.6 (Context Type Casting Fix)
+ * Version: v22.7 (Master Playlist Fix)
  * Modification:
- * 1. [FIX] Added 'import android.content.Context'.
- * 2. [FIX] Explicitly cast 'app' or 'AcraApplication.context' to 'Context' to avoid 'Any' type inference error.
+ * 1. [FIX] Added logic to detect and parse Master Playlist (#EXT-X-STREAM-INF).
+ * 2. [FIX] Automatically fetches the inner Media Playlist if Master is detected.
+ * 3. [FIX] Improved IV regex to capture variations.
  */
 class BunnyPoorCdn : ExtractorApi() {
     override val name = "TVMON"
@@ -68,7 +68,7 @@ class BunnyPoorCdn : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        println("[TVMON][v22.6] getUrl 호출됨. URL: $url")
+        println("[TVMON][v22.7] getUrl 호출됨. URL: $url")
         extract(url, referer, subtitleCallback, callback)
     }
 
@@ -106,10 +106,8 @@ class BunnyPoorCdn : ExtractorApi() {
             capturedKeys.clear()
             verifiedKey = null
             
-            // 수동 WebView 실행 (Main Thread)
             runWebViewHook(cleanUrl, cleanReferer)
             
-            // WebView 실행 후 수집된 키 확인
             println("[TVMON] 현재까지 수집된 키 후보 개수: ${capturedKeys.size}")
             capturedKeys.forEach { println("[TVMON] [CANDIDATE] 후킹된 키: $it") }
         }
@@ -132,15 +130,35 @@ class BunnyPoorCdn : ExtractorApi() {
                 var response = app.get(requestUrl, headers = headers)
                 var content = response.text.trim()
 
+                // 3-1. HTML 등에서 실제 .m3u8 링크 찾기
                 if (!content.startsWith("#EXTM3U")) {
                     println("[TVMON] 응답이 M3U8이 아님. 내부 링크 검색 중...")
                     Regex("""(https?://[^"']+\.m3u8[^"']*)""").find(content)?.let {
                         requestUrl = it.groupValues[1]
                         println("[TVMON] 실제 M3U8 주소 발견: $requestUrl")
-                        content = app.get(requestUrl, headers = headers).text.trim()
+                        response = app.get(requestUrl, headers = headers)
+                        content = response.text.trim()
                     }
                 }
 
+                // [FIX] 3-2. Master Playlist(다중 화질)인 경우, 하위 m3u8(Media Playlist) 찾기
+                if (content.contains("#EXT-X-STREAM-INF")) {
+                    println("[TVMON] [INFO] Master Playlist 감지됨. 하위 스트림을 탐색합니다.")
+                    // 가장 마지막(보통 최고 화질) 또는 첫 번째 m3u8 링크를 찾음
+                    val subUrlLine = content.lines().lastOrNull { it.isNotBlank() && !it.startsWith("#") }
+                    if (subUrlLine != null) {
+                        val originalUri = try { URI(requestUrl) } catch (e: Exception) { null }
+                        val subUrl = resolveUrl(originalUri, requestUrl, subUrlLine.trim())
+                        println("[TVMON] [INFO] 미디어 플레이리스트로 진입: $subUrl")
+                        
+                        // 하위 m3u8 요청
+                        requestUrl = subUrl
+                        response = app.get(requestUrl, headers = headers)
+                        content = response.text.trim()
+                    }
+                }
+
+                // 3-3. Key7 및 IV 확인
                 val isKey7 = content.lines().any { it.startsWith("#EXT-X-KEY") && it.contains("/v/key7") }
                 println("[TVMON] [CHECK] Key7 암호화 적용 여부: $isKey7")
 
@@ -152,10 +170,13 @@ class BunnyPoorCdn : ExtractorApi() {
                         updateSession(headers)
                     }
 
-                    val ivMatch = Regex("""IV=(0x[0-9a-fA-F]+)""").find(content)
-                    val ivHex = ivMatch?.groupValues?.get(1) ?: "0x00000000000000000000000000000000"
-                    currentIv = ivHex.removePrefix("0x").hexToByteArray()
-                    println("[TVMON] [DATA] 추출된 IV: $ivHex")
+                    // [FIX] IV 정규식 개선 (따옴표 처리 등 유연성 확보)
+                    val ivMatch = Regex("""IV=0x([0-9a-fA-F]+)""").find(content) 
+                        ?: Regex("""IV="0x([0-9a-fA-F]+)"""").find(content)
+                    
+                    val ivHex = ivMatch?.groupValues?.get(1) ?: "00000000000000000000000000000000"
+                    currentIv = ivHex.hexToByteArray()
+                    println("[TVMON] [DATA] 추출된 IV: 0x$ivHex")
 
                     val baseUri = try { URI(requestUrl) } catch (e: Exception) { null }
                     val sb = StringBuilder()
@@ -208,7 +229,6 @@ class BunnyPoorCdn : ExtractorApi() {
         return false
     }
 
-    // [NEW] 수동 WebView 실행 함수 (타입 캐스팅 문제 해결)
     private suspend fun runWebViewHook(url: String, referer: String) = suspendCancellableCoroutine<Unit> { cont ->
         val hookScript = """
             (function() {
@@ -227,8 +247,6 @@ class BunnyPoorCdn : ExtractorApi() {
 
         Handler(Looper.getMainLooper()).post {
             try {
-                // [FIX] Explicit Cast: Any -> Context
-                // try-catch 블록 제거 후 직접 할당 및 캐스팅으로 'Any' 타입 추론 오류 방지
                 val context: Context = (AcraApplication.context ?: app) as Context
                 val webView = WebView(context)
                 
