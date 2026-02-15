@@ -10,12 +10,12 @@ import java.net.URLDecoder
 import java.net.URLEncoder
 
 /**
- * TVMon Provider v1.2
+ * TVMon Provider v1.3
  *
- * [v1.2 수정 사항]
- * 1. CSS Selector 확장: '.mov_list ul li' 외에 '.item' (사용자 제보 소스 대응) 추가
- * 2. 포스터 URL 절대 경로 강제 변환 로직 추가 (/data/... -> https://tvmon.site/data/...)
- * 3. 디버깅 로그 강화 (포스터 감지 및 인코딩 여부 확인용)
+ * [v1.3 수정 사항]
+ * - 상세페이지 포스터 결정 로직 버그 수정 (Critical Fix)
+ * - 사이트가 og:image에 메인 URL(https://tvmon.site)을 넣어두는 경우, 이를 유효한 이미지로 착각하는 문제 해결.
+ * - 메인 URL과 동일한 포스터 주소는 가짜(Invalid)로 처리하고 Fallback(전달받은 포스터)을 사용하도록 강제함.
  */
 class TVMon : MainAPI() {
     override var mainUrl = "https://tvmon.site"
@@ -61,13 +61,11 @@ class TVMon : MainAPI() {
         return try {
             val doc = app.get(url, headers = commonHeaders).document
             
-            // [v1.2 수정] .mov_list ul li 뿐만 아니라 .item (div)도 선택하도록 범위 확장
-            // 사용자 소스 코드: <div class="item">...</div> 대응
+            // .mov_list ul li 뿐만 아니라 .item (div)도 선택하도록 범위 확장
             var elements = doc.select(".mov_list ul li")
             if (elements.isEmpty()) {
                 elements = doc.select(".item")
             }
-            // 그래도 없으면 섞어서 찾기
             if (elements.isEmpty()) {
                 elements = doc.select("li, div.item")
             }
@@ -82,9 +80,6 @@ class TVMon : MainAPI() {
     }
 
     private fun Element.toSearchResponse(): SearchResponse? {
-        // [v1.2 디버깅] 현재 처리 중인 요소 확인 (너무 많으면 주석 처리)
-        // println("[TVMon] Processing element: ${this.html().take(50)}...")
-
         val aTag = this.selectFirst("a.img") ?: return null
         var link = fixUrl(aTag.attr("href"))
         val title = this.selectFirst("a.title")?.text()?.trim() ?: return null
@@ -95,27 +90,21 @@ class TVMon : MainAPI() {
             ?: imgTag?.attr("src")
             ?: ""
 
-        // [v1.2 수정] 포스터 URL이 상대경로(/data/...)인 경우 강제로 절대경로로 변환
-        // fixUrl에만 의존하지 않고 직접 문자열 처리
+        // 포스터 URL이 상대경로(/data/...)인 경우 강제로 절대경로로 변환
         if (rawPoster.startsWith("/")) {
             rawPoster = "$mainUrl$rawPoster"
         }
         val fixedPoster = fixUrl(rawPoster)
 
-        // [v1.2 핵심] URL에 포스터 주소 인코딩해서 붙이기
-        if (fixedPoster.isNotEmpty() && !fixedPoster.contains("no3.png")) { // no3.png(이미지 없음)는 제외
+        // URL에 포스터 주소 인코딩해서 붙이기 (Tunneling)
+        if (fixedPoster.isNotEmpty() && !fixedPoster.contains("no3.png")) {
             try {
                 val encodedPoster = URLEncoder.encode(fixedPoster, "UTF-8")
                 val separator = if (link.contains("?")) "&" else "?"
                 link = "$link${separator}cw_poster=$encodedPoster"
-                
-                // [v1.2 디버깅] 성공적으로 포스터를 URL에 심었는지 확인
-                println("[TVMon] Poster Attached to Link: $title -> $encodedPoster")
             } catch (e: Exception) {
                 e.printStackTrace()
             }
-        } else {
-             println("[TVMon] No valid poster found for: $title (src: $rawPoster)")
         }
 
         val type = determineTypeFromUrl(link)
@@ -149,7 +138,6 @@ class TVMon : MainAPI() {
         val searchUrl = "$mainUrl/search?stx=$query"
         val doc = app.get(searchUrl, headers = commonHeaders).document
         
-        // 검색 결과에서도 .item을 찾을 수 있도록 선택자 확장
         var items = doc.select("ul#mov_con_list li").mapNotNull { it.toSearchResponse() }
         if (items.isEmpty()) {
              items = doc.select(".mov_list ul li, .item").mapNotNull { it.toSearchResponse() }
@@ -165,7 +153,6 @@ class TVMon : MainAPI() {
         var realUrl = url
 
         try {
-            // cw_poster 파라미터 추출 정규식
             val regex = Regex("[?&]cw_poster=([^&]+)")
             val match = regex.find(url)
             if (match != null) {
@@ -173,20 +160,15 @@ class TVMon : MainAPI() {
                 passedPoster = URLDecoder.decode(encoded, "UTF-8")
                 realUrl = url.replace(match.value, "")
                 
-                // URL 정제 (끝에 남은 ? 또는 & 제거)
                 if (realUrl.endsWith("?") || realUrl.endsWith("&")) {
                     realUrl = realUrl.dropLast(1)
                 }
                 println("[TVMon] Link에서 포스터 복원 성공: $passedPoster")
-            } else {
-                println("[TVMon] Link에 포스터 정보 없음")
             }
         } catch (e: Exception) {
             e.printStackTrace()
-            println("[TVMon] 포스터 디코딩 에러: ${e.message}")
         }
 
-        // 2. 상세 페이지 파싱
         val doc = app.get(realUrl, headers = commonHeaders).document
 
         val h3Element = doc.selectFirst("#bo_v_movinfo h3")
@@ -211,23 +193,29 @@ class TVMon : MainAPI() {
             }
         }
 
-        // 3. 상세 페이지 내 포스터 찾기
+        // 2. 포스터 결정 로직 (v1.3 버그 수정: 가짜 이미지 필터링 강화)
         var poster = doc.selectFirst("#bo_v_poster img")?.attr("src")
             ?: doc.selectFirst("meta[property='og:image']")?.attr("content")
             ?: ""
 
-        // [v1.2 핵심] 상세페이지 포스터가 없거나, 'no image' 아이콘인 경우 => 전달받은 포스터(passedPoster) 사용
-        val isInvalidPoster = poster.isEmpty() || poster.contains("no3.png") || poster.contains("no_image")
+        // [v1.3 핵심 수정] 
+        // poster가 "https://tvmon.site" (메인 URL)인 경우 이미지가 아니므로 무효(Invalid) 처리해야 함.
+        val isInvalidPoster = poster.isEmpty() 
+            || poster.contains("no3.png") 
+            || poster.contains("no_image")
+            || poster == mainUrl          // "https://tvmon.site"
+            || poster == "$mainUrl/"      // "https://tvmon.site/"
+            || poster.endsWith("/")       // 디렉토리 경로인 경우
         
         if (isInvalidPoster) {
             if (passedPoster != null) {
-                println("[TVMon] 상세페이지 포스터가 유효하지 않음($poster) -> 전달받은 포스터 적용: $passedPoster")
+                println("[TVMon] 상세페이지 포스터가 무효함($poster) -> 전달받은 포스터 적용: $passedPoster")
                 poster = passedPoster
             } else {
-                println("[TVMon] 상세페이지 포스터 없음 & 전달받은 포스터도 없음")
+                println("[TVMon] 상세페이지 포스터 없고, 전달받은 포스터도 없음.")
             }
         } else {
-             println("[TVMon] 상세페이지 포스터 사용: $poster")
+             println("[TVMon] 상세페이지 포스터 유효함: $poster")
         }
 
         val infoList = doc.select(".bo_v_info dd").map { it.text().trim().replace("개봉년도:", "공개일:") }
@@ -310,7 +298,6 @@ class TVMon : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // 기존 코드와 동일 (변경 없음)
         val doc = app.get(data, headers = commonHeaders).document
         val thumbnailHint = extractThumbnailHint(doc)
         val iframe = doc.selectFirst("iframe#view_iframe")
