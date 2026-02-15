@@ -1,6 +1,7 @@
 package com.tvmon
 
 import android.annotation.SuppressLint
+import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.webkit.JavascriptInterface
@@ -9,7 +10,8 @@ import android.webkit.WebViewClient
 import android.webkit.CookieManager
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
-import com.lagradost.cloudstream3.utils.* // 요청하신 import 적용
+import com.lagradost.cloudstream3.AcraApplication // [중요] 전역 Context 접근용
+import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
@@ -34,10 +36,10 @@ import kotlin.concurrent.thread
 import kotlin.coroutines.resume
 
 /**
- * Version: v23.2 (Build Fix: Use app.context)
+ * Version: v23.3 (Build Fix: Correct Context Access)
  * Modification:
- * 1. [FIX] 'MainActivity.activity' 참조 불가 에러 해결 -> 'app.context' 사용.
- * 2. [IMPORT] 'com.lagradost.cloudstream3.utils.*' 선언.
+ * 1. [FIX] 'app.context'는 존재하지 않으므로 'AcraApplication.context'로 변경하여 빌드 에러 해결.
+ * 2. [IMPORT] 'AcraApplication' 임포트 추가.
  * 3. [KEEP] Native WebView Hooking 기능 유지.
  */
 class BunnyPoorCdn : ExtractorApi() {
@@ -60,7 +62,7 @@ class BunnyPoorCdn : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        println("[TVMON][v23.2] getUrl 호출됨. URL: $url")
+        println("[TVMON][v23.3] getUrl 호출됨. URL: $url")
         extract(url, referer, subtitleCallback, callback)
     }
 
@@ -204,15 +206,17 @@ class BunnyPoorCdn : ExtractorApi() {
     private suspend fun runNativeWebViewHook(url: String, referer: String): String? {
         return withContext(Dispatchers.Main) { 
             suspendCancellableCoroutine<String?> { continuation ->
-                // [FIX] app.context 사용 (Application Context)
-                val context = app.context
+                // [FIX] app.context 대신 AcraApplication.context 사용 (전역 컨텍스트)
+                // AcraApplication.context는 nullable이므로 안전하게 처리
+                val context = AcraApplication.context
+                
                 if (context == null) {
-                    println("[NativeHook] [FATAL] Context 참조 불가.")
+                    println("[NativeHook] [FATAL] Context 참조 불가 (AcraApplication.context is null).")
                     continuation.resume(null)
                     return@suspendCancellableCoroutine
                 }
 
-                // Application Context로 WebView 생성 (UI 조작 없는 Headless 모드에 적합)
+                // Context가 확실하므로 WebView 생성 가능
                 val webView = WebView(context)
                 
                 webView.settings.apply {
