@@ -1,6 +1,11 @@
 package com.tvmon
 
 import android.util.Base64
+import android.webkit.ConsoleMessage
+import android.webkit.WebChromeClient
+import android.webkit.WebView
+import android.webkit.CookieManager
+import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.ExtractorApi
@@ -9,8 +14,6 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.network.WebViewResolver 
-import android.webkit.CookieManager
-import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.mapper
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.delay
@@ -30,11 +33,11 @@ import javax.crypto.spec.SecretKeySpec
 import kotlin.concurrent.thread
 
 /**
- * Version: v22.2 (Extreme Debug Logging & Multi-Key Verification)
+ * Version: v22.3 (WebView Hooking Logic Fix)
  * Modification:
- * 1. [DEBUG] Added println to every step: IV extraction, Key capture, Verification results.
- * 2. [FIX] Ensured byte retrieval uses body.bytes() to prevent build errors.
- * 3. [KEEP] Preserved all Key7/Proxy/Non-Proxy logic.
+ * 1. [FIX] WebViewResolver: 'c.html' 대신 'favicon.ico' 등을 타겟으로 하여 WebView 수명 연장.
+ * 2. [FIX] WebChromeClient: onConsoleMessage를 구현하여 JS console.log를 Kotlin으로 납치.
+ * 3. [KEEP] Proxy & Decryption Logic preserved.
  */
 class BunnyPoorCdn : ExtractorApi() {
     override val name = "TVMON"
@@ -58,7 +61,7 @@ class BunnyPoorCdn : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        println("[TVMON][v22.2] getUrl 호출됨. URL: $url")
+        println("[TVMON][v22.3] getUrl 호출됨. URL: $url")
         extract(url, referer, subtitleCallback, callback)
     }
 
@@ -94,7 +97,7 @@ class BunnyPoorCdn : ExtractorApi() {
             println("[TVMON] 입력된 URL이 이미 c.html 타겟입니다.")
         }
 
-        // 2. WebView 후킹 모드
+        // 2. WebView 후킹 모드 (수정됨)
         if (capturedUrl == null) {
             println("[TVMON] [STEP 2] WebView를 통한 키 후킹 시작...")
             val hookScript = """
@@ -112,15 +115,43 @@ class BunnyPoorCdn : ExtractorApi() {
                 })();
             """.trimIndent()
 
-            val resolver = WebViewResolver(
-                interceptUrl = Regex("""/c\.html"""), 
-                useOkhttp = false
-            )
+            // [핵심 수정] 익명 클래스로 WebViewResolver 확장
+            val resolver = object : WebViewResolver(
+                // c.html이 로딩된 후 나중에 호출되는 리소스를 타겟으로 설정하여 WebView가 바로 꺼지는 것을 방지
+                Regex("""/favicon\.ico|/api/key-share\.php"""), 
+                false
+            ) {
+                override fun onWebViewCreated(webView: WebView) {
+                    super.onWebViewCreated(webView)
+                    // JS 실행 권한 부여
+                    webView.settings.javaScriptEnabled = true
+                    webView.settings.domStorageEnabled = true
+                    
+                    // console.log 가로채기 설정
+                    webView.webChromeClient = object : WebChromeClient() {
+                        override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
+                            val msg = consoleMessage?.message() ?: ""
+                            
+                            // JS Hook에서 보낸 메시지 필터링
+                            if (msg.startsWith("CapturedKeyHex:")) {
+                                val key = msg.removePrefix("CapturedKeyHex:")
+                                capturedKeys.add(key)
+                                println("[TVMON] [HOOK] ★★★ 키 캡처 성공: $key")
+                            } else if (msg.contains("[JS-HOOK]")) {
+                                println("[TVMON] [HOOK] JS 스크립트 정상 주입됨.")
+                            }
+                            return super.onConsoleMessage(consoleMessage)
+                        }
+                    }
+                }
+            }
             
             try {
                 capturedKeys.clear()
                 verifiedKey = null
                 println("[TVMON] WebView Resolver 실행...")
+                
+                // CloudStream의 WebView 실행 (타임아웃까지 대기하거나 인터셉트 URL 발견 시 종료)
                 val response = app.get(
                     url = cleanUrl, 
                     headers = mapOf("Referer" to cleanReferer, "User-Agent" to DESKTOP_UA), 
@@ -128,15 +159,22 @@ class BunnyPoorCdn : ExtractorApi() {
                 )
                 
                 println("[TVMON] [WAIT] 키 후보군 수집을 위해 6초간 대기합니다...")
-                delay(6000) 
+                // WebViewResolver가 URL을 못 찾아서 타임아웃까지 기다릴 수 있으므로 
+                // 별도의 긴 딜레이는 필요 없을 수 있으나, 안전장치로 유지 혹은 조정 가능.
+                // 여기서는 기존 로직대로 유지하되 WebView가 닫혔는지 여부에 의존함.
+                
                 println("[TVMON] 현재까지 수집된 키 후보 개수: ${capturedKeys.size}")
                 capturedKeys.forEach { println("[TVMON] [CANDIDATE] 후킹된 키: $it") }
                 
+                // 만약 응답 URL이 c.html이라면 캡처
                 if (response.url.contains("/c.html")) {
                     capturedUrl = response.url
                     println("[TVMON] [STEP 2-1] c.html URL 캡처 완료: $capturedUrl")
                 }
-            } catch (e: Exception) { println("[TVMON] [ERROR] WebView 처리 중 예외 발생: ${e.message}") }
+            } catch (e: Exception) { 
+                println("[TVMON] [ERROR] WebView 처리 중 예외 발생 (타임아웃 등): ${e.message}") 
+                // 타임아웃이 발생해도 키가 수집되었으면 진행 가능
+            }
         }
 
         if (capturedUrl != null) {
@@ -153,7 +191,7 @@ class BunnyPoorCdn : ExtractorApi() {
 
             try {
                 println("[TVMON] [STEP 3] M3U8 메인 파일 요청 중...")
-                var requestUrl = capturedUrl.substringBefore("#")
+                var requestUrl = capturedUrl!!.substringBefore("#")
                 var response = app.get(requestUrl, headers = headers)
                 var content = response.text.trim()
 
