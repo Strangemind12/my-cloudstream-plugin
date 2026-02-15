@@ -9,11 +9,10 @@ import android.webkit.WebViewClient
 import android.webkit.CookieManager
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.utils.* // 요청하신 import 적용
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
-import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.MainActivity
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.mapper
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -35,11 +34,11 @@ import kotlin.concurrent.thread
 import kotlin.coroutines.resume
 
 /**
- * Version: v23.1 (Build Fix & Native Hooking)
+ * Version: v23.2 (Build Fix: Use app.context)
  * Modification:
- * 1. [FIX] 빌드 에러 원인인 'WebViewResolver' 및 'jsSnippet' 제거.
- * 2. [NEW] 'runNativeWebViewHook' 도입: 안드로이드 Native WebView를 직접 제어하여 키 추출.
- * 3. [KEEP] 추출된 키를 이용한 Proxy 서버 및 재생 로직 유지.
+ * 1. [FIX] 'MainActivity.activity' 참조 불가 에러 해결 -> 'app.context' 사용.
+ * 2. [IMPORT] 'com.lagradost.cloudstream3.utils.*' 선언.
+ * 3. [KEEP] Native WebView Hooking 기능 유지.
  */
 class BunnyPoorCdn : ExtractorApi() {
     override val name = "TVMON"
@@ -61,7 +60,7 @@ class BunnyPoorCdn : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        println("[TVMON][v23.1] getUrl 호출됨. URL: $url")
+        println("[TVMON][v23.2] getUrl 호출됨. URL: $url")
         extract(url, referer, subtitleCallback, callback)
     }
 
@@ -90,7 +89,7 @@ class BunnyPoorCdn : ExtractorApi() {
 
         val targetUrl = cleanUrl
         
-        // 2. Native WebView Hooking (빌드 에러 없이 키 추출하는 핵심 로직)
+        // 2. Native WebView Hooking
         println("[TVMON] [STEP 2] Native WebView Hooking 시작...")
         val extractedKeyHex = runNativeWebViewHook(targetUrl, cleanReferer)
         
@@ -203,17 +202,18 @@ class BunnyPoorCdn : ExtractorApi() {
 
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun runNativeWebViewHook(url: String, referer: String): String? {
-        // UI 스레드에서 WebView 생성 필수
         return withContext(Dispatchers.Main) { 
             suspendCancellableCoroutine<String?> { continuation ->
-                val activity = MainActivity.activity
-                if (activity == null) {
-                    println("[NativeHook] [FATAL] Activity 참조 불가.")
+                // [FIX] app.context 사용 (Application Context)
+                val context = app.context
+                if (context == null) {
+                    println("[NativeHook] [FATAL] Context 참조 불가.")
                     continuation.resume(null)
                     return@suspendCancellableCoroutine
                 }
 
-                val webView = WebView(activity)
+                // Application Context로 WebView 생성 (UI 조작 없는 Headless 모드에 적합)
+                val webView = WebView(context)
                 
                 webView.settings.apply {
                     javaScriptEnabled = true
@@ -223,7 +223,6 @@ class BunnyPoorCdn : ExtractorApi() {
 
                 var isResumed = false
                 
-                // 브릿지 설정: JS에서 window.TVMONBridge.sendKey() 호출 시 동작
                 val bridge = JSBridge { key ->
                     if (!isResumed) {
                         isResumed = true
@@ -268,7 +267,6 @@ class BunnyPoorCdn : ExtractorApi() {
                 val headers = mapOf("Referer" to referer)
                 webView.loadUrl(url, headers)
 
-                // 15초 타임아웃
                 Handler(Looper.getMainLooper()).postDelayed({
                     if (!isResumed) {
                         println("[NativeHook] [TIMEOUT] 시간 초과.")
