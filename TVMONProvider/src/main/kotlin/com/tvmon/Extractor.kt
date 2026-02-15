@@ -283,11 +283,11 @@ class BunnyPoorCdn : ExtractorApi() {
                 // [v23.5] 대기 시간 25초로 증설
                 Handler(Looper.getMainLooper()).postDelayed({
                     if (cont.isActive) {
-                        println("[TVMON] WebView 종료 (25초 경과). 확보된 키 후보: ${capturedKeys.size}개")
+                        println("[TVMON] WebView 종료 (5초 경과). 확보된 키 후보: ${capturedKeys.size}개")
                         try { webView.destroy() } catch (e: Exception) {}
                         cont.resume(detectedCUrl)
                     }
-                }, 25000)
+                }, 5000)
 
             } catch (e: Exception) {
                 if (cont.isActive) cont.resume(null)
