@@ -6,7 +6,17 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import java.net.URLDecoder
+import java.net.URLEncoder
 
+/**
+ * TVMon Provider
+ * v1.1 Changes:
+ * - Ported 'Poster Tunneling' logic from TVWiki.
+ * - Added URL encoding for poster in toSearchResponse.
+ * - Added URL decoding and fallback logic in load.
+ * - Added debug logs.
+ */
 class TVMon : MainAPI() {
     override var mainUrl = "https://tvmon.site"
     override var name = "TVMON"
@@ -33,8 +43,7 @@ class TVMon : MainAPI() {
         "Upgrade-Insecure-Requests" to "1"
     )
 
-    // [변경됨] FourKHDHub 스타일: 메인 페이지 탭 정의
-    // 여기에 정의된 항목들이 앱 홈 화면의 탭이나 섹션으로 나타납니다.
+    // FourKHDHub 스타일: 메인 페이지 탭 정의
     override val mainPage = mainPageOf(
         "/kor_movie" to "영화",
         "/drama" to "드라마",
@@ -48,10 +57,7 @@ class TVMon : MainAPI() {
         "/old_ent" to "추억의 예능"
     )
 
-    // [변경됨] FourKHDHub 스타일: 페이지네이션 적용
-    // page 변수가 스크롤 할 때마다 1, 2, 3... 으로 자동으로 들어옵니다.
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // request.data에는 위 mainPage에서 정의한 URL 뒷부분(예: /drama)이 들어옵니다.
         val url = "$mainUrl${request.data}?page=$page"
         
         return try {
@@ -59,24 +65,38 @@ class TVMon : MainAPI() {
             // 리스트 아이템 추출
             val list = doc.select(".mov_list ul li").mapNotNull { it.toSearchResponse() }
             
-            // 리스트가 비어있지 않다면 다음 페이지가 있다고 가정 (hasNext = true)
             newHomePageResponse(request.name, list, hasNext = list.isNotEmpty())
         } catch (e: Exception) {
+            e.printStackTrace()
             newHomePageResponse(request.name, emptyList(), hasNext = false)
         }
     }
 
-    // 리스트 아이템 파싱 로직
+    // [v1.1 수정] 리스트 아이템 파싱 로직 + 포스터 URL 전달
     private fun Element.toSearchResponse(): SearchResponse? {
         val aTag = this.selectFirst("a.img") ?: return null
-        val link = fixUrl(aTag.attr("href"))
+        var link = fixUrl(aTag.attr("href"))
         val title = this.selectFirst("a.title")?.text()?.trim() ?: return null
 
         val imgTag = aTag.selectFirst("img")
-        val poster = imgTag?.attr("data-original")?.ifEmpty { null }
+        val rawPoster = imgTag?.attr("data-original")?.ifEmpty { null }
             ?: imgTag?.attr("data-src")?.ifEmpty { null }
             ?: imgTag?.attr("src")
             ?: ""
+
+        val fixedPoster = fixUrl(rawPoster)
+
+        // [v1.1 추가] URL에 포스터 주소를 인코딩해서 붙임 (상세페이지 전달용)
+        if (fixedPoster.isNotEmpty()) {
+            try {
+                val encodedPoster = URLEncoder.encode(fixedPoster, "UTF-8")
+                val separator = if (link.contains("?")) "&" else "?"
+                link = "$link${separator}cw_poster=$encodedPoster"
+                // println("[TVMon] Poster encoded for $title: $encodedPoster") // 디버깅용 (필요시 주석 해제)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
 
         val type = determineTypeFromUrl(link)
 
@@ -85,19 +105,19 @@ class TVMon : MainAPI() {
                 title,
                 link,
                 type
-            ) { this.posterUrl = fixUrl(poster) }
+            ) { this.posterUrl = fixedPoster }
 
             TvType.Anime -> newAnimeSearchResponse(
                 title,
                 link,
                 TvType.Anime
-            ) { this.posterUrl = fixUrl(poster) }
+            ) { this.posterUrl = fixedPoster }
 
             else -> newTvSeriesSearchResponse(
                 title,
                 link,
                 TvType.TvSeries
-            ) { this.posterUrl = fixUrl(poster) }
+            ) { this.posterUrl = fixedPoster }
         }
     }
 
@@ -122,8 +142,35 @@ class TVMon : MainAPI() {
         return items
     }
 
+    // [v1.1 수정] load 함수: URL 파라미터 디코딩 및 포스터 Fallback 로직 적용
     override suspend fun load(url: String): LoadResponse {
-        val doc = app.get(url, headers = commonHeaders).document
+        println("[TVMon] load 시작: $url")
+
+        // 1. 전달받은 URL에서 포스터 정보 추출 및 복원
+        var passedPoster: String? = null
+        var realUrl = url
+
+        try {
+            val regex = Regex("[?&]cw_poster=([^&]+)")
+            val match = regex.find(url)
+            if (match != null) {
+                val encoded = match.groupValues[1]
+                passedPoster = URLDecoder.decode(encoded, "UTF-8")
+                realUrl = url.replace(match.value, "")
+                
+                // URL 끝에 남은 ? 또는 & 제거
+                if (realUrl.endsWith("?") || realUrl.endsWith("&")) {
+                    realUrl = realUrl.dropLast(1)
+                }
+                println("[TVMon] Passed Poster Detected: $passedPoster")
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            println("[TVMon] Error decoding passed poster: ${e.message}")
+        }
+
+        // 2. 실제 페이지 로딩 (파라미터 제거된 clean URL 사용)
+        val doc = app.get(realUrl, headers = commonHeaders).document
 
         val h3Element = doc.selectFirst("#bo_v_movinfo h3")
         var title = h3Element?.ownText()?.trim()
@@ -147,9 +194,16 @@ class TVMon : MainAPI() {
             }
         }
 
-        val poster = doc.selectFirst("#bo_v_poster img")?.attr("src")
+        // 3. 포스터 결정 로직 (상세페이지 > 메타태그 > 목록에서 가져온 포스터)
+        var poster = doc.selectFirst("#bo_v_poster img")?.attr("src")
             ?: doc.selectFirst("meta[property='og:image']")?.attr("content")
             ?: ""
+
+        // [v1.1 핵심] 상세페이지에 포스터가 없는데, 목록에서 가져온 게 있다면 그걸 사용
+        if (poster.isEmpty() && passedPoster != null) {
+            poster = passedPoster
+            println("[TVMon] 상세페이지 포스터 없음 -> 목록 포스터 사용")
+        }
 
         val infoList = doc.select(".bo_v_info dd").map { it.text().trim().replace("개봉년도:", "공개일:") }
         val genreList = doc.select(".ctgs dd a").filter {
@@ -205,19 +259,19 @@ class TVMon : MainAPI() {
             }
         }.reversed()
 
-        val type = determineTypeFromUrl(url)
+        val type = determineTypeFromUrl(realUrl) // realUrl 사용
 
         return when (type) {
             TvType.Movie, TvType.AnimeMovie -> {
-                val movieLink = episodes.firstOrNull()?.data ?: url
-                newMovieLoadResponse(title, url, type, movieLink) {
+                val movieLink = episodes.firstOrNull()?.data ?: realUrl
+                newMovieLoadResponse(title, realUrl, type, movieLink) {
                     this.posterUrl = fixUrl(poster)
                     this.plot = finalPlot
                 }
             }
 
             else -> {
-                newTvSeriesLoadResponse(title, url, type, episodes) {
+                newTvSeriesLoadResponse(title, realUrl, type, episodes) {
                     this.posterUrl = fixUrl(poster)
                     this.plot = finalPlot
                 }
