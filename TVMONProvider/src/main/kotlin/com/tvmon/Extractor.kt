@@ -43,11 +43,11 @@ import kotlin.concurrent.thread
 import kotlin.coroutines.resume
 
 /**
- * Version: v23.3 (Zombie Wait Strategy)
+ * Version: v23.4 (Dual-Hook Strategy)
  * Modification:
- * 1. [CRITICAL] Wait for at least 2 keys or 20 seconds timeout.
- * 2. [FIX] Do not destroy WebView immediately after first key.
- * 3. [FIX] Increased timeout to 20s to accommodate slow WASM execution.
+ * 1. [NEW] Added hook for 'window.crypto.subtle.importKey' to catch the final AES key.
+ * 2. [IMPROVE] Added entropy check to Uint8Array.set hook to ignore obvious fake keys.
+ * 3. [MAINTAIN] Zombie wait strategy (20s) and Master Playlist logic preserved.
  */
 class BunnyPoorCdn : ExtractorApi() {
     override val name = "TVMON"
@@ -70,7 +70,7 @@ class BunnyPoorCdn : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        println("[TVMON][v23.3] getUrl 호출됨. URL: $url")
+        println("[TVMON][v23.4] getUrl 호출됨. URL: $url")
         extract(url, referer, subtitleCallback, callback)
     }
 
@@ -101,13 +101,12 @@ class BunnyPoorCdn : ExtractorApi() {
 
         var capturedUrl: String? = cleanUrl
 
-        // 2. WebView 후킹 (좀비 모드: 끝까지 기다림)
+        // 2. WebView 후킹 (듀얼 모드)
         if (!cleanUrl.contains("/c.html")) {
-            println("[TVMON] [STEP 2] WebView 직접 실행하여 c.html 및 키 후킹 시도 (20초 대기)...")
+            println("[TVMON] [STEP 2] WebView 직접 실행하여 강력 후킹 시도 (20초 대기)...")
             capturedKeys.clear()
             verifiedKey = null
             
-            // 20초 동안 키를 모을 수 있는 만큼 모아옴
             val webViewResult = runWebViewHook(cleanUrl, cleanReferer)
             
             if (webViewResult != null) {
@@ -183,6 +182,7 @@ class BunnyPoorCdn : ExtractorApi() {
 
                     val ivMatch = Regex("""IV=("?)(0x[0-9a-fA-F]+)\1""").find(content)
                     val ivHex = ivMatch?.groupValues?.get(2) ?: "0x00000000000000000000000000000000"
+                    
                     currentIv = ivHex.removePrefix("0x").hexToByteArray()
                     println("[TVMON] [DATA] 추출된 IV: $ivHex")
 
@@ -237,28 +237,50 @@ class BunnyPoorCdn : ExtractorApi() {
         return false
     }
 
-    // [v23.3] "좀비 대기" 로직 적용
     private suspend fun runWebViewHook(url: String, referer: String) = suspendCancellableCoroutine<String?> { cont ->
         val hookScript = """
             (function() {
                 if (typeof G !== 'undefined') window.G = false;
+
+                // 1. Memory Write Hook (Uint8Array.set)
                 const originalSet = Uint8Array.prototype.set;
                 Uint8Array.prototype.set = function(source, offset) {
                     if (source instanceof Uint8Array && source.length === 16) {
-                        var hex = Array.from(source).map(b => b.toString(16).padStart(2, '0')).join('');
-                        console.log("CapturedKeyHex:" + hex);
+                        // Entropy Filter: 무작위성이 너무 낮은(가짜) 키는 무시
+                        let isFake = true;
+                        for(let i=0; i<16; i++) {
+                            if(source[i] > 50) { isFake = false; break; }
+                        }
+                        
+                        if (!isFake) {
+                            var hex = Array.from(source).map(b => b.toString(16).padStart(2, '0')).join('');
+                            console.log("CapturedKeyHex:[SET]" + hex);
+                        }
                     }
                     return originalSet.apply(this, arguments);
                 };
-                console.log("[JS-HOOK] 감시 장치 가동됨.");
+
+                // 2. WebCrypto Hook (The Golden Gate)
+                if (window.crypto && window.crypto.subtle) {
+                    const origImportKey = window.crypto.subtle.importKey;
+                    window.crypto.subtle.importKey = function(format, keyData, algorithm, extractable, keyUsages) {
+                        console.log("[JS-HOOK] importKey called! Format: " + format);
+                        if (format === 'raw' && (keyData.byteLength === 16 || keyData.length === 16)) {
+                            var bytes = new Uint8Array(keyData);
+                            var hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+                            console.log("CapturedKeyHex:[CRYPTO]" + hex);
+                        }
+                        return origImportKey.apply(this, arguments);
+                    };
+                }
+
+                console.log("[JS-HOOK] Dual-Mode Watchdog Installed.");
             })();
         """.trimIndent()
 
         Handler(Looper.getMainLooper()).post {
             try {
-                // c.html 주소 저장용
                 var detectedCUrl: String? = null
-                
                 val context: Context = (AcraApplication.context ?: app) as Context
                 val webView = WebView(context)
                 
@@ -273,15 +295,15 @@ class BunnyPoorCdn : ExtractorApi() {
                     override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
                         val msg = consoleMessage?.message() ?: ""
                         if (msg.startsWith("CapturedKeyHex:")) {
-                            val key = msg.removePrefix("CapturedKeyHex:")
-                            // 중복 방지하며 키 저장
-                            if (capturedKeys.add(key)) {
-                                println("[TVMON] [HOOK] ★★★ 키 캡처 성공: $key (총 ${capturedKeys.size}개)")
-                            }
+                            // [SET] 또는 [CRYPTO] 태그 제거하고 키만 추출
+                            val rawKey = msg.substringAfter("CapturedKeyHex:")
+                            val key = rawKey.removePrefix("[SET]").removePrefix("[CRYPTO]")
                             
-                            // [CRITICAL] 여기서 절대 종료하지 않음!
-                            // 타임아웃(20초)이 될 때까지 계속 수집하게 둠.
-                            // 왜냐하면 진짜 키는 나중에 나오기 때문.
+                            if (capturedKeys.add(key)) {
+                                println("[TVMON] [HOOK] ★★★ 키 캡처 성공: $key (Source: $rawKey)")
+                            }
+                        } else if (msg.contains("[JS-HOOK]")) {
+                            println("[TVMON] [HOOK] JS 스크립트 정상 주입됨.")
                         }
                         return true
                     }
@@ -307,14 +329,10 @@ class BunnyPoorCdn : ExtractorApi() {
                 println("[TVMON] Manual WebView 로드 시작: $url")
                 webView.loadUrl(url, mapOf("Referer" to referer))
 
-                // [CRITICAL] 20초 대기 (무조건 기다림)
-                // 키가 빨리 나와도 진짜 키가 아닐 수 있으므로 넉넉히 기다려서 다 긁어모음
                 Handler(Looper.getMainLooper()).postDelayed({
                     if (cont.isActive) {
                         println("[TVMON] WebView 종료 (20초 경과). 수집된 키로 진행합니다.")
                         try { webView.destroy() } catch (e: Exception) {}
-                        // c.html을 못 찾았더라도 키만 있으면 OK일 수 있으나, 
-                        // 구조상 c.html이 있어야 m3u8을 얻을 수 있으므로 detectedCUrl 반환
                         cont.resume(detectedCUrl)
                     }
                 }, 20000)
@@ -437,6 +455,8 @@ class BunnyPoorCdn : ExtractorApi() {
                     
                     for (hexKey in capturedKeys) {
                         val keyBytes = hexKey.hexToByteArray()
+                        
+                        // 오프셋 0~512 탐색
                         for (offset in 0..512) {
                             if (responseData.size < offset + safeCheckSize) break
 
