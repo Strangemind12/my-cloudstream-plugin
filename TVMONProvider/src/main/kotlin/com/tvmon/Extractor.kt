@@ -3,9 +3,10 @@ package com.tvmon
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
-import android.util.Base64
 import android.webkit.ConsoleMessage
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.webkit.CookieManager
@@ -41,11 +42,11 @@ import kotlin.concurrent.thread
 import kotlin.coroutines.resume
 
 /**
- * Version: v22.7 (Master Playlist Fix)
+ * Version: v23.0 (Wait for Key Logic Fix)
  * Modification:
- * 1. [FIX] Added logic to detect and parse Master Playlist (#EXT-X-STREAM-INF).
- * 2. [FIX] Automatically fetches the inner Media Playlist if Master is detected.
- * 3. [FIX] Improved IV regex to capture variations.
+ * 1. [CRITICAL FIX] Do NOT destroy WebView immediately upon intercepting 'c.html'.
+ * 2. [FIX] Wait until 'CapturedKeyHex' appears in console log before destroying WebView.
+ * 3. [FIX] Added logic to return the captured URL even if it times out.
  */
 class BunnyPoorCdn : ExtractorApi() {
     override val name = "TVMON"
@@ -68,7 +69,7 @@ class BunnyPoorCdn : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        println("[TVMON][v22.7] getUrl 호출됨. URL: $url")
+        println("[TVMON][v23.0] getUrl 호출됨. URL: $url")
         extract(url, referer, subtitleCallback, callback)
     }
 
@@ -82,8 +83,7 @@ class BunnyPoorCdn : ExtractorApi() {
         println("[TVMON] [STEP 1] extract() 프로세스 시작.")
         var cleanUrl = url.replace(Regex("[\\r\\n\\s]"), "").trim()
         val cleanReferer = referer?.replace(Regex("[\\r\\n\\s]"), "")?.trim() ?: "https://tvmon.site/"
-        println("[TVMON] 대상 URL: $cleanUrl, 레퍼러: $cleanReferer")
-
+        
         // 1. iframe 주소 추출
         if (!cleanUrl.contains("v/f/") && !cleanUrl.contains("v/e/")) {
             try {
@@ -102,11 +102,19 @@ class BunnyPoorCdn : ExtractorApi() {
 
         // 2. WebView 후킹 (직접 구현 모드)
         if (!cleanUrl.contains("/c.html")) {
-            println("[TVMON] [STEP 2] WebView 직접 실행하여 키 후킹 시도...")
+            println("[TVMON] [STEP 2] WebView 직접 실행하여 c.html 및 키 후킹 시도...")
             capturedKeys.clear()
             verifiedKey = null
             
-            runWebViewHook(cleanUrl, cleanReferer)
+            // [FIX] URL을 반환받되, 키가 수집될 때까지 내부적으로 대기함
+            val webViewResult = runWebViewHook(cleanUrl, cleanReferer)
+            
+            if (webViewResult != null) {
+                capturedUrl = webViewResult
+                println("[TVMON] [STEP 2-1] c.html URL 캡처 완료: $capturedUrl")
+            } else {
+                println("[TVMON] [WARNING] c.html 캡처 실패. iframe 주소로 계속 진행합니다.")
+            }
             
             println("[TVMON] 현재까지 수집된 키 후보 개수: ${capturedKeys.size}")
             capturedKeys.forEach { println("[TVMON] [CANDIDATE] 후킹된 키: $it") }
@@ -130,7 +138,7 @@ class BunnyPoorCdn : ExtractorApi() {
                 var response = app.get(requestUrl, headers = headers)
                 var content = response.text.trim()
 
-                // 3-1. HTML 등에서 실제 .m3u8 링크 찾기
+                // [CASE A] HTML 내용 안에 .m3u8 링크가 숨어있는 경우
                 if (!content.startsWith("#EXTM3U")) {
                     println("[TVMON] 응답이 M3U8이 아님. 내부 링크 검색 중...")
                     Regex("""(https?://[^"']+\.m3u8[^"']*)""").find(content)?.let {
@@ -141,24 +149,29 @@ class BunnyPoorCdn : ExtractorApi() {
                     }
                 }
 
-                // [FIX] 3-2. Master Playlist(다중 화질)인 경우, 하위 m3u8(Media Playlist) 찾기
+                // [CASE B] Master Playlist (화질 목록)인 경우
                 if (content.contains("#EXT-X-STREAM-INF")) {
-                    println("[TVMON] [INFO] Master Playlist 감지됨. 하위 스트림을 탐색합니다.")
-                    // 가장 마지막(보통 최고 화질) 또는 첫 번째 m3u8 링크를 찾음
-                    val subUrlLine = content.lines().lastOrNull { it.isNotBlank() && !it.startsWith("#") }
+                    println("[TVMON] [INFO] Master Playlist 감지됨. 하위 스트림 탐색.")
+                    val lines = content.lines()
+                    var subUrlLine: String? = null
+                    for (i in lines.indices.reversed()) {
+                        val line = lines[i].trim()
+                        if (line.isNotEmpty() && !line.startsWith("#")) {
+                            subUrlLine = line
+                            break
+                        }
+                    }
+
                     if (subUrlLine != null) {
                         val originalUri = try { URI(requestUrl) } catch (e: Exception) { null }
-                        val subUrl = resolveUrl(originalUri, requestUrl, subUrlLine.trim())
-                        println("[TVMON] [INFO] 미디어 플레이리스트로 진입: $subUrl")
-                        
-                        // 하위 m3u8 요청
-                        requestUrl = subUrl
+                        requestUrl = resolveUrl(originalUri, requestUrl, subUrlLine)
+                        println("[TVMON] [INFO] 미디어 플레이리스트로 진입: $requestUrl")
                         response = app.get(requestUrl, headers = headers)
                         content = response.text.trim()
                     }
                 }
 
-                // 3-3. Key7 및 IV 확인
+                // [CHECK] Key7 및 IV 확인
                 val isKey7 = content.lines().any { it.startsWith("#EXT-X-KEY") && it.contains("/v/key7") }
                 println("[TVMON] [CHECK] Key7 암호화 적용 여부: $isKey7")
 
@@ -170,13 +183,11 @@ class BunnyPoorCdn : ExtractorApi() {
                         updateSession(headers)
                     }
 
-                    // [FIX] IV 정규식 개선 (따옴표 처리 등 유연성 확보)
-                    val ivMatch = Regex("""IV=0x([0-9a-fA-F]+)""").find(content) 
-                        ?: Regex("""IV="0x([0-9a-fA-F]+)"""").find(content)
+                    val ivMatch = Regex("""IV=("?)(0x[0-9a-fA-F]+)\1""").find(content)
+                    val ivHex = ivMatch?.groupValues?.get(2) ?: "0x00000000000000000000000000000000"
                     
-                    val ivHex = ivMatch?.groupValues?.get(1) ?: "00000000000000000000000000000000"
-                    currentIv = ivHex.hexToByteArray()
-                    println("[TVMON] [DATA] 추출된 IV: 0x$ivHex")
+                    currentIv = ivHex.removePrefix("0x").hexToByteArray()
+                    println("[TVMON] [DATA] 추출된 IV: $ivHex")
 
                     val baseUri = try { URI(requestUrl) } catch (e: Exception) { null }
                     val sb = StringBuilder()
@@ -229,7 +240,7 @@ class BunnyPoorCdn : ExtractorApi() {
         return false
     }
 
-    private suspend fun runWebViewHook(url: String, referer: String) = suspendCancellableCoroutine<Unit> { cont ->
+    private suspend fun runWebViewHook(url: String, referer: String) = suspendCancellableCoroutine<String?> { cont ->
         val hookScript = """
             (function() {
                 if (typeof G !== 'undefined') window.G = false;
@@ -247,6 +258,9 @@ class BunnyPoorCdn : ExtractorApi() {
 
         Handler(Looper.getMainLooper()).post {
             try {
+                // 임시로 찾은 c.html 주소를 저장할 변수
+                var detectedCUrl: String? = null
+                
                 val context: Context = (AcraApplication.context ?: app) as Context
                 val webView = WebView(context)
                 
@@ -264,6 +278,14 @@ class BunnyPoorCdn : ExtractorApi() {
                             val key = msg.removePrefix("CapturedKeyHex:")
                             capturedKeys.add(key)
                             println("[TVMON] [HOOK] ★★★ 키 캡처 성공: $key")
+                            
+                            // [CRITICAL FIX] 키를 찾았을 때 비로소 Resume 호출 (종료)
+                            if (cont.isActive) {
+                                // 만약 c.html을 못 찾았더라도 키를 찾았으면 성공한 것이므로 null이라도 반환해서 넘어감
+                                // 하지만 보통은 interceptRequest에서 이미 detectedCUrl이 채워져 있음
+                                cont.resume(detectedCUrl)
+                                webView.destroy()
+                            }
                         } else if (msg.contains("[JS-HOOK]")) {
                             println("[TVMON] [HOOK] JS 스크립트 정상 주입됨.")
                         }
@@ -272,6 +294,16 @@ class BunnyPoorCdn : ExtractorApi() {
                 }
 
                 webView.webViewClient = object : WebViewClient() {
+                    override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                        val reqUrl = request?.url?.toString() ?: ""
+                        if (reqUrl.contains("/c.html") && reqUrl.contains("token=")) {
+                            println("[TVMON] [INTERCEPT] c.html 주소 감지됨 (아직 종료 안 함): $reqUrl")
+                            detectedCUrl = reqUrl
+                            // [CRITICAL] 여기서 resume() 하지 않음! 키가 나올 때까지 기다림.
+                        }
+                        return super.shouldInterceptRequest(view, request)
+                    }
+
                     override fun onPageFinished(view: WebView?, url: String?) {
                         super.onPageFinished(view, url)
                         println("[TVMON] 페이지 로드 완료. Hook 주입 시도: $url")
@@ -282,15 +314,18 @@ class BunnyPoorCdn : ExtractorApi() {
                 println("[TVMON] Manual WebView 로드 시작: $url")
                 webView.loadUrl(url, mapOf("Referer" to referer))
 
+                // 15초 타임아웃
                 Handler(Looper.getMainLooper()).postDelayed({
-                    println("[TVMON] WebView 타임아웃 (10초). 종료합니다.")
-                    try { webView.destroy() } catch (e: Exception) {}
-                    if (cont.isActive) cont.resume(Unit)
-                }, 10000)
+                    if (cont.isActive) {
+                        println("[TVMON] WebView 타임아웃 (15초). 키를 못 찾았어도 확보된 URL로 진행합니다.")
+                        try { webView.destroy() } catch (e: Exception) {}
+                        cont.resume(detectedCUrl)
+                    }
+                }, 15000)
 
             } catch (e: Exception) {
                 println("[TVMON] WebView 생성 실패: ${e.message}")
-                if (cont.isActive) cont.resume(Unit)
+                if (cont.isActive) cont.resume(null)
             }
         }
     }
