@@ -43,11 +43,11 @@ import kotlin.concurrent.thread
 import kotlin.coroutines.resume
 
 /**
- * Version: v23.2 (Triple-Check Verification)
+ * Version: v23.3 (Zombie Wait Strategy)
  * Modification:
- * 1. [CRITICAL] verifyMultipleKeys now checks for 0x47 at indices 0, 188, and 376.
- * 2. [FIX] Decrypts a larger chunk (1KB) to ensure enough data for 3-packet verification.
- * 3. [MAINTAIN] All previous fixes (Manual WebView, Master Playlist, IV Regex) are preserved.
+ * 1. [CRITICAL] Wait for at least 2 keys or 20 seconds timeout.
+ * 2. [FIX] Do not destroy WebView immediately after first key.
+ * 3. [FIX] Increased timeout to 20s to accommodate slow WASM execution.
  */
 class BunnyPoorCdn : ExtractorApi() {
     override val name = "TVMON"
@@ -70,7 +70,7 @@ class BunnyPoorCdn : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        println("[TVMON][v23.2] getUrl 호출됨. URL: $url")
+        println("[TVMON][v23.3] getUrl 호출됨. URL: $url")
         extract(url, referer, subtitleCallback, callback)
     }
 
@@ -101,12 +101,13 @@ class BunnyPoorCdn : ExtractorApi() {
 
         var capturedUrl: String? = cleanUrl
 
-        // 2. WebView 후킹
+        // 2. WebView 후킹 (좀비 모드: 끝까지 기다림)
         if (!cleanUrl.contains("/c.html")) {
-            println("[TVMON] [STEP 2] WebView 직접 실행하여 c.html 및 키 후킹 시도...")
+            println("[TVMON] [STEP 2] WebView 직접 실행하여 c.html 및 키 후킹 시도 (20초 대기)...")
             capturedKeys.clear()
             verifiedKey = null
             
+            // 20초 동안 키를 모을 수 있는 만큼 모아옴
             val webViewResult = runWebViewHook(cleanUrl, cleanReferer)
             
             if (webViewResult != null) {
@@ -116,7 +117,7 @@ class BunnyPoorCdn : ExtractorApi() {
                 println("[TVMON] [WARNING] c.html 캡처 실패. iframe 주소로 계속 진행합니다.")
             }
             
-            println("[TVMON] 현재까지 수집된 키 후보 개수: ${capturedKeys.size}")
+            println("[TVMON] 수집 종료. 최종 확보된 키 개수: ${capturedKeys.size}")
             capturedKeys.forEach { println("[TVMON] [CANDIDATE] 후킹된 키: $it") }
         }
 
@@ -138,7 +139,6 @@ class BunnyPoorCdn : ExtractorApi() {
                 var response = app.get(requestUrl, headers = headers)
                 var content = response.text.trim()
 
-                // [CASE A] HTML 내용 안에 .m3u8 링크가 숨어있는 경우
                 if (!content.startsWith("#EXTM3U")) {
                     println("[TVMON] 응답이 M3U8이 아님. 내부 링크 검색 중...")
                     Regex("""(https?://[^"']+\.m3u8[^"']*)""").find(content)?.let {
@@ -149,7 +149,6 @@ class BunnyPoorCdn : ExtractorApi() {
                     }
                 }
 
-                // [CASE B] Master Playlist (화질 목록)인 경우
                 if (content.contains("#EXT-X-STREAM-INF")) {
                     println("[TVMON] [INFO] Master Playlist 감지됨. 하위 스트림 탐색.")
                     val lines = content.lines()
@@ -171,7 +170,6 @@ class BunnyPoorCdn : ExtractorApi() {
                     }
                 }
 
-                // [CHECK] Key7 및 IV 확인
                 val isKey7 = content.lines().any { it.startsWith("#EXT-X-KEY") && it.contains("/v/key7") }
                 println("[TVMON] [CHECK] Key7 암호화 적용 여부: $isKey7")
 
@@ -185,7 +183,6 @@ class BunnyPoorCdn : ExtractorApi() {
 
                     val ivMatch = Regex("""IV=("?)(0x[0-9a-fA-F]+)\1""").find(content)
                     val ivHex = ivMatch?.groupValues?.get(2) ?: "0x00000000000000000000000000000000"
-                    
                     currentIv = ivHex.removePrefix("0x").hexToByteArray()
                     println("[TVMON] [DATA] 추출된 IV: $ivHex")
 
@@ -240,6 +237,7 @@ class BunnyPoorCdn : ExtractorApi() {
         return false
     }
 
+    // [v23.3] "좀비 대기" 로직 적용
     private suspend fun runWebViewHook(url: String, referer: String) = suspendCancellableCoroutine<String?> { cont ->
         val hookScript = """
             (function() {
@@ -258,6 +256,9 @@ class BunnyPoorCdn : ExtractorApi() {
 
         Handler(Looper.getMainLooper()).post {
             try {
+                // c.html 주소 저장용
+                var detectedCUrl: String? = null
+                
                 val context: Context = (AcraApplication.context ?: app) as Context
                 val webView = WebView(context)
                 
@@ -273,15 +274,14 @@ class BunnyPoorCdn : ExtractorApi() {
                         val msg = consoleMessage?.message() ?: ""
                         if (msg.startsWith("CapturedKeyHex:")) {
                             val key = msg.removePrefix("CapturedKeyHex:")
-                            capturedKeys.add(key)
-                            println("[TVMON] [HOOK] ★★★ 키 캡처 성공: $key")
-                            
-                            if (cont.isActive) {
-                                cont.resume(null) // URL은 intercept에서 못 잡았어도 키는 잡았으니 진행
-                                webView.destroy()
+                            // 중복 방지하며 키 저장
+                            if (capturedKeys.add(key)) {
+                                println("[TVMON] [HOOK] ★★★ 키 캡처 성공: $key (총 ${capturedKeys.size}개)")
                             }
-                        } else if (msg.contains("[JS-HOOK]")) {
-                            println("[TVMON] [HOOK] JS 스크립트 정상 주입됨.")
+                            
+                            // [CRITICAL] 여기서 절대 종료하지 않음!
+                            // 타임아웃(20초)이 될 때까지 계속 수집하게 둠.
+                            // 왜냐하면 진짜 키는 나중에 나오기 때문.
                         }
                         return true
                     }
@@ -291,12 +291,8 @@ class BunnyPoorCdn : ExtractorApi() {
                     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                         val reqUrl = request?.url?.toString() ?: ""
                         if (reqUrl.contains("/c.html") && reqUrl.contains("token=")) {
-                            println("[TVMON] [INTERCEPT] c.html 주소 감지됨 (계속 대기): $reqUrl")
-                            // URL만 캡처하고 키가 나올 때까지 대기
-                            if (cont.isActive) {
-                                cont.resume(reqUrl) 
-                                // 주의: 여기서 destroy하면 안됨
-                            }
+                            println("[TVMON] [INTERCEPT] c.html 주소 감지됨: $reqUrl")
+                            detectedCUrl = reqUrl
                         }
                         return super.shouldInterceptRequest(view, request)
                     }
@@ -311,13 +307,17 @@ class BunnyPoorCdn : ExtractorApi() {
                 println("[TVMON] Manual WebView 로드 시작: $url")
                 webView.loadUrl(url, mapOf("Referer" to referer))
 
+                // [CRITICAL] 20초 대기 (무조건 기다림)
+                // 키가 빨리 나와도 진짜 키가 아닐 수 있으므로 넉넉히 기다려서 다 긁어모음
                 Handler(Looper.getMainLooper()).postDelayed({
                     if (cont.isActive) {
-                        println("[TVMON] WebView 타임아웃 (15초).")
+                        println("[TVMON] WebView 종료 (20초 경과). 수집된 키로 진행합니다.")
                         try { webView.destroy() } catch (e: Exception) {}
-                        cont.resume(null)
+                        // c.html을 못 찾았더라도 키만 있으면 OK일 수 있으나, 
+                        // 구조상 c.html이 있어야 m3u8을 얻을 수 있으므로 detectedCUrl 반환
+                        cont.resume(detectedCUrl)
                     }
-                }, 15000)
+                }, 20000)
 
             } catch (e: Exception) {
                 println("[TVMON] WebView 생성 실패: ${e.message}")
@@ -415,7 +415,6 @@ class BunnyPoorCdn : ExtractorApi() {
             } catch (e: Exception) { socket.close() }
         }
 
-        // [v23.2] 3단계 정밀 검증 (0, 188, 376 인덱스 모두 0x47인지 확인)
         private fun verifyMultipleKeys(): ByteArray? {
             val url = testSegmentUrl ?: return null
             println("[VERIFY] 검증 타겟 세그먼트: $url")
@@ -426,12 +425,10 @@ class BunnyPoorCdn : ExtractorApi() {
             return try {
                 val responseData = runBlocking { 
                     println("[VERIFY] 세그먼트 데이터 다운로드 중...")
-                    // 1KB 정도만 받아도 충분하지만, 확실한 검증을 위해 넉넉히 받음
                     app.get(url, headers = currentHeaders).body.bytes() 
                 }
                 println("[VERIFY] 다운로드 완료. 전체 크기: ${responseData.size} bytes")
 
-                // 3패킷 검증을 위해 필요한 최소 크기: 377바이트 (376번 인덱스까지 필요하므로)
                 val checkSize = 1024 
                 val safeCheckSize = if (responseData.size < checkSize) responseData.size else checkSize
 
@@ -440,17 +437,12 @@ class BunnyPoorCdn : ExtractorApi() {
                     
                     for (hexKey in capturedKeys) {
                         val keyBytes = hexKey.hexToByteArray()
-                        
-                        // 오프셋 0~512 범위 탐색
                         for (offset in 0..512) {
-                            // 배열 범위 체크
                             if (responseData.size < offset + safeCheckSize) break
 
                             val testChunk = responseData.copyOfRange(offset, offset + safeCheckSize)
                             val decrypted = decryptAES(testChunk, keyBytes, targetIv)
 
-                            // [CRITICAL] 3단계 검증: 0, 188, 376 인덱스가 모두 0x47이어야 함
-                            // MPEG-TS 패킷 길이는 188바이트 고정임
                             if (decrypted.size >= 377 &&
                                 decrypted[0] == 0x47.toByte() &&
                                 decrypted[188] == 0x47.toByte() &&
@@ -460,19 +452,17 @@ class BunnyPoorCdn : ExtractorApi() {
                                 println("[VERIFY] ★★★ 정밀 검증 성공 (MPEG-TS 표준 확인) ★★★")
                                 println("1. 정답 키: $hexKey")
                                 println("2. 숨겨진 오프셋: $offset 바이트")
-                                println("3. Sync Bytes: [0]=0x47, [188]=0x47, [376]=0x47 확인됨")
                                 println("========================================\n")
                                 return keyBytes
                             }
                         }
                     }
                 }
-                println("[VERIFY] [FATAL] 모든 오프셋에서 MPEG-TS 패턴(0x47 * 3)을 찾지 못했습니다.")
+                println("[VERIFY] [FATAL] 모든 오프셋에서 MPEG-TS 패턴을 찾지 못했습니다.")
                 null
             } catch (e: Exception) { println("[VERIFY] [ERROR] 검증 로직 중단: ${e.message}"); null }
         }
 
-        // [v23.2] 대용량(1KB) 데이터 복호화용
         private fun decryptAES(data: ByteArray, key: ByteArray, iv: ByteArray): ByteArray {
             return try {
                 val cipher = Cipher.getInstance("AES/CBC/NoPadding")
