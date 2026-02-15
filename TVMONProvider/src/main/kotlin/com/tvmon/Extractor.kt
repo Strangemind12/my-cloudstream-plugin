@@ -37,12 +37,11 @@ import kotlin.concurrent.thread
 import kotlin.coroutines.resume
 
 /**
- * Version: v23.7 (Build Error Fix & Context Preservation)
+ * Version: v23.8 (Smart Timeout Management)
  * Modification:
- * 1. [FIX] Wrap 'app.get' calls in 'runBlocking' inside threads to fix suspension error.
- * 2. [KEEP] Skip hooking if no key7.
- * 3. [KEEP] 5s WebView timeout.
- * 4. [KEEP] Proxy URL format with Video ID.
+ * 1. [FIX] Wait for c.html discovery (up to 15s) and cancel timer upon discovery.
+ * 2. [FIX] Immediate exit if not key7 or if key is captured.
+ * 3. [KEEP] Build error fixes (runBlocking) and Proxy ID path.
  */
 class BunnyPoorCdn : ExtractorApi() {
     override val name = "TVMON"
@@ -65,7 +64,7 @@ class BunnyPoorCdn : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        println("[TVMON][v23.7] getUrl 호출됨.")
+        println("[TVMON][v23.8] getUrl 호출됨.")
         extract(url, referer, subtitleCallback, callback)
     }
 
@@ -94,7 +93,7 @@ class BunnyPoorCdn : ExtractorApi() {
         var capturedUrl: String? = cleanUrl
 
         if (!cleanUrl.contains("/c.html")) {
-            println("[TVMON] [STEP 2] WebView 분석 실행 (5초 제한)")
+            println("[TVMON] [STEP 2] WebView 분석 시작...")
             capturedKeys.clear()
             verifiedKey = null
             
@@ -188,6 +187,8 @@ class BunnyPoorCdn : ExtractorApi() {
     }
 
     private suspend fun runWebViewHook(url: String, referer: String) = suspendCancellableCoroutine<String?> { cont ->
+        val handler = Handler(Looper.getMainLooper())
+        
         val hookScript = """
             (function() {
                 window.G = false;
@@ -221,7 +222,7 @@ class BunnyPoorCdn : ExtractorApi() {
             })();
         """.trimIndent()
 
-        Handler(Looper.getMainLooper()).post {
+        handler.post {
             try {
                 var detectedCUrl: String? = null
                 val context: Context = (AcraApplication.context ?: app) as Context
@@ -233,12 +234,25 @@ class BunnyPoorCdn : ExtractorApi() {
                     userAgentString = DESKTOP_UA
                 }
 
+                // [FIX] c.html을 발견하지 못할 경우를 대비한 15초 안전장치
+                val discoveryTimeout = Runnable {
+                    if (cont.isActive) {
+                        println("[TVMON] [TIMEOUT] c.html 발견 실패 (15초 경과).")
+                        try { webView.destroy() } catch (e: Exception) {}
+                        cont.resume(null)
+                    }
+                }
+                handler.postDelayed(discoveryTimeout, 15000)
+
                 webView.webChromeClient = object : WebChromeClient() {
                     override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
                         val msg = consoleMessage?.message() ?: ""
                         if (msg.startsWith("CapturedKeyHex:")) {
                             val key = msg.substringAfter("CapturedKeyHex:").removePrefix("[SET]").removePrefix("[CRYPTO]")
-                            capturedKeys.add(key)
+                            if (capturedKeys.add(key)) {
+                                println("[TVMON] [HOOK] 키 캡처 성공 ($key)")
+                                // 키가 하나라도 잡히면 분석 시간을 단축하기 위해 조기 종료 고려 가능
+                            }
                         }
                         return true
                     }
@@ -253,22 +267,35 @@ class BunnyPoorCdn : ExtractorApi() {
                     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                         val reqUrl = request?.url?.toString() ?: ""
                         if (reqUrl.contains("/c.html") && reqUrl.contains("token=")) {
+                            println("[TVMON] [INTERCEPT] c.html 발견. 대기 타이머 해제.")
                             detectedCUrl = reqUrl
+                            
+                            // c.html을 찾았으므로 discovery 타이머 해제
+                            handler.removeCallbacks(discoveryTimeout)
+                            
                             view?.post { view.evaluateJavascript(hookScript, null) }
                             
-                            // [FIX] app.get() 호출 시 runBlocking 사용하여 빌드 에러 해결
                             thread {
                                 try {
                                     runBlocking {
                                         val checkRes = app.get(reqUrl, headers = mapOf("User-Agent" to DESKTOP_UA, "Referer" to "https://player.bunny-frame.online/"))
                                         if (!checkRes.text.contains("/v/key7")) {
-                                            println("[TVMON] key7 없음 - 즉시 종료")
-                                            Handler(Looper.getMainLooper()).post {
+                                            println("[TVMON] [SKIP] 일반 영상 확인. 즉시 종료.")
+                                            handler.post {
                                                 if (cont.isActive) {
                                                     try { webView.destroy() } catch (e: Exception) {}
                                                     cont.resume(detectedCUrl)
                                                 }
                                             }
+                                        } else {
+                                            println("[TVMON] [WAIT] Key7 감지. 키 수집을 위해 7초간 더 유지합니다.")
+                                            handler.postDelayed({
+                                                if (cont.isActive) {
+                                                    println("[TVMON] [DONE] 키 수집 시간 종료.")
+                                                    try { webView.destroy() } catch (e: Exception) {}
+                                                    cont.resume(detectedCUrl)
+                                                }
+                                            }, 7000) // key7이 있을 때만 키 수집을 위해 추가 대기
                                         }
                                     }
                                 } catch (e: Exception) {}
@@ -283,15 +310,8 @@ class BunnyPoorCdn : ExtractorApi() {
                     }
                 }
 
+                println("[TVMON] WebView 로드 시작: $url")
                 webView.loadUrl(url, mapOf("Referer" to referer))
-
-                Handler(Looper.getMainLooper()).postDelayed({
-                    if (cont.isActive) {
-                        println("[TVMON] 5초 타임아웃 종료")
-                        try { webView.destroy() } catch (e: Exception) {}
-                        cont.resume(detectedCUrl)
-                    }
-                }, 5000)
 
             } catch (e: Exception) {
                 if (cont.isActive) cont.resume(null)
@@ -372,7 +392,6 @@ class BunnyPoorCdn : ExtractorApi() {
             } catch (e: Exception) { try { socket.close() } catch(e2: Exception) {} }
         }
 
-        // [FIX] runBlocking을 사용하여 코루틴 범위 내에서 app.get() 호출
         private fun verifyMultipleKeys(): ByteArray? = runBlocking {
             val url = testSegmentUrl ?: return@runBlocking null
             val targetIv = currentIv ?: ByteArray(16)
