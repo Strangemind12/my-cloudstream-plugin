@@ -1,5 +1,7 @@
 package com.tvmon
 
+// [FIX] Context 명시적 임포트 추가
+import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.util.Base64
@@ -40,10 +42,10 @@ import kotlin.concurrent.thread
 import kotlin.coroutines.resume
 
 /**
- * Version: v22.5 (Context Reference Fix)
+ * Version: v22.6 (Context Type Casting Fix)
  * Modification:
- * 1. [FIX] 'app.context' -> 'app' (app itself is the Context).
- * 2. [FIX] Cleaned up AcraApplication reference logic.
+ * 1. [FIX] Added 'import android.content.Context'.
+ * 2. [FIX] Explicitly cast 'app' or 'AcraApplication.context' to 'Context' to avoid 'Any' type inference error.
  */
 class BunnyPoorCdn : ExtractorApi() {
     override val name = "TVMON"
@@ -66,7 +68,7 @@ class BunnyPoorCdn : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        println("[TVMON][v22.5] getUrl 호출됨. URL: $url")
+        println("[TVMON][v22.6] getUrl 호출됨. URL: $url")
         extract(url, referer, subtitleCallback, callback)
     }
 
@@ -206,6 +208,7 @@ class BunnyPoorCdn : ExtractorApi() {
         return false
     }
 
+    // [NEW] 수동 WebView 실행 함수 (타입 캐스팅 문제 해결)
     private suspend fun runWebViewHook(url: String, referer: String) = suspendCancellableCoroutine<Unit> { cont ->
         val hookScript = """
             (function() {
@@ -224,15 +227,15 @@ class BunnyPoorCdn : ExtractorApi() {
 
         Handler(Looper.getMainLooper()).post {
             try {
-                // [수정] app 객체 자체가 Context이므로 바로 사용
-                val context = try { AcraApplication.context ?: app } catch(e: Exception) { app }
+                // [FIX] Explicit Cast: Any -> Context
+                // try-catch 블록 제거 후 직접 할당 및 캐스팅으로 'Any' 타입 추론 오류 방지
+                val context: Context = (AcraApplication.context ?: app) as Context
                 val webView = WebView(context)
                 
                 webView.settings.apply {
                     javaScriptEnabled = true
                     domStorageEnabled = true
                     userAgentString = DESKTOP_UA
-                    // 미디어 자동 재생 허용 (필요시)
                     mediaPlaybackRequiresUserGesture = false
                 }
 
