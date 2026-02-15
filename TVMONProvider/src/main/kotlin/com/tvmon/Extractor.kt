@@ -1,9 +1,12 @@
 package com.tvmon
 
+import android.os.Handler
+import android.os.Looper
 import android.util.Base64
 import android.webkit.ConsoleMessage
 import android.webkit.WebChromeClient
 import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.webkit.CookieManager
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.SubtitleFile
@@ -13,10 +16,13 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.network.WebViewResolver 
 import com.lagradost.cloudstream3.mapper
+import com.lagradost.cloudstream3.AcraApplication
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
 import java.io.BufferedReader
 import java.io.InputStream
 import java.io.InputStreamReader
@@ -31,13 +37,14 @@ import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import kotlin.concurrent.thread
+import kotlin.coroutines.resume
 
 /**
- * Version: v22.3 (WebView Hooking Logic Fix)
+ * Version: v22.4 (Build Fix & Manual WebView)
  * Modification:
- * 1. [FIX] WebViewResolver: 'c.html' 대신 'favicon.ico' 등을 타겟으로 하여 WebView 수명 연장.
- * 2. [FIX] WebChromeClient: onConsoleMessage를 구현하여 JS console.log를 Kotlin으로 납치.
- * 3. [KEEP] Proxy & Decryption Logic preserved.
+ * 1. [FIX] Removed 'object : WebViewResolver' inheritance (caused build error 42).
+ * 2. [NEW] Added 'runWebViewHook' function to manually create and control WebView.
+ * 3. [FIX] Solved 'onWebViewCreated' override error by using direct WebView instance.
  */
 class BunnyPoorCdn : ExtractorApi() {
     override val name = "TVMON"
@@ -48,7 +55,6 @@ class BunnyPoorCdn : ExtractorApi() {
 
     companion object {
         private var proxyServer: ProxyWebServer? = null
-        // 웹뷰에서 가로챈 모든 키 후보군
         val capturedKeys: MutableSet<String> = Collections.synchronizedSet(mutableSetOf<String>())
         @Volatile var verifiedKey: ByteArray? = null
         @Volatile var currentIv: ByteArray? = null
@@ -61,7 +67,7 @@ class BunnyPoorCdn : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        println("[TVMON][v22.3] getUrl 호출됨. URL: $url")
+        println("[TVMON][v22.4] getUrl 호출됨. URL: $url")
         extract(url, referer, subtitleCallback, callback)
     }
 
@@ -77,7 +83,7 @@ class BunnyPoorCdn : ExtractorApi() {
         val cleanReferer = referer?.replace(Regex("[\\r\\n\\s]"), "")?.trim() ?: "https://tvmon.site/"
         println("[TVMON] 대상 URL: $cleanUrl, 레퍼러: $cleanReferer")
 
-        // 1. iframe 주소 추출 로직
+        // 1. iframe 주소 추출
         if (!cleanUrl.contains("v/f/") && !cleanUrl.contains("v/e/")) {
             try {
                 println("[TVMON] [STEP 1-1] iframe 주소 찾는 중...")
@@ -91,90 +97,21 @@ class BunnyPoorCdn : ExtractorApi() {
             } catch (e: Exception) { println("[TVMON] [ERROR] iframe 파싱 실패: ${e.message}") }
         }
 
-        var capturedUrl: String? = null
-        if (cleanUrl.contains("/c.html") && cleanUrl.contains("token=")) {
-            capturedUrl = cleanUrl
-            println("[TVMON] 입력된 URL이 이미 c.html 타겟입니다.")
-        }
+        var capturedUrl: String? = cleanUrl
 
-        // 2. WebView 후킹 모드 (수정됨)
-        if (capturedUrl == null) {
-            println("[TVMON] [STEP 2] WebView를 통한 키 후킹 시작...")
-            val hookScript = """
-                (function() {
-                    if (typeof G !== 'undefined') window.G = false;
-                    const originalSet = Uint8Array.prototype.set;
-                    Uint8Array.prototype.set = function(source, offset) {
-                        if (source instanceof Uint8Array && source.length === 16) {
-                            var hex = Array.from(source).map(b => b.toString(16).padStart(2, '0')).join('');
-                            console.log("CapturedKeyHex:" + hex);
-                        }
-                        return originalSet.apply(this, arguments);
-                    };
-                    console.log("[JS-HOOK] 감시 장치 가동됨.");
-                })();
-            """.trimIndent()
-
-            // [핵심 수정] 익명 클래스로 WebViewResolver 확장
-            val resolver = object : WebViewResolver(
-                // c.html이 로딩된 후 나중에 호출되는 리소스를 타겟으로 설정하여 WebView가 바로 꺼지는 것을 방지
-                Regex("""/favicon\.ico|/api/key-share\.php"""), 
-                false
-            ) {
-                override fun onWebViewCreated(webView: WebView) {
-                    super.onWebViewCreated(webView)
-                    // JS 실행 권한 부여
-                    webView.settings.javaScriptEnabled = true
-                    webView.settings.domStorageEnabled = true
-                    
-                    // console.log 가로채기 설정
-                    webView.webChromeClient = object : WebChromeClient() {
-                        override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
-                            val msg = consoleMessage?.message() ?: ""
-                            
-                            // JS Hook에서 보낸 메시지 필터링
-                            if (msg.startsWith("CapturedKeyHex:")) {
-                                val key = msg.removePrefix("CapturedKeyHex:")
-                                capturedKeys.add(key)
-                                println("[TVMON] [HOOK] ★★★ 키 캡처 성공: $key")
-                            } else if (msg.contains("[JS-HOOK]")) {
-                                println("[TVMON] [HOOK] JS 스크립트 정상 주입됨.")
-                            }
-                            return super.onConsoleMessage(consoleMessage)
-                        }
-                    }
-                }
-            }
+        // 2. WebView 후킹 (직접 구현 모드)
+        // c.html URL이 아니거나 토큰이 없으면 WebView를 띄워 획득 시도
+        if (!cleanUrl.contains("/c.html")) {
+            println("[TVMON] [STEP 2] WebView 직접 실행하여 키 후킹 시도...")
+            capturedKeys.clear()
+            verifiedKey = null
             
-            try {
-                capturedKeys.clear()
-                verifiedKey = null
-                println("[TVMON] WebView Resolver 실행...")
-                
-                // CloudStream의 WebView 실행 (타임아웃까지 대기하거나 인터셉트 URL 발견 시 종료)
-                val response = app.get(
-                    url = cleanUrl, 
-                    headers = mapOf("Referer" to cleanReferer, "User-Agent" to DESKTOP_UA), 
-                    interceptor = resolver
-                )
-                
-                println("[TVMON] [WAIT] 키 후보군 수집을 위해 6초간 대기합니다...")
-                // WebViewResolver가 URL을 못 찾아서 타임아웃까지 기다릴 수 있으므로 
-                // 별도의 긴 딜레이는 필요 없을 수 있으나, 안전장치로 유지 혹은 조정 가능.
-                // 여기서는 기존 로직대로 유지하되 WebView가 닫혔는지 여부에 의존함.
-                
-                println("[TVMON] 현재까지 수집된 키 후보 개수: ${capturedKeys.size}")
-                capturedKeys.forEach { println("[TVMON] [CANDIDATE] 후킹된 키: $it") }
-                
-                // 만약 응답 URL이 c.html이라면 캡처
-                if (response.url.contains("/c.html")) {
-                    capturedUrl = response.url
-                    println("[TVMON] [STEP 2-1] c.html URL 캡처 완료: $capturedUrl")
-                }
-            } catch (e: Exception) { 
-                println("[TVMON] [ERROR] WebView 처리 중 예외 발생 (타임아웃 등): ${e.message}") 
-                // 타임아웃이 발생해도 키가 수집되었으면 진행 가능
-            }
+            // 수동 WebView 실행 (Main Thread)
+            runWebViewHook(cleanUrl, cleanReferer)
+            
+            // WebView 실행 후 수집된 키 확인
+            println("[TVMON] 현재까지 수집된 키 후보 개수: ${capturedKeys.size}")
+            capturedKeys.forEach { println("[TVMON] [CANDIDATE] 후킹된 키: $it") }
         }
 
         if (capturedUrl != null) {
@@ -186,7 +123,7 @@ class BunnyPoorCdn : ExtractorApi() {
             )
             if (!cookie.isNullOrEmpty()) {
                 headers["Cookie"] = cookie
-                println("[TVMON] 쿠키 적용됨: ${cookie.take(30)}...")
+                println("[TVMON] 쿠키 적용됨.")
             }
 
             try {
@@ -215,7 +152,6 @@ class BunnyPoorCdn : ExtractorApi() {
                         updateSession(headers)
                     }
 
-                    // IV 추출 및 출력
                     val ivMatch = Regex("""IV=(0x[0-9a-fA-F]+)""").find(content)
                     val ivHex = ivMatch?.groupValues?.get(1) ?: "0x00000000000000000000000000000000"
                     currentIv = ivHex.removePrefix("0x").hexToByteArray()
@@ -224,7 +160,7 @@ class BunnyPoorCdn : ExtractorApi() {
                     val baseUri = try { URI(requestUrl) } catch (e: Exception) { null }
                     val sb = StringBuilder()
 
-                    println("[TVMON] [STEP 4-1] Playlist 재작성 및 세그먼트 라우팅 시작.")
+                    println("[TVMON] [STEP 4-1] Playlist 재작성 및 세그먼트 라우팅.")
                     content.lines().forEach { line ->
                         val trimmed = line.trim()
                         if (trimmed.isEmpty()) return@forEach
@@ -272,6 +208,78 @@ class BunnyPoorCdn : ExtractorApi() {
         return false
     }
 
+    // [NEW] 수동 WebView 실행 함수 (WebViewResolver 상속 문제 해결)
+    private suspend fun runWebViewHook(url: String, referer: String) = suspendCancellableCoroutine<Unit> { cont ->
+        val hookScript = """
+            (function() {
+                if (typeof G !== 'undefined') window.G = false;
+                const originalSet = Uint8Array.prototype.set;
+                Uint8Array.prototype.set = function(source, offset) {
+                    if (source instanceof Uint8Array && source.length === 16) {
+                        var hex = Array.from(source).map(b => b.toString(16).padStart(2, '0')).join('');
+                        console.log("CapturedKeyHex:" + hex);
+                    }
+                    return originalSet.apply(this, arguments);
+                };
+                console.log("[JS-HOOK] 감시 장치 가동됨.");
+            })();
+        """.trimIndent()
+
+        // 메인 스레드에서 WebView 생성
+        Handler(Looper.getMainLooper()).post {
+            try {
+                // Context 확보 (app.context가 없으면 AcraApplication 사용)
+                val context = AcraApplication.context ?: app.context
+                val webView = WebView(context)
+                
+                webView.settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    userAgentString = DESKTOP_UA
+                }
+
+                // Console.log 납치
+                webView.webChromeClient = object : WebChromeClient() {
+                    override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
+                        val msg = consoleMessage?.message() ?: ""
+                        if (msg.startsWith("CapturedKeyHex:")) {
+                            val key = msg.removePrefix("CapturedKeyHex:")
+                            capturedKeys.add(key)
+                            println("[TVMON] [HOOK] ★★★ 키 캡처 성공: $key")
+                        } else if (msg.contains("[JS-HOOK]")) {
+                            println("[TVMON] [HOOK] JS 스크립트 정상 주입됨.")
+                        }
+                        return true
+                    }
+                }
+
+                webView.webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView?, url: String?) {
+                        super.onPageFinished(view, url)
+                        println("[TVMON] 페이지 로드 완료. Hook 주입 시도: $url")
+                        view?.evaluateJavascript(hookScript, null)
+                    }
+                }
+
+                println("[TVMON] Manual WebView 로드 시작: $url")
+                webView.loadUrl(url, mapOf("Referer" to referer))
+
+                // 10초 후 자동 종료 및 코루틴 재개
+                Handler(Looper.getMainLooper()).postDelayed({
+                    println("[TVMON] WebView 타임아웃 (10초). 종료합니다.")
+                    try {
+                        webView.destroy()
+                    } catch (e: Exception) {}
+                    if (cont.isActive) cont.resume(Unit)
+                }, 10000)
+
+            } catch (e: Exception) {
+                println("[TVMON] WebView 생성 실패: ${e.message}")
+                if (cont.isActive) cont.resume(Unit)
+            }
+        }
+    }
+
     private fun resolveUrl(baseUri: URI?, baseUrlStr: String, target: String): String {
         if (target.startsWith("http")) return target
         return try { baseUri?.resolve(target).toString() } catch (e: Exception) {
@@ -280,13 +288,9 @@ class BunnyPoorCdn : ExtractorApi() {
         }
     }
 
-    // 데이터 모델 유지
     data class Layer(@JsonProperty("name") val name: String, @JsonProperty("xor_mask") val xorMask: String? = null, @JsonProperty("pad_len") val padLen: Int? = null, @JsonProperty("segment_lengths") val segmentLengths: List<Int>? = null, @JsonProperty("real_positions") val realPositions: List<Int>? = null, @JsonProperty("init_key") val initKey: String? = null, @JsonProperty("noise_lens") val noiseLens: List<Int>? = null, @JsonProperty("perm") val perm: List<Int>? = null, @JsonProperty("rotations") val rotations: List<Int>? = null, @JsonProperty("inverse_sbox") val inverseSbox: String? = null)
     data class Key7Response(@JsonProperty("encrypted_key") val encryptedKey: String, @JsonProperty("layers") val layers: List<Layer>)
 
-    // ==========================================
-    // Proxy Server with Step-by-Step Logging
-    // ==========================================
     class ProxyWebServer {
         private var serverSocket: ServerSocket? = null
         private var isRunning = false
@@ -368,7 +372,6 @@ class BunnyPoorCdn : ExtractorApi() {
         private fun verifyMultipleKeys(): ByteArray? {
             val url = testSegmentUrl ?: return null
             println("[VERIFY] 검증 타겟 세그먼트: $url")
-            println("[VERIFY] 현재 사용 IV: ${currentIv?.joinToString("") { String.format("%02x", it) }}")
             
             return try {
                 val responseData = runBlocking { 
@@ -385,15 +388,12 @@ class BunnyPoorCdn : ExtractorApi() {
                         try {
                             val decrypted = decryptAES(testChunk, keyBytes, currentIv ?: ByteArray(16))
                             if (decrypted.isNotEmpty()) {
-                                val firstByte = String.format("%02x", decrypted[0])
-                                println("[VERIFY] 테스트 중: $hex -> 첫 바이트: 0x$firstByte")
-                                
                                 if (decrypted[0] == 0x47.toByte()) {
                                     println("[VERIFY] [SUCCESS] 유효한 키 발견! 진짜 키: $hex")
                                     return keyBytes
                                 }
                             }
-                        } catch (e: Exception) { println("[VERIFY] [FAIL] 키 오류 ($hex): ${e.message}") }
+                        } catch (e: Exception) { }
                     }
                 }
                 println("[VERIFY] [FATAL] 모든 후보 키가 일치하지 않습니다.")
