@@ -37,11 +37,12 @@ import kotlin.concurrent.thread
 import kotlin.coroutines.resume
 
 /**
- * Version: v23.5 (Forced Hooking & Early Injection)
+ * Version: v23.7 (Direct Content Inspection & ID-based Proxy)
  * Modification:
- * 1. [FIX] Inject hook at 'onPageStarted' for earlier capture.
- * 2. [FIX] Use 'Object.defineProperty' for importKey hook to bypass protection.
- * 3. [FIX] Removed entropy filter in JS to capture ALL candidates first.
+ * 1. [FIX] Fetch c.html first and check for 'key7' inside the playlist content.
+ * 2. [FIX] Skip WebView if 'key7' is not found in the playlist.
+ * 3. [FIX] WebView timeout reduced to 5 seconds.
+ * 4. [FIX] Proxy URL format: http://127.0.0.1:port/{videoId}/playlist.m3u8
  */
 class BunnyPoorCdn : ExtractorApi() {
     override val name = "TVMON"
@@ -64,7 +65,7 @@ class BunnyPoorCdn : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        println("[TVMON][v23.5] getUrl 호출됨. URL: $url")
+        println("[TVMON][v23.7] getUrl 호출됨. URL: $url")
         extract(url, referer, subtitleCallback, callback)
     }
 
@@ -79,121 +80,111 @@ class BunnyPoorCdn : ExtractorApi() {
         var cleanUrl = url.replace(Regex("[\\r\\n\\s]"), "").trim()
         val cleanReferer = referer?.replace(Regex("[\\r\\n\\s]"), "")?.trim() ?: "https://tvmon.site/"
         
-        if (!cleanUrl.contains("v/f/") && !cleanUrl.contains("v/e/")) {
+        // 1. iframe 주소로부터 실제 c.html 경로 찾기
+        if (!cleanUrl.contains("/c.html")) {
             try {
-                println("[TVMON] [STEP 1-1] iframe 주소 찾는 중...")
-                val refRes = app.get(cleanReferer)
-                val iframeMatch = Regex("""src=['"](https://player\.bunny-frame\.online/[^"']+)['"]""").find(refRes.text)
-                    ?: Regex("""data-player\d*=['"](https://player\.bunny-frame\.online/[^"']+)['"]""").find(refRes.text)
+                println("[TVMON] [STEP 1-1] 원본 소스에서 플레이어 URL 추출 시도...")
+                val refRes = app.get(cleanUrl, referer = cleanReferer)
+                val iframeMatch = Regex("""src=['"](https://[^"']+/v/[ef]/[^"']+)['"]""").find(refRes.text)
+                    ?: Regex("""data-player\d*=['"](https://[^"']+/v/[ef]/[^"']+)['"]""").find(refRes.text)
                 if (iframeMatch != null) {
                     cleanUrl = iframeMatch.groupValues[1].replace("&amp;", "&").trim()
-                    println("[TVMON] iframe 발견됨: $cleanUrl")
                 }
-            } catch (e: Exception) { println("[TVMON] [ERROR] iframe 파싱 실패: ${e.message}") }
+                
+                if (!cleanUrl.contains("/c.html")) {
+                    cleanUrl = if (cleanUrl.contains("?")) {
+                        cleanUrl.replace("/v/e/", "/v/e/").replace("/v/f/", "/v/f/").substringBefore("?") + "/c.html?" + cleanUrl.substringAfter("?")
+                    } else {
+                        "$cleanUrl/c.html"
+                    }
+                }
+            } catch (e: Exception) { println("[TVMON] [ERROR] URL 구성 실패: ${e.message}") }
         }
 
-        var capturedUrl: String? = cleanUrl
+        println("[TVMON] [STEP 2] c.html 내용 선행 분석 시작: $cleanUrl")
+        
+        val headers = mutableMapOf(
+            "User-Agent" to DESKTOP_UA,
+            "Referer" to "https://player.bunny-frame.online/",
+            "Origin" to "https://player.bunny-frame.online"
+        )
 
-        if (!cleanUrl.contains("/c.html")) {
-            println("[TVMON] [STEP 2] WebView 강력 후킹 모드 실행 (25초 대기)...")
+        val videoId = Regex("/v/[ef]/([^/]+)").find(cleanUrl)?.groupValues?.get(1) ?: "video"
+        var playlistContent: String = ""
+        try {
+            val response = app.get(cleanUrl, headers = headers)
+            playlistContent = response.text.trim()
+        } catch (e: Exception) {
+            println("[TVMON] [ERROR] c.html 로드 실패: ${e.message}")
+            return false
+        }
+
+        // 2. key7 포함 여부 확인
+        val hasKey7 = playlistContent.contains("#EXT-X-KEY") && playlistContent.contains("/v/key7")
+
+        if (hasKey7) {
+            println("[TVMON] [STEP 3] key7 감지됨! 웹뷰 후킹 가동 (5초 대기)...")
             capturedKeys.clear()
             verifiedKey = null
             
-            val webViewResult = runWebViewHook(cleanUrl, cleanReferer)
+            // 웹뷰를 통해 토큰과 세션 쿠키, 그리고 WASM에서 생성되는 키를 가로챔
+            runWebViewHook(cleanUrl, cleanReferer)
             
-            if (webViewResult != null) {
-                capturedUrl = webViewResult
-                println("[TVMON] [STEP 2-1] c.html URL 캡처 완료: $capturedUrl")
+            println("[TVMON] [STEP 4] 키 수집 종료. 후보군: ${capturedKeys.size}개. 프록시 설정 시작.")
+            
+            proxyServer?.stop()
+            proxyServer = ProxyWebServer().apply { start(); updateSession(headers) }
+
+            // IV 추출
+            val ivMatch = Regex("""IV=("?)(0x[0-9a-fA-F]+)\1""").find(playlistContent)
+            val ivHex = ivMatch?.groupValues?.get(2) ?: "0x00000000000000000000000000000000"
+            currentIv = ivHex.removePrefix("0x").hexToByteArray()
+
+            val baseUri = try { URI(cleanUrl) } catch (e: Exception) { null }
+            val sb = StringBuilder()
+            
+            playlistContent.lines().forEach { line ->
+                val trimmed = line.trim()
+                if (trimmed.isEmpty()) return@forEach
+                if (trimmed.startsWith("#")) {
+                    if (trimmed.startsWith("#EXT-X-KEY") && trimmed.contains("/v/key7")) {
+                        val match = Regex("""URI="([^"]+)"""").find(trimmed)
+                        if (match != null) {
+                            val absKey = resolveUrl(baseUri, cleanUrl, match.groupValues[1])
+                            val encKey = java.net.URLEncoder.encode(absKey, "UTF-8")
+                            sb.append(trimmed.replace(match.groupValues[1], "http://127.0.0.1:${proxyServer!!.port}/key?url=$encKey")).append("\n")
+                        } else sb.append(trimmed).append("\n")
+                    } else sb.append(trimmed).append("\n")
+                } else {
+                    val absSeg = resolveUrl(baseUri, cleanUrl, trimmed)
+                    if (testSegmentUrl == null) testSegmentUrl = absSeg
+                    val encSeg = java.net.URLEncoder.encode(absSeg, "UTF-8")
+                    sb.append("http://127.0.0.1:${proxyServer!!.port}/seg?url=$encSeg").append("\n")
+                }
             }
+            proxyServer!!.setPlaylist(sb.toString())
+
+            val proxyUrl = "http://127.0.0.1:${proxyServer!!.port}/$videoId/playlist.m3u8"
+            println("[TVMON] [FINISH] 프록시 재생 주소: $proxyUrl")
             
-            println("[TVMON] 수집 종료. 최종 확보된 키 후보: ${capturedKeys.size}개")
+            callback(newExtractorLink(name, name, proxyUrl, ExtractorLinkType.M3U8) {
+                this.referer = "https://player.bunny-frame.online/"; this.headers = headers
+            })
+            return true
+        } else {
+            println("[TVMON] [STEP 3] 일반 영상(key7 없음) 확인. 웹뷰 없이 즉시 재생.")
+            callback(newExtractorLink(name, name, cleanUrl, ExtractorLinkType.M3U8) {
+                this.referer = "https://player.bunny-frame.online/"; this.headers = headers
+            })
+            return true
         }
-
-        if (capturedUrl != null) {
-            val cookie = CookieManager.getInstance().getCookie(capturedUrl)
-            val headers = mutableMapOf(
-                "User-Agent" to DESKTOP_UA,
-                "Referer" to "https://player.bunny-frame.online/",
-                "Origin" to "https://player.bunny-frame.online"
-            )
-            if (!cookie.isNullOrEmpty()) headers["Cookie"] = cookie
-
-            try {
-                println("[TVMON] [STEP 3] M3U8 플레이리스트 획득 시도...")
-                var requestUrl = capturedUrl!!.substringBefore("#")
-                var response = app.get(requestUrl, headers = headers)
-                var content = response.text.trim()
-
-                if (!content.startsWith("#EXTM3U")) {
-                    Regex("""(https?://[^"']+\.m3u8[^"']*)""").find(content)?.let {
-                        requestUrl = it.groupValues[1]
-                        content = app.get(requestUrl, headers = headers).text.trim()
-                    }
-                }
-
-                if (content.contains("#EXT-X-STREAM-INF")) {
-                    val subUrlLine = content.lines().lastOrNull { it.isNotBlank() && !it.startsWith("#") }
-                    if (subUrlLine != null) {
-                        val originalUri = try { URI(requestUrl) } catch (e: Exception) { null }
-                        requestUrl = resolveUrl(originalUri, requestUrl, subUrlLine)
-                        content = app.get(requestUrl, headers = headers).text.trim()
-                    }
-                }
-
-                val isKey7 = content.lines().any { it.startsWith("#EXT-X-KEY") && it.contains("/v/key7") }
-                if (isKey7) {
-                    println("[TVMON] [STEP 4] Key7 프록시 가동.")
-                    proxyServer?.stop()
-                    proxyServer = ProxyWebServer().apply { start(); updateSession(headers) }
-
-                    val ivMatch = Regex("""IV=("?)(0x[0-9a-fA-F]+)\1""").find(content)
-                    val ivHex = ivMatch?.groupValues?.get(2) ?: "0x00000000000000000000000000000000"
-                    currentIv = ivHex.removePrefix("0x").hexToByteArray()
-
-                    val baseUri = try { URI(requestUrl) } catch (e: Exception) { null }
-                    val sb = StringBuilder()
-                    content.lines().forEach { line ->
-                        val trimmed = line.trim()
-                        if (trimmed.isEmpty()) return@forEach
-                        if (trimmed.startsWith("#")) {
-                            if (trimmed.startsWith("#EXT-X-KEY") && trimmed.contains("/v/key7")) {
-                                val match = Regex("""URI="([^"]+)"""").find(trimmed)
-                                if (match != null) {
-                                    val absKey = resolveUrl(baseUri, requestUrl, match.groupValues[1])
-                                    val encKey = java.net.URLEncoder.encode(absKey, "UTF-8")
-                                    sb.append(trimmed.replace(match.groupValues[1], "http://127.0.0.1:${proxyServer!!.port}/key?url=$encKey")).append("\n")
-                                } else sb.append(trimmed).append("\n")
-                            } else sb.append(trimmed).append("\n")
-                        } else {
-                            val absSeg = resolveUrl(baseUri, requestUrl, trimmed)
-                            if (testSegmentUrl == null) testSegmentUrl = absSeg
-                            val encSeg = java.net.URLEncoder.encode(absSeg, "UTF-8")
-                            sb.append("http://127.0.0.1:${proxyServer!!.port}/seg?url=$encSeg").append("\n")
-                        }
-                    }
-                    proxyServer!!.setPlaylist(sb.toString())
-                    callback(newExtractorLink(name, name, "http://127.0.0.1:${proxyServer!!.port}/playlist.m3u8", ExtractorLinkType.M3U8) {
-                        this.referer = "https://player.bunny-frame.online/"; this.headers = headers
-                    })
-                    return true
-                }
-                callback(newExtractorLink(name, name, requestUrl, ExtractorLinkType.M3U8) {
-                    this.referer = "https://player.bunny-frame.online/"; this.headers = headers
-                })
-                return true
-            } catch (e: Exception) { println("[TVMON] [ERROR] $e") }
-        }
-        return false
     }
 
-    private suspend fun runWebViewHook(url: String, referer: String) = suspendCancellableCoroutine<String?> { cont ->
-        // [v23.5] 더 강력해진 무력화 및 가로채기 스크립트
+    private suspend fun runWebViewHook(url: String, referer: String) = suspendCancellableCoroutine<Unit> { cont ->
         val hookScript = """
             (function() {
                 console.log("[JS-HOOK] Watchdog Activating...");
                 window.G = false;
-
-                // 1. importKey 강제 오버라이드 (Object.defineProperty 사용)
                 if (window.crypto && window.crypto.subtle) {
                     const originalImportKey = window.crypto.subtle.importKey;
                     Object.defineProperty(window.crypto.subtle, 'importKey', {
@@ -207,12 +198,9 @@ class BunnyPoorCdn : ExtractorApi() {
                             }
                             return originalImportKey.apply(this, arguments);
                         },
-                        configurable: true,
-                        writable: true
+                        configurable: true, writable: true
                     });
                 }
-
-                // 2. Uint8Array.set 후킹 (엔트로피 필터 제거하여 모든 16바이트 수집)
                 const originalSet = Uint8Array.prototype.set;
                 Uint8Array.prototype.set = function(source, offset) {
                     if (source && source.length === 16) {
@@ -223,74 +211,48 @@ class BunnyPoorCdn : ExtractorApi() {
                     }
                     return originalSet.apply(this, arguments);
                 };
-                console.log("[JS-HOOK] All Watchers Installed.");
             })();
         """.trimIndent()
 
         Handler(Looper.getMainLooper()).post {
             try {
-                var detectedCUrl: String? = null
                 val context: Context = (AcraApplication.context ?: app) as Context
                 val webView = WebView(context)
-                
-                webView.settings.apply {
-                    javaScriptEnabled = true
-                    domStorageEnabled = true
-                    userAgentString = DESKTOP_UA
-                    databaseEnabled = true
-                }
+                webView.settings.javaScriptEnabled = true
+                webView.settings.domStorageEnabled = true
+                webView.settings.userAgentString = DESKTOP_UA
 
                 webView.webChromeClient = object : WebChromeClient() {
                     override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
                         val msg = consoleMessage?.message() ?: ""
                         if (msg.startsWith("CapturedKeyHex:")) {
                             val key = msg.substringAfter("CapturedKeyHex:").removePrefix("[SET]").removePrefix("[CRYPTO]")
-                            if (capturedKeys.add(key)) {
-                                println("[TVMON] [HOOK] 키 캡처 성공 ($key) - Source: $msg")
-                            }
+                            capturedKeys.add(key)
                         }
                         return true
                     }
                 }
 
                 webView.webViewClient = object : WebViewClient() {
-                    // [v23.5] 페이지 시작 시점에 즉시 주입 (WASM 실행 전 선점)
                     override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
-                        super.onPageStarted(view, url, favicon)
                         view?.evaluateJavascript(hookScript, null)
                     }
-
-                    override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
-                        val reqUrl = request?.url?.toString() ?: ""
-                        if (reqUrl.contains("/c.html") && reqUrl.contains("token=")) {
-                            println("[TVMON] [INTERCEPT] c.html 감지: $reqUrl")
-                            detectedCUrl = reqUrl
-                            // 주입 보강
-                            view?.post { view.evaluateJavascript(hookScript, null) }
-                        }
-                        return super.shouldInterceptRequest(view, request)
-                    }
-
                     override fun onPageFinished(view: WebView?, url: String?) {
-                        super.onPageFinished(view, url)
                         view?.evaluateJavascript(hookScript, null)
                     }
                 }
 
-                println("[TVMON] WebView 로드 시작: $url")
                 webView.loadUrl(url, mapOf("Referer" to referer))
 
-                // [v23.5] 대기 시간 25초로 증설
+                // 5초 후 강제 종료 및 복귀
                 Handler(Looper.getMainLooper()).postDelayed({
                     if (cont.isActive) {
-                        println("[TVMON] WebView 종료 (5초 경과). 확보된 키 후보: ${capturedKeys.size}개")
                         try { webView.destroy() } catch (e: Exception) {}
-                        cont.resume(detectedCUrl)
+                        cont.resume(Unit)
                     }
                 }, 5000)
-
             } catch (e: Exception) {
-                if (cont.isActive) cont.resume(null)
+                if (cont.isActive) cont.resume(Unit)
             }
         }
     }
@@ -302,9 +264,6 @@ class BunnyPoorCdn : ExtractorApi() {
             else "${baseUrlStr.substringBeforeLast("/")}/$target"
         }
     }
-
-    data class Layer(@JsonProperty("name") val name: String, @JsonProperty("xor_mask") val xorMask: String? = null, @JsonProperty("pad_len") val padLen: Int? = null, @JsonProperty("segment_lengths") val segmentLengths: List<Int>? = null, @JsonProperty("real_positions") val realPositions: List<Int>? = null, @JsonProperty("init_key") val initKey: String? = null, @JsonProperty("noise_lens") val noiseLens: List<Int>? = null, @JsonProperty("perm") val perm: List<Int>? = null, @JsonProperty("rotations") val rotations: List<Int>? = null, @JsonProperty("inverse_sbox") val inverseSbox: String? = null)
-    data class Key7Response(@JsonProperty("encrypted_key") val encryptedKey: String, @JsonProperty("layers") val layers: List<Layer>)
 
     class ProxyWebServer {
         private var serverSocket: ServerSocket? = null
@@ -323,20 +282,20 @@ class BunnyPoorCdn : ExtractorApi() {
             } catch (e: Exception) {}
         }
 
-        fun stop() { isRunning = false; serverSocket?.close() }
+        fun stop() { isRunning = false; try { serverSocket?.close() } catch(e: Exception){} }
         fun updateSession(h: Map<String, String>) { currentHeaders = h }
         fun setPlaylist(p: String) { currentPlaylist = p }
 
         private fun handleClient(socket: Socket) {
             try {
                 val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
-                val line = reader.readLine() ?: return
-                val parts = line.split(" ")
-                val path = parts[1]
+                val firstLine = reader.readLine() ?: return
+                val path = firstLine.split(" ")[1]
                 val output = socket.getOutputStream()
 
                 when {
-                    path.contains("/playlist.m3u8") -> {
+                    // 비디오 ID가 포함된 경로 처리
+                    path.contains("playlist.m3u8") -> {
                         output.write("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nAccess-Control-Allow-Origin: *\r\n\r\n".toByteArray())
                         output.write(currentPlaylist.toByteArray())
                     }
@@ -368,7 +327,7 @@ class BunnyPoorCdn : ExtractorApi() {
                     }
                 }
                 output.flush(); socket.close()
-            } catch (e: Exception) { socket.close() }
+            } catch (e: Exception) { try { socket.close() } catch(ex: Exception){} }
         }
 
         private fun verifyMultipleKeys(): ByteArray? {
@@ -379,7 +338,7 @@ class BunnyPoorCdn : ExtractorApi() {
                 val checkSize = 1024 
                 val safeCheckSize = if (responseData.size < checkSize) responseData.size else checkSize
                 synchronized(capturedKeys) {
-                    println("[VERIFY] 총 ${capturedKeys.size}개의 키 후보 스캔 시작.")
+                    println("[VERIFY] ${capturedKeys.size}개의 키 후보 검증 시작...")
                     for (hexKey in capturedKeys) {
                         val keyBytes = hexKey.hexToByteArray()
                         for (offset in 0..512) {
@@ -387,7 +346,7 @@ class BunnyPoorCdn : ExtractorApi() {
                             val testChunk = responseData.copyOfRange(offset, offset + safeCheckSize)
                             val decrypted = decryptAES(testChunk, keyBytes, targetIv)
                             if (decrypted.size >= 377 && decrypted[0] == 0x47.toByte() && decrypted[188] == 0x47.toByte() && decrypted[376] == 0x47.toByte()) {
-                                println("[VERIFY] ★ 정답 발견: $hexKey (Offset: $offset)")
+                                println("[VERIFY] ★ 정답 키 발견: $hexKey")
                                 return keyBytes
                             }
                         }
