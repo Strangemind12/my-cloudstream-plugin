@@ -37,11 +37,12 @@ import kotlin.concurrent.thread
 import kotlin.coroutines.resume
 
 /**
- * Version: v23.6 (Conditional Hooking & ID Path)
+ * Version: v23.7 (Build Error Fix & Context Preservation)
  * Modification:
- * 1. [FIX] key7 미감지 시 키 수집 스킵 및 즉시 재생 (논프록시)
- * 2. [FIX] WebView 최대 대기 시간 5초로 단축
- * 3. [FIX] 프록시 재생 URL에 Video ID 포함 (/{videoId}/playlist.m3u8)
+ * 1. [FIX] Wrap 'app.get' calls in 'runBlocking' inside threads to fix suspension error.
+ * 2. [KEEP] Skip hooking if no key7.
+ * 3. [KEEP] 5s WebView timeout.
+ * 4. [KEEP] Proxy URL format with Video ID.
  */
 class BunnyPoorCdn : ExtractorApi() {
     override val name = "TVMON"
@@ -64,7 +65,7 @@ class BunnyPoorCdn : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        println("[TVMON][v23.6] getUrl 호출됨. URL: $url")
+        println("[TVMON][v23.7] getUrl 호출됨.")
         extract(url, referer, subtitleCallback, callback)
     }
 
@@ -75,35 +76,31 @@ class BunnyPoorCdn : ExtractorApi() {
         callback: (ExtractorLink) -> Unit,
         thumbnailHint: String? = null,
     ): Boolean {
-        println("[TVMON] [STEP 1] extract() 프로세스 시작.")
+        println("[TVMON] [STEP 1] extract() 시작.")
         var cleanUrl = url.replace(Regex("[\\r\\n\\s]"), "").trim()
         val cleanReferer = referer?.replace(Regex("[\\r\\n\\s]"), "")?.trim() ?: "https://tvmon.site/"
         
         if (!cleanUrl.contains("v/f/") && !cleanUrl.contains("v/e/")) {
             try {
-                println("[TVMON] [STEP 1-1] iframe 주소 찾는 중...")
                 val refRes = app.get(cleanReferer)
                 val iframeMatch = Regex("""src=['"](https://player\.bunny-frame\.online/[^"']+)['"]""").find(refRes.text)
                     ?: Regex("""data-player\d*=['"](https://player\.bunny-frame\.online/[^"']+)['"]""").find(refRes.text)
                 if (iframeMatch != null) {
                     cleanUrl = iframeMatch.groupValues[1].replace("&amp;", "&").trim()
-                    println("[TVMON] iframe 발견됨: $cleanUrl")
                 }
-            } catch (e: Exception) { println("[TVMON] [ERROR] iframe 파싱 실패: ${e.message}") }
+            } catch (e: Exception) { println("[TVMON] [ERROR] iframe 파싱 실패") }
         }
 
         var capturedUrl: String? = cleanUrl
 
-        // WebView를 통해 c.html URL 확보 및 필요 시 키 수집
         if (!cleanUrl.contains("/c.html")) {
-            println("[TVMON] [STEP 2] WebView 분석 모드 실행 (최대 5초 대기)...")
+            println("[TVMON] [STEP 2] WebView 분석 실행 (5초 제한)")
             capturedKeys.clear()
             verifiedKey = null
             
             val webViewResult = runWebViewHook(cleanUrl, cleanReferer)
             if (webViewResult != null) {
                 capturedUrl = webViewResult
-                println("[TVMON] [STEP 2-1] 분석 완료: $capturedUrl")
             }
         }
 
@@ -117,12 +114,11 @@ class BunnyPoorCdn : ExtractorApi() {
             if (!cookie.isNullOrEmpty()) headers["Cookie"] = cookie
 
             try {
-                println("[TVMON] [STEP 3] M3U8 플레이리스트 확인 중...")
+                println("[TVMON] [STEP 3] M3U8 분석 중...")
                 var requestUrl = capturedUrl!!.substringBefore("#")
                 var response = app.get(requestUrl, headers = headers)
                 var content = response.text.trim()
 
-                // m3u8이 아닌 경우 내부 링크 검색
                 if (!content.startsWith("#EXTM3U")) {
                     Regex("""(https?://[^"']+\.m3u8[^"']*)""").find(content)?.let {
                         requestUrl = it.groupValues[1]
@@ -130,7 +126,6 @@ class BunnyPoorCdn : ExtractorApi() {
                     }
                 }
 
-                // 마스터 플레이리스트 처리
                 if (content.contains("#EXT-X-STREAM-INF")) {
                     val subUrlLine = content.lines().lastOrNull { it.isNotBlank() && !it.startsWith("#") }
                     if (subUrlLine != null) {
@@ -140,15 +135,13 @@ class BunnyPoorCdn : ExtractorApi() {
                     }
                 }
 
-                // Key7 존재 여부 최종 확인
                 val isKey7 = content.lines().any { it.startsWith("#EXT-X-KEY") && it.contains("/v/key7") }
                 
                 if (isKey7) {
-                    println("[TVMON] [STEP 4] Key7 감지됨. 프록시 모드 활성화.")
+                    println("[TVMON] [STEP 4] 프록시 모드 시작.")
                     proxyServer?.stop()
                     proxyServer = ProxyWebServer().apply { start(); updateSession(headers) }
 
-                    // 비디오 ID 추출 (Requirement 3)
                     val videoId = Regex("""/v/[ef]/([^/]+)""").find(capturedUrl!!)?.groupValues?.get(1) ?: "video"
                     
                     val ivMatch = Regex("""IV=("?)(0x[0-9a-fA-F]+)\1""").find(content)
@@ -178,13 +171,12 @@ class BunnyPoorCdn : ExtractorApi() {
                     }
                     proxyServer!!.setPlaylist(sb.toString())
                     
-                    // ID가 포함된 로컬 주소 반환 (Requirement 3)
                     callback(newExtractorLink(name, name, "http://127.0.0.1:${proxyServer!!.port}/$videoId/playlist.m3u8", ExtractorLinkType.M3U8) {
                         this.referer = "https://player.bunny-frame.online/"; this.headers = headers
                     })
                     return true
                 } else {
-                    println("[TVMON] [STEP 4] 일반 영상 감지. 논프록시 직접 재생.")
+                    println("[TVMON] 일반 영상 직접 재생.")
                     callback(newExtractorLink(name, name, requestUrl, ExtractorLinkType.M3U8) {
                         this.referer = "https://player.bunny-frame.online/"; this.headers = headers
                     })
@@ -198,7 +190,6 @@ class BunnyPoorCdn : ExtractorApi() {
     private suspend fun runWebViewHook(url: String, referer: String) = suspendCancellableCoroutine<String?> { cont ->
         val hookScript = """
             (function() {
-                console.log("[JS-HOOK] Watchdog Activating...");
                 window.G = false;
                 if (window.crypto && window.crypto.subtle) {
                     const originalImportKey = window.crypto.subtle.importKey;
@@ -247,9 +238,7 @@ class BunnyPoorCdn : ExtractorApi() {
                         val msg = consoleMessage?.message() ?: ""
                         if (msg.startsWith("CapturedKeyHex:")) {
                             val key = msg.substringAfter("CapturedKeyHex:").removePrefix("[SET]").removePrefix("[CRYPTO]")
-                            if (capturedKeys.add(key)) {
-                                println("[TVMON] [HOOK] 키 후보 획득 ($key)")
-                            }
+                            capturedKeys.add(key)
                         }
                         return true
                     }
@@ -264,24 +253,23 @@ class BunnyPoorCdn : ExtractorApi() {
                     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                         val reqUrl = request?.url?.toString() ?: ""
                         if (reqUrl.contains("/c.html") && reqUrl.contains("token=")) {
-                            println("[TVMON] [INTERCEPT] c.html 감지: $reqUrl")
                             detectedCUrl = reqUrl
                             view?.post { view.evaluateJavascript(hookScript, null) }
                             
-                            // [Requirement 1] key7 여부 선행 검사
+                            // [FIX] app.get() 호출 시 runBlocking 사용하여 빌드 에러 해결
                             thread {
                                 try {
-                                    val checkRes = app.get(reqUrl, headers = mapOf("User-Agent" to DESKTOP_UA, "Referer" to "https://player.bunny-frame.online/"))
-                                    if (!checkRes.text.contains("/v/key7")) {
-                                        println("[TVMON] [SKIP] key7 없음 확인됨. 즉시 반환.")
-                                        Handler(Looper.getMainLooper()).post {
-                                            if (cont.isActive) {
-                                                try { webView.destroy() } catch (e: Exception) {}
-                                                cont.resume(detectedCUrl)
+                                    runBlocking {
+                                        val checkRes = app.get(reqUrl, headers = mapOf("User-Agent" to DESKTOP_UA, "Referer" to "https://player.bunny-frame.online/"))
+                                        if (!checkRes.text.contains("/v/key7")) {
+                                            println("[TVMON] key7 없음 - 즉시 종료")
+                                            Handler(Looper.getMainLooper()).post {
+                                                if (cont.isActive) {
+                                                    try { webView.destroy() } catch (e: Exception) {}
+                                                    cont.resume(detectedCUrl)
+                                                }
                                             }
                                         }
-                                    } else {
-                                        println("[TVMON] [KEEP] key7 감지됨. 키 수집 대기 유지.")
                                     }
                                 } catch (e: Exception) {}
                             }
@@ -295,13 +283,11 @@ class BunnyPoorCdn : ExtractorApi() {
                     }
                 }
 
-                println("[TVMON] WebView 로드 시작: $url")
                 webView.loadUrl(url, mapOf("Referer" to referer))
 
-                // [Requirement 2] 5초 후 자동 종료
                 Handler(Looper.getMainLooper()).postDelayed({
                     if (cont.isActive) {
-                        println("[TVMON] WebView 타임아웃 종료 (5초).")
+                        println("[TVMON] 5초 타임아웃 종료")
                         try { webView.destroy() } catch (e: Exception) {}
                         cont.resume(detectedCUrl)
                     }
@@ -351,7 +337,6 @@ class BunnyPoorCdn : ExtractorApi() {
                 val output = socket.getOutputStream()
 
                 when {
-                    // Requirement 3: 어떤 ID 경로로 들어와도 playlist.m3u8만 포함되면 응답
                     path.contains("playlist.m3u8") -> {
                         output.write("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nAccess-Control-Allow-Origin: *\r\n\r\n".toByteArray())
                         output.write(currentPlaylist.toByteArray())
@@ -384,18 +369,18 @@ class BunnyPoorCdn : ExtractorApi() {
                     }
                 }
                 output.flush(); socket.close()
-            } catch (e: Exception) { socket.close() }
+            } catch (e: Exception) { try { socket.close() } catch(e2: Exception) {} }
         }
 
-        private fun verifyMultipleKeys(): ByteArray? {
-            val url = testSegmentUrl ?: return null
+        // [FIX] runBlocking을 사용하여 코루틴 범위 내에서 app.get() 호출
+        private fun verifyMultipleKeys(): ByteArray? = runBlocking {
+            val url = testSegmentUrl ?: return@runBlocking null
             val targetIv = currentIv ?: ByteArray(16)
-            return try {
-                val responseData = runBlocking { app.get(url, headers = currentHeaders).body.bytes() }
+            try {
+                val responseData = app.get(url, headers = currentHeaders).body.bytes()
                 val checkSize = 1024 
                 val safeCheckSize = if (responseData.size < checkSize) responseData.size else checkSize
                 synchronized(capturedKeys) {
-                    println("[VERIFY] ${capturedKeys.size}개 후보 검증 시작.")
                     for (hexKey in capturedKeys) {
                         val keyBytes = hexKey.hexToByteArray()
                         for (offset in 0..512) {
@@ -403,13 +388,12 @@ class BunnyPoorCdn : ExtractorApi() {
                             val testChunk = responseData.copyOfRange(offset, offset + safeCheckSize)
                             val decrypted = decryptAES(testChunk, keyBytes, targetIv)
                             if (decrypted.size >= 377 && decrypted[0] == 0x47.toByte() && decrypted[188] == 0x47.toByte() && decrypted[376] == 0x47.toByte()) {
-                                println("[VERIFY] ★ 정답 발견: $hexKey")
-                                return keyBytes
+                                return@synchronized keyBytes
                             }
                         }
                     }
+                    null
                 }
-                null
             } catch (e: Exception) { null }
         }
 
