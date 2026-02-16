@@ -10,12 +10,11 @@ import java.net.URLDecoder
 import java.net.URLEncoder
 
 /**
- * TVMon Provider v1.3
+ * TVMon Provider v1.4
  *
- * [v1.3 수정 사항]
- * - 상세페이지 포스터 결정 로직 버그 수정 (Critical Fix)
- * - 사이트가 og:image에 메인 URL(https://tvmon.site)을 넣어두는 경우, 이를 유효한 이미지로 착각하는 문제 해결.
- * - 메인 URL과 동일한 포스터 주소는 가짜(Invalid)로 처리하고 Fallback(전달받은 포스터)을 사용하도록 강제함.
+ * [v1.4 수정 사항]
+ * - 상세 정보 태그화: 줄거리를 제외한 정보를 태그(Tags) 리스트로 분리하여 KOTBC와 동일한 구조로 변경.
+ * - 태그 정제: "제목" 태그 제외, "개봉년도" -> "공개일" 라벨 변경, 불필요한 연도/괄호 텍스트 제거.
  */
 class TVMon : MainAPI() {
     override var mainUrl = "https://tvmon.site"
@@ -42,6 +41,9 @@ class TVMon : MainAPI() {
         "Upgrade-Insecure-Requests" to "1"
     )
 
+    // 태그 내용 정제용 정규식
+    private val tagCleanRegex = Regex("""\s*\(?\d{4}\)?.*""")
+
     override val mainPage = mainPageOf(
         "/kor_movie" to "영화",
         "/drama" to "드라마",
@@ -57,11 +59,10 @@ class TVMon : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = "$mainUrl${request.data}?page=$page"
+        println("[TVMon][v1.4] getMainPage 요청: $url")
         
         return try {
             val doc = app.get(url, headers = commonHeaders).document
-            
-            // .mov_list ul li 뿐만 아니라 .item (div)도 선택하도록 범위 확장
             var elements = doc.select(".mov_list ul li")
             if (elements.isEmpty()) {
                 elements = doc.select(".item")
@@ -71,10 +72,11 @@ class TVMon : MainAPI() {
             }
 
             val list = elements.mapNotNull { it.toSearchResponse() }
+            println("[TVMon] 메인 페이지 아이템 로드 성공: ${list.size}건")
             
             newHomePageResponse(request.name, list, hasNext = list.isNotEmpty())
         } catch (e: Exception) {
-            e.printStackTrace()
+            println("[TVMon] 메인 페이지 로드 에러: ${e.message}")
             newHomePageResponse(request.name, emptyList(), hasNext = false)
         }
     }
@@ -90,13 +92,11 @@ class TVMon : MainAPI() {
             ?: imgTag?.attr("src")
             ?: ""
 
-        // 포스터 URL이 상대경로(/data/...)인 경우 강제로 절대경로로 변환
         if (rawPoster.startsWith("/")) {
             rawPoster = "$mainUrl$rawPoster"
         }
         val fixedPoster = fixUrl(rawPoster)
 
-        // URL에 포스터 주소 인코딩해서 붙이기 (Tunneling)
         if (fixedPoster.isNotEmpty() && !fixedPoster.contains("no3.png")) {
             try {
                 val encodedPoster = URLEncoder.encode(fixedPoster, "UTF-8")
@@ -135,6 +135,7 @@ class TVMon : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
+        println("[TVMon][v1.4] 검색 실행: $query")
         val searchUrl = "$mainUrl/search?stx=$query"
         val doc = app.get(searchUrl, headers = commonHeaders).document
         
@@ -146,9 +147,8 @@ class TVMon : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        println("[TVMon] load 진입: $url")
+        println("[TVMon][v1.4] 상세 페이지 load 진입: $url")
 
-        // 1. URL 파라미터(cw_poster) 복원
         var passedPoster: String? = null
         var realUrl = url
 
@@ -163,10 +163,10 @@ class TVMon : MainAPI() {
                 if (realUrl.endsWith("?") || realUrl.endsWith("&")) {
                     realUrl = realUrl.dropLast(1)
                 }
-                println("[TVMon] Link에서 포스터 복원 성공: $passedPoster")
+                println("[TVMon] URL에서 터널링된 포스터 복원: $passedPoster")
             }
         } catch (e: Exception) {
-            e.printStackTrace()
+            println("[TVMon] 포스터 파라미터 복원 실패: ${e.message}")
         }
 
         val doc = app.get(realUrl, headers = commonHeaders).document
@@ -181,7 +181,7 @@ class TVMon : MainAPI() {
                 ?: "Unknown"
         }
         title = title!!.replace(
-            Regex("\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\s*\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\d+\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\s*[화회부].*"),
+            Regex("\\s*\\d+\\s*[화회부].*"),
             ""
         ).replace(" 다시보기", "").trim()
 
@@ -192,53 +192,53 @@ class TVMon : MainAPI() {
                 title = "$title (원제 : $pureOriTitle)"
             }
         }
+        println("[TVMon] 상세 제목 확정: $title")
 
-        // 2. 포스터 결정 로직 (v1.3 버그 수정: 가짜 이미지 필터링 강화)
         var poster = doc.selectFirst("#bo_v_poster img")?.attr("src")
             ?: doc.selectFirst("meta[property='og:image']")?.attr("content")
             ?: ""
 
-        // [v1.3 핵심 수정] 
-        // poster가 "https://tvmon.site" (메인 URL)인 경우 이미지가 아니므로 무효(Invalid) 처리해야 함.
         val isInvalidPoster = poster.isEmpty() 
             || poster.contains("no3.png") 
             || poster.contains("no_image")
-            || poster == mainUrl          // "https://tvmon.site"
-            || poster == "$mainUrl/"      // "https://tvmon.site/"
-            || poster.endsWith("/")       // 디렉토리 경로인 경우
+            || poster == mainUrl 
+            || poster == "$mainUrl/"
+            || poster.endsWith("/")
         
         if (isInvalidPoster) {
             if (passedPoster != null) {
-                println("[TVMon] 상세페이지 포스터가 무효함($poster) -> 전달받은 포스터 적용: $passedPoster")
                 poster = passedPoster
-            } else {
-                println("[TVMon] 상세페이지 포스터 없고, 전달받은 포스터도 없음.")
+                println("[TVMon] 유효하지 않은 포스터 감지 -> 터널링된 포스터 사용")
             }
-        } else {
-             println("[TVMon] 상세페이지 포스터 유효함: $poster")
         }
 
-        val infoList = doc.select(".bo_v_info dd").map { it.text().trim().replace("개봉년도:", "공개일:") }
+        // --- 태그 파싱 로직 (KOTBC 스타일로 변경) ---
+        val tagsList = mutableListOf<String>()
+        
+        // 1. 기본 정보 태그화
+        doc.select(".bo_v_info dd").forEach { dd ->
+            val text = dd.text().trim()
+            if (text.isNotEmpty() && !text.startsWith("제목")) {
+                // "개봉년도" 라벨을 "공개일"로 변경하고 괄호 내용 정제
+                val cleanedText = text.replace("개봉년도:", "공개일:")
+                                      .replace(tagCleanRegex, "").trim()
+                tagsList.add(cleanedText)
+            }
+        }
+
+        // 2. 장르 정보 태그화
         val genreList = doc.select(".ctgs dd a").filter {
             val txt = it.text()
             !txt.contains("트레일러") && !it.hasClass("btn_watch")
-        }.map { it.text().trim() }
+        }.map { it.text().trim().replace(tagCleanRegex, "") }
 
-        val genreFormatted = if (genreList.isNotEmpty()) {
-            "장르: ${genreList.joinToString(", ")}"
-        } else {
-            ""
+        if (genreList.isNotEmpty()) {
+            tagsList.add("장르: ${genreList.joinToString(", ")}")
         }
+        
+        println("[TVMon] 생성된 태그 개수: ${tagsList.size}")
 
-        val metaParts = mutableListOf<String>()
-        if (infoList.isNotEmpty()) {
-            metaParts.add(infoList.joinToString(" / "))
-        }
-        if (genreFormatted.isNotEmpty()) {
-            metaParts.add(genreFormatted)
-        }
-        val metaString = metaParts.joinToString(" / ")
-
+        // --- 줄거리 파싱 ---
         var story = doc.selectFirst(".story")?.text()?.trim()
             ?: doc.selectFirst(".tmdb-overview")?.text()?.trim()
             ?: doc.selectFirst("meta[name='description']")?.attr("content")
@@ -246,12 +246,6 @@ class TVMon : MainAPI() {
 
         if (story.contains("다시보기") && story.contains("무료")) story = "다시보기"
         if (story.isEmpty()) story = "다시보기"
-
-        val finalPlot = if (story == "다시보기") {
-            "다시보기"
-        } else {
-            "$metaString / 줄거리: $story".trim()
-        }
 
         val episodes = doc.select("#other_list ul li").mapNotNull { li ->
             val aTag = li.selectFirst("a.ep-link") ?: return@mapNotNull null
@@ -271,6 +265,7 @@ class TVMon : MainAPI() {
                 this.posterUrl = fixUrl(epThumb ?: "")
             }
         }.reversed()
+        println("[TVMon] 에피소드 파싱 완료: ${episodes.size}건")
 
         val type = determineTypeFromUrl(realUrl)
 
@@ -279,14 +274,16 @@ class TVMon : MainAPI() {
                 val movieLink = episodes.firstOrNull()?.data ?: realUrl
                 newMovieLoadResponse(title, realUrl, type, movieLink) {
                     this.posterUrl = fixUrl(poster)
-                    this.plot = finalPlot
+                    this.plot = story // 줄거리는 설명 내용만
+                    this.tags = tagsList // 기타 정보는 태그로
                 }
             }
 
             else -> {
                 newTvSeriesLoadResponse(title, realUrl, type, episodes) {
                     this.posterUrl = fixUrl(poster)
-                    this.plot = finalPlot
+                    this.plot = story // 줄거리는 설명 내용만
+                    this.tags = tagsList // 기타 정보는 태그로
                 }
             }
         }
@@ -298,6 +295,7 @@ class TVMon : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        println("[TVMon][v1.4] loadLinks 진입: $data")
         val doc = app.get(data, headers = commonHeaders).document
         val thumbnailHint = extractThumbnailHint(doc)
         val iframe = doc.selectFirst("iframe#view_iframe")
@@ -307,6 +305,7 @@ class TVMon : MainAPI() {
 
         if (playerUrl != null) {
             val finalPlayerUrl = fixUrl(playerUrl).replace("&amp;", "&")
+            println("[TVMon] 플레이어 URL 발견: $finalPlayerUrl")
             val extracted = BunnyPoorCdn().extract(
                 finalPlayerUrl,
                 data,
@@ -318,6 +317,7 @@ class TVMon : MainAPI() {
         }
 
         if (thumbnailHint != null) {
+            println("[TVMon] 썸네일 힌트 기반 다이렉트 링크 생성 시도: $thumbnailHint")
             try {
                 val pathRegex = Regex("""/v/[a-z]/[a-zA-Z0-9]+""")
                 val pathMatch = pathRegex.find(thumbnailHint)
@@ -335,7 +335,7 @@ class TVMon : MainAPI() {
                     return true
                 }
             } catch (e: Exception) {
-                e.printStackTrace()
+                println("[TVMon] 다이렉트 링크 생성 에러: ${e.message}")
             }
         }
         return false
