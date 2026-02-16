@@ -11,7 +11,7 @@ import org.jsoup.nodes.Element
  */
 class Kotbc : MainAPI() {
     override var mainUrl = "https://m135.kotbc2.com"
-    override var name = "Kotbc"
+    override var name = "KOTBC"
     override val hasMainPage = true
     override var lang = "ko"
     
