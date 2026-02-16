@@ -5,9 +5,11 @@ import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Element
 
 /**
- * Kotbc Provider v1.5
- * - KotbcPlugin 및 Extractor와의 호환성 확인
- * - TvType.Variety 제거 상태 유지
+ * Kotbc Provider v2.3
+ * - Update: import utils.* 적용
+ * - Fix: 포스터 이미지 상대 경로(../data/...) 처리
+ * - Fix: 시리즈 에피소드 파싱 (.serial-list)
+ * - Fix: form.tt2 로직 강화
  */
 class Kotbc : MainAPI() {
     override var mainUrl = "https://m135.kotbc2.com"
@@ -37,7 +39,9 @@ class Kotbc : MainAPI() {
 
         return try {
             val doc = app.get(url).document
-            val elements = doc.select(".list-row .list-box")
+            // 소스 분석 결과: .list-body .list-row .list-box
+            val elements = doc.select(".list-body .list-row .list-box")
+            
             println("[Kotbc] Found elements: ${elements.size}")
 
             val list = elements.mapNotNull { element ->
@@ -61,7 +65,7 @@ class Kotbc : MainAPI() {
 
         return try {
             val doc = app.get(url).document
-            val elements = doc.select(".list-row .list-box")
+            val elements = doc.select(".list-body .list-row .list-box")
             println("[Kotbc] Search results found: ${elements.size}")
 
             elements.mapNotNull { element ->
@@ -74,28 +78,37 @@ class Kotbc : MainAPI() {
         }
     }
 
+    // ============================================================
+    // 아이템 파싱 (공통)
+    // ============================================================
     private fun Element.toSearchResponse(): SearchResponse? {
         try {
-            val linkEl = this.selectFirst(".list-img a") ?: this.selectFirst(".list-desc a")
+            // 링크 (.list-front .list-img a 또는 .list-text .list-desc a)
+            val linkEl = this.selectFirst(".list-front a") ?: this.selectFirst("a")
             val href = linkEl?.attr("href") ?: return null
-            
-            var title = this.selectFirst(".post-title")?.text()?.trim() ?: ""
-            if (title.isEmpty()) title = linkEl.text().trim()
+            val fullUrl = fixUrl(href)
 
-            // 제목 뒤 (2026) 같은 연도 제거
+            // 제목 (.post-title)
+            val titleEl = this.selectFirst(".post-title")
+            var title = titleEl?.text()?.trim() ?: linkEl.text().trim()
+            
+            // 제목 뒤 연도 및 괄호 제거
             title = title.replace(Regex("\\s*\\(\\d{4}\\)$"), "").trim()
 
-            val imgTag = this.selectFirst(".img-item img")
-            val posterUrl = imgTag?.attr("src")
+            // 포스터 (.img-item img)
+            val imgTag = this.selectFirst(".img-item img") ?: this.selectFirst("img")
+            val rawSrc = imgTag?.attr("src")
+            val posterUrl = rawSrc?.let { resolvePosterUrl(it) }
 
-            val type = if (href.contains("movie")) TvType.Movie else TvType.TvSeries
+            // 타입 결정
+            val type = if (href.contains("bo_table=movie")) TvType.Movie else TvType.TvSeries
 
             return if (type == TvType.Movie) {
-                newMovieSearchResponse(title, href, TvType.Movie) {
+                newMovieSearchResponse(title, fullUrl, TvType.Movie) {
                     this.posterUrl = posterUrl
                 }
             } else {
-                newTvSeriesSearchResponse(title, href, TvType.TvSeries) {
+                newTvSeriesSearchResponse(title, fullUrl, TvType.TvSeries) {
                     this.posterUrl = posterUrl
                 }
             }
@@ -106,39 +119,72 @@ class Kotbc : MainAPI() {
     }
 
     // ============================================================
-    // 상세 페이지
+    // 상세 페이지 로드
     // ============================================================
     override suspend fun load(url: String): LoadResponse {
         println("[Kotbc] Load Detail: $url")
         val doc = app.get(url).document
 
-        val titleElement = doc.selectFirst(".view-title h1")
-        var title = titleElement?.text()?.trim() ?: "Unknown Title"
+        // 제목
+        val titleEl = doc.selectFirst(".view-title h1")
+        var title = titleEl?.text()?.trim() ?: "Unknown Title"
         title = title.replace(Regex("\\s*\\(\\d{4}\\)$"), "").trim()
 
-        val poster = doc.selectFirst("meta[property='og:image']")?.attr("content")
-            ?: doc.selectFirst(".view-content img")?.attr("src")
+        // 포스터
+        val posterEl = doc.selectFirst(".view-info .image img")
+        val poster = posterEl?.attr("src")?.let { resolvePosterUrl(it) }
 
-        val description = doc.selectFirst("meta[name='description']")?.attr("content")
-            ?: doc.selectFirst(".view-content")?.text()?.take(200)
+        // 줄거리
+        val description = doc.selectFirst(".view-cont")?.text()?.trim()
 
-        val tags = doc.select(".view-tag a").map { it.text() }
-        val type = if (url.contains("movie")) TvType.Movie else TvType.TvSeries
+        // 태그
+        val tags = doc.select(".view-info p span.block:last-child").map { it.text() }
         
-        return if (type == TvType.Movie) {
-            newMovieLoadResponse(title, url, TvType.Movie, url) {
+        val type = if (url.contains("bo_table=movie")) TvType.Movie else TvType.TvSeries
+        
+        if (type == TvType.Movie) {
+            return newMovieLoadResponse(title, url, TvType.Movie, url) {
                 this.posterUrl = poster
                 this.plot = description
                 this.tags = tags
             }
         } else {
-            // newEpisode 사용
-            newTvSeriesLoadResponse(title, url, TvType.TvSeries, listOf(
-                newEpisode(url) {
+            // 시리즈 에피소드 파싱 (.serial-list)
+            val episodes = mutableListOf<Episode>()
+            val episodeItems = doc.select(".serial-list .list-body .list-item")
+            
+            println("[Kotbc] Found ${episodeItems.size} episodes")
+
+            if (episodeItems.isNotEmpty()) {
+                episodeItems.forEach { item ->
+                    val linkEl = item.selectFirst("a.item-subject")
+                    val epHref = linkEl?.attr("href")
+                    val epName = linkEl?.text()?.trim() ?: "Episode"
+                    // 번호 추출
+                    val epNum = Regex("(\\d+)[화회]").find(epName)?.groupValues?.get(1)?.toIntOrNull()
+                    
+                    if (!epHref.isNullOrEmpty()) {
+                        val fullEpUrl = fixUrl(epHref)
+                        episodes.add(
+                            newEpisode(fullEpUrl) {
+                                this.name = epName
+                                this.episode = epNum
+                                this.posterUrl = poster
+                            }
+                        )
+                    }
+                }
+            } else {
+                episodes.add(newEpisode(url) {
                     this.name = title
                     this.posterUrl = poster
-                }
-            )) {
+                })
+            }
+
+            // 에피소드 번호순 정렬
+            val sortedEpisodes = episodes.sortedBy { it.episode ?: 0 }
+
+            return newTvSeriesLoadResponse(title, url, TvType.TvSeries, sortedEpisodes) {
                 this.posterUrl = poster
                 this.plot = description
                 this.tags = tags
@@ -160,27 +206,30 @@ class Kotbc : MainAPI() {
         try {
             val doc = app.get(data).document
             
-            // form.tt2 요소 찾기
-            val form = doc.selectFirst("form.tt2")
-            if (form == null) {
-                println("[Kotbc] form.tt2 not found!")
-                return false
+            // 1. form.tt2 찾기
+            val form = doc.selectFirst("form.tt2") ?: doc.selectFirst("form.tt")
+            
+            if (form != null) {
+                val action = form.attr("action")
+                val vParam = form.selectFirst("input[name=v]")?.attr("value")
+
+                println("[Kotbc] Found form action: $action, v: $vParam")
+
+                if (action.isNotEmpty() && !vParam.isNullOrEmpty()) {
+                    val targetUrl = "$action?v=$vParam"
+                    val extractor = KotbcExtractor()
+                    extractor.getUrl(targetUrl, mainUrl, subtitleCallback, callback)
+                    return true
+                }
             }
-
-            val action = form.attr("action")
-            val vParam = form.selectFirst("input[name=v]")?.attr("value")
-
-            println("[Kotbc] Found form action: $action, v: $vParam")
-
-            if (action.isNotEmpty() && !vParam.isNullOrEmpty()) {
-                val targetUrl = "$action?v=$vParam"
-                println("[Kotbc] Generated target URL: $targetUrl")
-                
-                // ExtractorApi를 상속받은 클래스 인스턴스 생성 및 호출
-                val extractor = KotbcExtractor()
-                extractor.getUrl(targetUrl, mainUrl, subtitleCallback, callback)
-            } else {
-                println("[Kotbc] Invalid form data")
+            
+            // 2. 백업: iframe 검색
+            doc.select("iframe").forEach { iframe ->
+                val src = iframe.attr("src")
+                if (src.contains("nnmo0oi1") || src.contains("glamov")) {
+                     val extractor = KotbcExtractor()
+                     extractor.getUrl(fixUrl(src), mainUrl, subtitleCallback, callback)
+                }
             }
 
         } catch (e: Exception) {
@@ -189,5 +238,34 @@ class Kotbc : MainAPI() {
         }
 
         return true
+    }
+
+    // URL 보정 함수
+    private fun fixUrl(url: String): String {
+        if (url.startsWith("http")) return url
+        if (url.startsWith("//")) return "https:$url"
+        
+        val baseUrl = "$mainUrl/bbs/"
+        
+        if (url.startsWith("./")) {
+            return baseUrl + url.substring(2)
+        }
+        if (url.startsWith("/")) {
+            return mainUrl + url
+        }
+        return baseUrl + url
+    }
+
+    // 포스터 URL 보정 함수
+    private fun resolvePosterUrl(url: String): String {
+        if (url.startsWith("http")) return url
+        
+        if (url.startsWith("../")) {
+            return mainUrl + "/" + url.substring(3)
+        }
+        if (url.startsWith("/")) {
+            return mainUrl + url
+        }
+        return "$mainUrl/bbs/$url"
     }
 }
