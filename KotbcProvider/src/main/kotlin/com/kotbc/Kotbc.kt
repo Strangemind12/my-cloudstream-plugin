@@ -25,7 +25,7 @@ class Kotbc : MainAPI() {
         "movie" to "영화",
         "drama" to "드라마",
         "enter" to "예능/시사",
-        "mid" to "미드"
+        "mid" to "해외드라마"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
