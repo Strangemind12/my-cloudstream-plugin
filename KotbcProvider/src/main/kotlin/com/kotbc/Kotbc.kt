@@ -5,11 +5,10 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import org.jsoup.nodes.Element
 
 /**
- * Kotbc Provider v1.1
- * - 메인 메뉴: 영화, 드라마, 예능, 미드
- * - 제목 연도 제거 (예: (2026))
- * - tt2 폼 데이터를 이용한 링크 추출
- * - KotbcExtractor 연동
+ * Kotbc Provider v1.4
+ * - Build Fix: newEpisode 사용 (Episode 생성자 경고 해결)
+ * - TvType.Variety 제거
+ * - KotbcExtractor(Class) 인스턴스 호출 방식으로 변경
  */
 class Kotbc : MainAPI() {
     override var mainUrl = "https://m135.kotbc2.com"
@@ -17,10 +16,12 @@ class Kotbc : MainAPI() {
     override val hasMainPage = true
     override var lang = "ko"
     
+    // Variety 제거됨
     override val supportedTypes = setOf(
         TvType.Movie,
         TvType.TvSeries,
-        TvType.AsianDrama    )
+        TvType.AsianDrama
+    )
 
     override val mainPage = mainPageOf(
         "movie" to "영화",
@@ -133,12 +134,12 @@ class Kotbc : MainAPI() {
                 this.tags = tags
             }
         } else {
+            // Build Fix: newEpisode 사용
             newTvSeriesLoadResponse(title, url, TvType.TvSeries, listOf(
-                Episode(
-                    url,
-                    title,
-                    posterUrl = poster
-                )
+                newEpisode(url) {
+                    this.name = title
+                    this.posterUrl = poster
+                }
             )) {
                 this.posterUrl = poster
                 this.plot = description
@@ -148,7 +149,7 @@ class Kotbc : MainAPI() {
     }
 
     // ============================================================
-    // 링크 추출 (수정됨)
+    // 링크 추출
     // ============================================================
     override suspend fun loadLinks(
         data: String,
@@ -161,27 +162,26 @@ class Kotbc : MainAPI() {
         try {
             val doc = app.get(data).document
             
-            // 요청사항: form.tt2 요소 찾기
+            // form.tt2 요소 찾기
             val form = doc.selectFirst("form.tt2")
             if (form == null) {
                 println("[Kotbc] form.tt2 not found!")
                 return false
             }
 
-            // action 속성 가져오기 (예: https://mov.glamov.com/detail.php)
             val action = form.attr("action")
-            // hidden input 'v' 값 가져오기
             val vParam = form.selectFirst("input[name=v]")?.attr("value")
 
             println("[Kotbc] Found form action: $action, v: $vParam")
 
             if (action.isNotEmpty() && !vParam.isNullOrEmpty()) {
-                // GET 방식 URL 생성
                 val targetUrl = "$action?v=$vParam"
                 println("[Kotbc] Generated target URL: $targetUrl")
                 
-                // Extractor 호출
-                KotbcExtractor.fetch(targetUrl, mainUrl, callback)
+                // [변경] ExtractorApi를 상속받은 클래스 인스턴스 생성 및 호출
+                // MoviekingProvider와 유사한 구조
+                val extractor = KotbcExtractor()
+                extractor.getUrl(targetUrl, mainUrl, subtitleCallback, callback)
             } else {
                 println("[Kotbc] Invalid form data")
             }
