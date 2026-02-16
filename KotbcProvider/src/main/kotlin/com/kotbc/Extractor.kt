@@ -1,19 +1,37 @@
 package com.kotbc
 
-import com.lagradost.cloudstream3.app
-import com.lagradost.cloudstream3.utils.*
+import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import android.webkit.ConsoleMessage
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.webkit.CookieManager
 import com.lagradost.cloudstream3.SubtitleFile
-import com.fasterxml.jackson.annotation.JsonProperty
+import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.AcraApplication
+import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.newExtractorLink
+import kotlinx.coroutines.suspendCancellableCoroutine
+import java.net.URI
+import java.util.Collections
+import kotlin.coroutines.resume
 
 /**
- * KotbcExtractor v2.8
- * - Fix: securedLink 우선 추출 (MD5/Expires 파라미터 포함된 진짜 링크)
- * - Fix: Hash 추출 패턴 강화 (모든 32자리 Hex 검색)
+ * KotbcExtractor v3.0 (Based on TVWiki/TVMON Provider)
+ * - Uses WebView to intercept M3U8 requests from nnmo0oi1.com / mov.glamov.com
  */
 class KotbcExtractor : ExtractorApi() {
     override val name = "Kotbc"
     override val mainUrl = "https://mov.glamov.com"
-    override val requiresReferer = false
+    override val requiresReferer = true
+    
+    private val DESKTOP_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
 
     override suspend fun getUrl(
         url: String,
@@ -21,121 +39,99 @@ class KotbcExtractor : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        println("[KotbcExtractor] Fetching: $url")
-        try {
-            // 1. mov.glamov 페이지 요청
-            val response = app.get(url, headers = mapOf("Referer" to "https://m135.kotbc2.com"))
-            val html = response.text
+        println("[Kotbc] getUrl: $url")
+        extract(url, referer, subtitleCallback, callback)
+    }
 
-            // 2. 내부 iframe 찾기 (nnmo0oi1.com/video/...)
-            val iframeRegex = Regex("""src=["'](https://nnmo0oi1\.com/video/[^"']+)["']""")
-            val iframeMatch = iframeRegex.find(html)
+    suspend fun extract(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        // WebView를 통해 최종 M3U8 URL을 획득
+        val capturedUrl = runWebViewHook(url, referer ?: "https://m135.kotbc2.com/")
+        
+        if (capturedUrl != null) {
+            println("[Kotbc] WebView 캡처 성공: $capturedUrl")
             
-            var targetUrl = url
-            
-            if (iframeMatch != null) {
-                targetUrl = iframeMatch.groupValues[1]
-                println("[KotbcExtractor] Found video iframe: $targetUrl")
+            val headers = mutableMapOf(
+                "User-Agent" to DESKTOP_UA,
+                "Referer" to "https://nnmo0oi1.com/", // 스트리밍 시 필요한 리퍼러
+                "Origin" to "https://nnmo0oi1.com"
+            )
+
+            // 쿠키가 있다면 추가
+            val cookie = CookieManager.getInstance().getCookie(capturedUrl)
+            if (!cookie.isNullOrEmpty()) {
+                headers["Cookie"] = cookie
             }
 
-            // 3. 비디오 페이지(nnmo0oi1) 내용 가져오기
-            val videoHtml = if (targetUrl != url) {
-                // iframe 요청 시 referer는 mov.glamov.com (즉, 현재 url)
-                app.get(targetUrl, headers = mapOf("Referer" to url)).text
-            } else {
-                html
-            }
-
-            // 4. API를 통한 영상 추출
-            // originalReferer는 r값 생성을 위해 필요 (glamov 주소)
-            if (fetchVideoApi(videoHtml, targetUrl, url, callback)) {
-                return
-            }
-
-            // 5. 실패 시 내장 추출기 백업
-            println("[KotbcExtractor] API failed, trying loadExtractor fallback")
-            loadExtractor(targetUrl, subtitleCallback = subtitleCallback, callback = callback)
-
-        } catch (e: Exception) {
-            println("[KotbcExtractor] Error: ${e.message}")
-            e.printStackTrace()
+            callback(newExtractorLink(name, name, capturedUrl, ExtractorLinkType.M3U8) {
+                this.headers = headers
+            })
+            return true
+        } else {
+            println("[Kotbc] WebView 캡처 실패")
+            return false
         }
     }
 
-    private suspend fun fetchVideoApi(
-        html: String, 
-        videoPageUrl: String, 
-        originalReferer: String, 
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        try {
-            println("[KotbcExtractor] Attempting API extraction...")
-            
-            // 1. Hash 추출 (32자리 hex)
-            // HTML 내에 있는 모든 32자리 소문자 Hex 값을 찾아서 시도해봄 (가장 확실한 방법)
-            val allHexPattern = Regex("""['"]([a-f0-9]{32})['"]""")
-            val matches = allHexPattern.findAll(html).map { it.groupValues[1] }.toSet()
-            
-            if (matches.isEmpty()) {
-                println("[KotbcExtractor] No hash found in HTML")
-                return false
-            }
-
-            // r 값 설정 (mov.glamov.com)
-            val rValue = if (originalReferer.contains("glamov")) originalReferer else "https://mov.glamov.com/"
-
-            // 2. 각 Hash 후보에 대해 API 요청 시도
-            for (hash in matches) {
-                println("[KotbcExtractor] Trying hash: $hash")
+    private suspend fun runWebViewHook(url: String, referer: String) = suspendCancellableCoroutine<String?> { cont ->
+        println("[Kotbc] WebView 실행: $url")
+        val handler = Handler(Looper.getMainLooper())
+        
+        handler.post {
+            try {
+                val context: Context = (AcraApplication.context ?: app) as Context
+                val webView = WebView(context)
                 
-                val apiUrl = "https://nnmo0oi1.com/player/index.php?data=$hash&do=getVideo"
-                
-                val headers = mapOf(
-                    "X-Requested-With" to "XMLHttpRequest",
-                    "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
-                    "Origin" to "https://nnmo0oi1.com",
-                    "Referer" to videoPageUrl,
-                    "Accept" to "*/*"
-                )
-                
-                val params = mapOf(
-                    "hash" to hash,
-                    "r" to rValue
-                )
+                webView.settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    userAgentString = DESKTOP_UA
+                }
 
-                val apiResponse = app.post(apiUrl, headers = headers, data = params).text
-                
-                // 성공적인 응답인지 확인 (securedLink가 있어야 함)
-                if (apiResponse.contains("securedLink")) {
-                    println("[KotbcExtractor] API Success with hash: $hash")
-                    println("[KotbcExtractor] API Response: $apiResponse")
-                    
-                    // 3. JSON 파싱 및 링크 추출
-                    // securedLink 우선 추출
-                    val securedLinkRegex = Regex("""["']securedLink["']\s*:\s*["']([^"']+)["']""")
-                    var videoUrl = securedLinkRegex.find(apiResponse)?.groupValues?.get(1)?.replace("\\/", "/")
-
-                    if (videoUrl != null) {
-                        println("[KotbcExtractor] Found Secured Video URL: $videoUrl")
-                        callback(
-                            newExtractorLink(
-                                name = name,
-                                source = name,
-                                url = videoUrl,
-                                type = ExtractorLinkType.M3U8
-                            ) {
-                                this.referer = "https://nnmo0oi1.com"
-                                this.quality = Qualities.Unknown.value
-                            }
-                        )
-                        return true
+                // 타임아웃 설정 (15초 내에 못 찾으면 종료)
+                val discoveryTimeout = Runnable {
+                    if (cont.isActive) {
+                        println("[Kotbc] WebView Timeout")
+                        try { webView.destroy() } catch (e: Exception) {}
+                        cont.resume(null)
                     }
                 }
-            }
+                handler.postDelayed(discoveryTimeout, 15000)
 
-        } catch (e: Exception) {
-            println("[KotbcExtractor] API extraction failed: ${e.message}")
+                webView.webViewClient = object : WebViewClient() {
+                    override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                        val reqUrl = request?.url?.toString() ?: ""
+                        
+                        // [핵심] M3U8 또는 Master.txt 요청 감지
+                        // nnmo0oi1.com 도메인의 .m3u8 또는 .txt 요청을 찾음
+                        if ((reqUrl.contains(".m3u8") || reqUrl.contains(".txt") || reqUrl.contains("master")) 
+                            && (reqUrl.contains("nnmo0oi1.com") || reqUrl.contains("bunny-frame") || reqUrl.contains("glamov"))) {
+                            
+                            println("[Kotbc] Target URL Intercepted: $reqUrl")
+                            
+                            handler.removeCallbacks(discoveryTimeout)
+                            
+                            // 코루틴 재개 (결과 반환)
+                            if (cont.isActive) {
+                                view?.post { try { webView.destroy() } catch (e: Exception) {} }
+                                cont.resume(reqUrl)
+                            }
+                            return null
+                        }
+                        return super.shouldInterceptRequest(view, request)
+                    }
+                }
+
+                webView.loadUrl(url, mapOf("Referer" to referer))
+
+            } catch (e: Exception) {
+                println("[Kotbc] WebView Init Error: ${e.message}")
+                if (cont.isActive) cont.resume(null)
+            }
         }
-        return false
     }
 }
