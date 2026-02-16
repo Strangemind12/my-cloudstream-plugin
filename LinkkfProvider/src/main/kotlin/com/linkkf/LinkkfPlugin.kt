@@ -9,7 +9,5 @@ class LinkkfPlugin : Plugin() {
     override fun load(context: Context) {
         // All providers should be added in this manner
         registerMainAPI(Linkkf())
-        registerExtractorAPI(LinkkfExtractor())
-
     }
 }
