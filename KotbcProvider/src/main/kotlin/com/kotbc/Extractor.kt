@@ -1,13 +1,13 @@
 package com.kotbc
 
 import com.lagradost.cloudstream3.app
-import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.utils.* // 요청하신 import 추가
 import com.lagradost.cloudstream3.SubtitleFile
 
 /**
  * KotbcExtractor v2.3
- * - Update: import utils.* 적용
- * - Logic: mov.glamov -> iframe(nnmo0oi1) -> m3u8 regex
+ * - Fix: extractM3u8 함수에 suspend 키워드 추가 (빌드 에러 해결)
+ * - Import: utils.* 추가
  */
 class KotbcExtractor : ExtractorApi() {
     override val name = "Kotbc"
@@ -35,16 +35,18 @@ class KotbcExtractor : ExtractorApi() {
             if (iframeMatch != null) {
                 targetUrl = iframeMatch.groupValues[1]
                 println("[KotbcExtractor] Found video iframe: $targetUrl")
+            } else if (!url.contains("nnmo0oi1.com")) {
+                 println("[KotbcExtractor] No nnmo0oi1 iframe found, scanning current page content.")
             }
 
-            // 3. 비디오 페이지(nnmo0oi1) 내용 가져오기
+            // 3. 비디오 페이지(nnmo0oi1) 내용 가져오기 (만약 url이 바뀌었다면)
             val videoHtml = if (targetUrl != url) {
                 app.get(targetUrl, headers = mapOf("Referer" to url)).text
             } else {
                 html
             }
 
-            // 4. M3U8 링크 추출
+            // 4. M3U8 링크 추출 (suspend 함수 호출)
             extractM3u8(videoHtml, targetUrl, callback)
 
         } catch (e: Exception) {
@@ -53,7 +55,8 @@ class KotbcExtractor : ExtractorApi() {
         }
     }
 
-    private fun extractM3u8(html: String, refererUrl: String, callback: (ExtractorLink) -> Unit) {
+    // [Fix] suspend 키워드 추가: newExtractorLink가 suspend 함수이므로 필수
+    private suspend fun extractM3u8(html: String, refererUrl: String, callback: (ExtractorLink) -> Unit) {
         // .m3u8 링크 찾기
         val m3u8Regex = Regex("""(https?://[^"']+\.m3u8)""")
         val matches = m3u8Regex.findAll(html)
@@ -62,6 +65,7 @@ class KotbcExtractor : ExtractorApi() {
             val m3u8Url = match.value
             println("[KotbcExtractor] Found M3U8: $m3u8Url")
             
+            // newExtractorLink는 suspend 함수임
             callback(
                 newExtractorLink(
                     name = name,
