@@ -5,8 +5,9 @@ import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Element
 
 /**
- * Kotbc Provider v3.0
- * - Refactor: TVWiki/TVMON 방식의 WebView 기반 Extractor 사용
+ * Kotbc Provider v3.1
+ * - Update: 에피소드 정규식에 '부' 추가 (화/회/부)
+ * - Update: 상세 정보 태그 파싱 로직 개선 (제목 제외, 개요->장르 변환 및 텍스트 정제, 라벨링 추가)
  */
 class Kotbc : MainAPI() {
     override var mainUrl = "https://m135.kotbc2.com"
@@ -75,7 +76,38 @@ class Kotbc : MainAPI() {
         val title = doc.selectFirst(".view-title h1")?.text()?.trim()?.replace(Regex("\\s*\\(\\d{4}\\)$"), "") ?: "Unknown"
         val poster = doc.selectFirst(".view-info .image img")?.attr("src")?.let { resolvePosterUrl(it) }
         val description = doc.selectFirst(".view-cont")?.text()?.trim()
-        val tags = doc.select(".view-info p span.block:last-child").map { it.text() }
+        
+        // [수정] 태그 파싱 로직 개선
+        val tags = doc.select(".view-info p").mapNotNull { p ->
+            val labelEl = p.selectFirst("span.block:first-child")
+            val valueEl = p.selectFirst("span.block:last-child")
+            
+            if (labelEl != null && valueEl != null) {
+                var label = labelEl.text().trim()
+                var value = valueEl.text().trim()
+
+                // 1. "제목" 태그는 제외
+                if (label == "제목") return@mapNotNull null
+
+                // 2. "개요" -> "장르"로 변경 및 내용 정제
+                if (label == "개요") {
+                    label = "장르"
+                    // 예: "드라마/코미디 한국영화 (2025)" -> "드라마/코미디"
+                    // "한국영화 (2025)", "해외영화 (2004)" 등의 패턴 제거
+                    value = value.replace(Regex("\\s*(한국|해외)?영화\\s*\\(\\d{4}\\).*"), "").trim()
+                }
+
+                // 내용이 있을 경우에만 "라벨: 내용" 형식으로 반환
+                if (value.isNotEmpty()) {
+                    "$label: $value"
+                } else {
+                    null
+                }
+            } else {
+                null
+            }
+        }
+
         val type = if (url.contains("bo_table=movie")) TvType.Movie else TvType.TvSeries
         
         if (type == TvType.Movie) {
@@ -90,7 +122,10 @@ class Kotbc : MainAPI() {
                 val linkEl = item.selectFirst("a.item-subject")
                 val epHref = linkEl?.attr("href")
                 val epName = linkEl?.text()?.trim() ?: "Episode"
-                val epNum = Regex("(\\d+)[화회]").find(epName)?.groupValues?.get(1)?.toIntOrNull()
+                
+                // [수정] 에피소드 정규식에 '부' 추가
+                val epNum = Regex("(\\d+)[화회부]").find(epName)?.groupValues?.get(1)?.toIntOrNull()
+                
                 if (!epHref.isNullOrEmpty()) {
                     episodes.add(newEpisode(fixUrl(epHref)) {
                         this.name = epName
@@ -114,7 +149,6 @@ class Kotbc : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // [수정] tt2 폼 데이터를 이용해 Extractor 호출
         try {
             val doc = app.get(data).document
             val form = doc.selectFirst("form.tt2") ?: doc.selectFirst("form.tt")
