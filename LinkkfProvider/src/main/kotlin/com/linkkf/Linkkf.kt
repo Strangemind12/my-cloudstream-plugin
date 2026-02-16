@@ -3,20 +3,19 @@ package com.linkkf
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
-import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.network.WebViewResolver
 import org.jsoup.nodes.Element
 
 class Linkkf : MainAPI() {
-    // v1.11: 403 Forbidden 해결을 위한 Referer 전략 수정
+    // v1.12: SupportedTypes 정리 (TvSeries, Movie 제거 -> Anime로 통일)
     override var mainUrl = "https://linkkf.tv"
     override var name = "Linkkf"
     override val hasMainPage = true
     override var lang = "ko"
 
+    // [수정됨] TvSeries, Movie 제거
     override val supportedTypes = setOf(
-        TvType.TvSeries,
-        TvType.Movie,
         TvType.Anime,
         TvType.OVA
     )
@@ -108,7 +107,8 @@ class Linkkf : MainAPI() {
                 } else null
             }.reversed()
 
-            return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
+            // [수정됨] TvType.TvSeries -> TvType.Anime 로 변경
+            return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
                 this.posterUrl = poster
                 this.plot = description
                 this.tags = tags
@@ -135,9 +135,7 @@ class Linkkf : MainAPI() {
             subtitleCallback.invoke(SubtitleFile("Korean", result.subtitleUrl))
         }
 
-        // [v1.11 수정] Referer 결정 로직
-        // needsWebView가 true인 경우(구형 플레이어), m3u8Url 변수에는 '플레이어 페이지 주소'가 들어있음.
-        // 이를 Referer로 사용해야 403 에러를 피할 수 있습니다.
+        // 구형 플레이어(needsWebView=true) 대응: Referer를 플레이어 페이지로 설정
         val playerPageUrl = result.m3u8Url
         val targetReferer = if (result.needsWebView) playerPageUrl else "$mainUrl/"
 
@@ -166,7 +164,6 @@ class Linkkf : MainAPI() {
                 url = finalM3u8Url,
                 type = ExtractorLinkType.M3U8
             ) {
-                // 수정된 Referer 적용
                 this.referer = targetReferer
                 this.quality = getQualityFromName("HD")
             }
@@ -182,6 +179,7 @@ class Linkkf : MainAPI() {
         val poster = this.selectFirst(".img-wrapper")?.attr("data-original")
             ?.ifEmpty { this.selectFirst("img")?.attr("src") }
 
+        // [기존 코드 유지] 이미 TvType.Anime로 되어 있음
         return newTvSeriesSearchResponse(title, href, TvType.Anime) {
             this.posterUrl = poster
         }
