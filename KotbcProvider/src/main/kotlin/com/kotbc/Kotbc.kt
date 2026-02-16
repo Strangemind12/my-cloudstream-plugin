@@ -5,13 +5,13 @@ import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Element
 
 /**
- * Kotbc Provider v3.1
- * - Update: 에피소드 정규식에 '부' 추가 (화/회/부)
- * - Update: 상세 정보 태그 파싱 로직 개선 (제목 제외, 개요->장르 변환 및 텍스트 정제, 라벨링 추가)
+ * Kotbc Provider v3.2
+ * - Fix: 영화(Movie)도 에피소드 구조(링크 클릭 필요)를 가질 수 있음을 반영.
+ * - Logic: 영화/드라마 구분 없이 에피소드 리스트를 먼저 파싱한 후, 영화는 첫 번째 링크를 dataUrl로 사용.
  */
 class Kotbc : MainAPI() {
     override var mainUrl = "https://m135.kotbc2.com"
-    override var name = "KOTBC"
+    override var name = "Kotbc"
     override val hasMainPage = true
     override var lang = "ko"
     
@@ -30,18 +30,21 @@ class Kotbc : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = "$mainUrl/bbs/board.php?bo_table=${request.data}&page=$page"
+        println("[Kotbc] getMainPage: $url")
         return try {
             val doc = app.get(url).document
             val elements = doc.select(".list-body .list-row .list-box")
             val list = elements.mapNotNull { element -> element.toSearchResponse() }
             newHomePageResponse(request.name, list, hasNext = list.isNotEmpty())
         } catch (e: Exception) {
+            println("[Kotbc] Main page error: ${e.message}")
             newHomePageResponse(request.name, emptyList(), hasNext = false)
         }
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/bbs/search.php?sfl=wr_subject&stx=$query"
+        println("[Kotbc] search: $url")
         return try {
             val doc = app.get(url).document
             val elements = doc.select(".list-body .list-row .list-box")
@@ -72,12 +75,13 @@ class Kotbc : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
+        println("[Kotbc] load: $url")
         val doc = app.get(url).document
         val title = doc.selectFirst(".view-title h1")?.text()?.trim()?.replace(Regex("\\s*\\(\\d{4}\\)$"), "") ?: "Unknown"
         val poster = doc.selectFirst(".view-info .image img")?.attr("src")?.let { resolvePosterUrl(it) }
         val description = doc.selectFirst(".view-cont")?.text()?.trim()
         
-        // [수정] 태그 파싱 로직 개선
+        // 태그 파싱
         val tags = doc.select(".view-info p").mapNotNull { p ->
             val labelEl = p.selectFirst("span.block:first-child")
             val valueEl = p.selectFirst("span.block:last-child")
@@ -86,44 +90,29 @@ class Kotbc : MainAPI() {
                 var label = labelEl.text().trim()
                 var value = valueEl.text().trim()
 
-                // 1. "제목" 태그는 제외
                 if (label == "제목") return@mapNotNull null
 
-                // 2. "개요" -> "장르"로 변경 및 내용 정제
                 if (label == "개요") {
                     label = "장르"
-                    // 예: "드라마/코미디 한국영화 (2025)" -> "드라마/코미디"
-                    // "한국영화 (2025)", "해외영화 (2004)" 등의 패턴 제거
                     value = value.replace(Regex("\\s*(한국|해외)?영화\\s*\\(\\d{4}\\).*"), "").trim()
                 }
 
-                // 내용이 있을 경우에만 "라벨: 내용" 형식으로 반환
-                if (value.isNotEmpty()) {
-                    "$label: $value"
-                } else {
-                    null
-                }
+                if (value.isNotEmpty()) "$label: $value" else null
             } else {
                 null
             }
         }
 
-        val type = if (url.contains("bo_table=movie")) TvType.Movie else TvType.TvSeries
+        // [Fix] 영화/드라마 구분 없이 일단 에피소드 리스트를 파싱합니다.
+        val episodes = mutableListOf<Episode>()
+        val episodeItems = doc.select(".serial-list .list-body .list-item")
         
-        if (type == TvType.Movie) {
-            return newMovieLoadResponse(title, url, TvType.Movie, url) {
-                this.posterUrl = poster
-                this.plot = description
-                this.tags = tags
-            }
-        } else {
-            val episodes = mutableListOf<Episode>()
-            doc.select(".serial-list .list-body .list-item").forEach { item ->
+        if (episodeItems.isNotEmpty()) {
+            println("[Kotbc] 에피소드 리스트 발견: ${episodeItems.size}개")
+            episodeItems.forEach { item ->
                 val linkEl = item.selectFirst("a.item-subject")
                 val epHref = linkEl?.attr("href")
                 val epName = linkEl?.text()?.trim() ?: "Episode"
-                
-                // [수정] 에피소드 정규식에 '부' 추가
                 val epNum = Regex("(\\d+)[화회부]").find(epName)?.groupValues?.get(1)?.toIntOrNull()
                 
                 if (!epHref.isNullOrEmpty()) {
@@ -134,7 +123,28 @@ class Kotbc : MainAPI() {
                     })
                 }
             }
-            if (episodes.isEmpty()) episodes.add(newEpisode(url) { this.name = title; this.posterUrl = poster })
+        } else {
+            println("[Kotbc] 에피소드 리스트 없음. 현재 페이지를 단일 에피소드로 처리.")
+            episodes.add(newEpisode(url) { 
+                this.name = title
+                this.posterUrl = poster 
+            })
+        }
+
+        val type = if (url.contains("bo_table=movie")) TvType.Movie else TvType.TvSeries
+        
+        if (type == TvType.Movie) {
+            // [Fix] 영화라도 에피소드 리스트가 있다면 첫 번째 링크를 사용해야 플레이어로 연결됨
+            val movieDataUrl = episodes.firstOrNull()?.data ?: url
+            println("[Kotbc] Movie 타입 로드. Data URL: $movieDataUrl")
+            
+            return newMovieLoadResponse(title, url, TvType.Movie, movieDataUrl) {
+                this.posterUrl = poster
+                this.plot = description
+                this.tags = tags
+            }
+        } else {
+            println("[Kotbc] TVSeries 타입 로드.")
             return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes.sortedBy { it.episode ?: 0 }) {
                 this.posterUrl = poster
                 this.plot = description
@@ -149,6 +159,7 @@ class Kotbc : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        println("[Kotbc] loadLinks: $data")
         try {
             val doc = app.get(data).document
             val form = doc.selectFirst("form.tt2") ?: doc.selectFirst("form.tt")
@@ -157,12 +168,14 @@ class Kotbc : MainAPI() {
                 val vParam = form.selectFirst("input[name=v]")?.attr("value")
                 if (action.isNotEmpty() && !vParam.isNullOrEmpty()) {
                     val targetUrl = "$action?v=$vParam"
+                    println("[Kotbc] Extractor 호출: $targetUrl")
                     val extractor = KotbcExtractor()
                     extractor.getUrl(targetUrl, mainUrl, subtitleCallback, callback)
                     return true
                 }
             }
-            // 백업: iframe 직접 검색
+            
+            // 백업
             doc.select("iframe").forEach { iframe ->
                 val src = iframe.attr("src")
                 if (src.contains("nnmo0oi1") || src.contains("glamov")) {
