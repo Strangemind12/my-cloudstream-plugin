@@ -5,10 +5,9 @@ import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Element
 
 /**
- * Kotbc Provider v1.4
- * - Build Fix: newEpisode 사용 (Episode 생성자 경고 해결)
- * - TvType.Variety 제거
- * - KotbcExtractor(Class) 인스턴스 호출 방식으로 변경
+ * Kotbc Provider v1.5
+ * - KotbcPlugin 및 Extractor와의 호환성 확인
+ * - TvType.Variety 제거 상태 유지
  */
 class Kotbc : MainAPI() {
     override var mainUrl = "https://m135.kotbc2.com"
@@ -16,7 +15,6 @@ class Kotbc : MainAPI() {
     override val hasMainPage = true
     override var lang = "ko"
     
-    // Variety 제거됨
     override val supportedTypes = setOf(
         TvType.Movie,
         TvType.TvSeries,
@@ -134,7 +132,7 @@ class Kotbc : MainAPI() {
                 this.tags = tags
             }
         } else {
-            // Build Fix: newEpisode 사용
+            // newEpisode 사용
             newTvSeriesLoadResponse(title, url, TvType.TvSeries, listOf(
                 newEpisode(url) {
                     this.name = title
@@ -178,8 +176,7 @@ class Kotbc : MainAPI() {
                 val targetUrl = "$action?v=$vParam"
                 println("[Kotbc] Generated target URL: $targetUrl")
                 
-                // [변경] ExtractorApi를 상속받은 클래스 인스턴스 생성 및 호출
-                // MoviekingProvider와 유사한 구조
+                // ExtractorApi를 상속받은 클래스 인스턴스 생성 및 호출
                 val extractor = KotbcExtractor()
                 extractor.getUrl(targetUrl, mainUrl, subtitleCallback, callback)
             } else {
