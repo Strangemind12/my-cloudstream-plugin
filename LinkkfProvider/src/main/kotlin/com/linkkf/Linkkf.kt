@@ -3,18 +3,17 @@ package com.linkkf
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
-import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.network.WebViewResolver
 import org.jsoup.nodes.Element
 
 class Linkkf : MainAPI() {
-    // v1.12: SupportedTypes 정리 (TvSeries, Movie 제거 -> Anime로 통일)
+    // v1.13: WebViewResolver 및 Referer 정책 통합 완료
     override var mainUrl = "https://linkkf.tv"
     override var name = "Linkkf"
     override val hasMainPage = true
     override var lang = "ko"
 
-    // [수정됨] TvSeries, Movie 제거
     override val supportedTypes = setOf(
         TvType.Anime,
         TvType.OVA
@@ -107,7 +106,6 @@ class Linkkf : MainAPI() {
                 } else null
             }.reversed()
 
-            // [수정됨] TvType.TvSeries -> TvType.Anime 로 변경
             return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
                 this.posterUrl = poster
                 this.plot = description
@@ -130,20 +128,21 @@ class Linkkf : MainAPI() {
         
         val result = LinkkfExtractor().extract(fullUrl, "$mainUrl/") ?: return false
 
-        // 자막 처리
         if (result.subtitleUrl.isNotEmpty()) {
             subtitleCallback.invoke(SubtitleFile("Korean", result.subtitleUrl))
         }
 
-        // 구형 플레이어(needsWebView=true) 대응: Referer를 플레이어 페이지로 설정
+        // [v1.13] Referer 통합 로직
+        // needsWebView=true인 경우(대부분) 플레이어 페이지 URL을 Referer로 사용
         val playerPageUrl = result.m3u8Url
         val targetReferer = if (result.needsWebView) playerPageUrl else "$mainUrl/"
 
         var finalM3u8Url = result.m3u8Url
 
         if (result.needsWebView) {
-            println("[Linkkf] 구형 플레이어. WebViewResolver 사용. (Referer 예정: $targetReferer)")
+            println("[Linkkf] WebViewResolver 스니핑 시작. (Target: $playerPageUrl, Referer: $targetReferer)")
             try {
+                // .m3u8 패턴 스니핑
                 val response = app.get(
                     result.m3u8Url, 
                     headers = commonHeaders, 
@@ -179,7 +178,6 @@ class Linkkf : MainAPI() {
         val poster = this.selectFirst(".img-wrapper")?.attr("data-original")
             ?.ifEmpty { this.selectFirst("img")?.attr("src") }
 
-        // [기존 코드 유지] 이미 TvType.Anime로 되어 있음
         return newTvSeriesSearchResponse(title, href, TvType.Anime) {
             this.posterUrl = poster
         }
