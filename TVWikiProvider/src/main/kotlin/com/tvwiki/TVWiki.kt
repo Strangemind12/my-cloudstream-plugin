@@ -9,6 +9,7 @@ import org.jsoup.nodes.Element
 import java.net.URLDecoder
 import java.net.URLEncoder
 
+// v1.1 - 에피소드 정렬 로직 개선 (밀림 현상 수정)
 class TVWiki : MainAPI() {
     override var mainUrl = "https://tvwiki5.net"
     override var name = "TVWiki"
@@ -133,7 +134,20 @@ class TVWiki : MainAPI() {
         return items
     }
 
+    // 에피소드 제목에서 숫자만 추출하는 헬퍼 함수
+    private fun getEpisodeNumber(name: String): Int {
+        return try {
+            // "레이디 두아 1화", "1화" 등에서 숫자만 추출
+            val numberString = name.replace(Regex("[^0-9]"), "")
+            if (numberString.isNotEmpty()) numberString.toInt() else Int.MAX_VALUE
+        } catch (e: Exception) {
+            Int.MAX_VALUE // 숫자가 없으면 맨 뒤로 보냄
+        }
+    }
+
     override suspend fun load(url: String): LoadResponse {
+        println("[TVWiki] load 시작 - URL: $url")
+
         // 전달받은 URL에서 포스터 정보 추출 및 복원
         var passedPoster: String? = null
         var realUrl = url
@@ -164,7 +178,9 @@ class TVWiki : MainAPI() {
                 ?: doc.selectFirst("input[name='con_title']")?.attr("value")?.trim()
                 ?: "Unknown"
         }
-        title = title!!.replace(Regex("\\\\s*\\\\d+[화회부].*"), "").replace(" 다시보기", "").trim()
+        
+        // 제목 정제
+        title = title!!.replace(Regex("\\s*\\d+[화회부].*"), "").replace(" 다시보기", "").trim()
 
         if (!oriTitleFull.isNullOrEmpty()) {
             val pureOriTitle = oriTitleFull.replace("원제 :", "").replace("원제:", "").trim()
@@ -195,7 +211,6 @@ class TVWiki : MainAPI() {
 
         val castList = doc.select(".slider_act .item .name").map { it.text().trim() }
         
-        // [수정] 운영진이 포함된 경우 출연진 정보를 표시하지 않음 (빈 문자열 처리)
         val castFormatted = if (castList.isNotEmpty() && castList.none { it.contains("운영팀") }) {
             "출연: ${castList.joinToString(", ")}"
         } else {
@@ -223,6 +238,8 @@ class TVWiki : MainAPI() {
                 else "$metaString / 줄거리: $story".trim()
         }
         
+        // [수정] 에피소드 파싱 및 정렬 로직 개선
+        println("[TVWiki] 에피소드 파싱 시작")
         val episodes = doc.select("#other_list ul li").mapNotNull { li ->
             val aTag = li.selectFirst("a.ep-link") ?: return@mapNotNull null
             val href = fixUrl(aTag.attr("href"))
@@ -233,11 +250,23 @@ class TVWiki : MainAPI() {
                 ?: thumbImg?.attr("src")?.ifEmpty { null }
                 ?: li.selectFirst("img")?.attr("src")
 
+            println("[TVWiki] 파싱됨 - 이름: $epName, 링크: $href")
+
             newEpisode(href) {
                 this.name = epName
                 this.posterUrl = fixUrl(epThumb ?: "")
             }
-        }.reversed()
+        }.sortedBy { 
+            // 이름에 포함된 숫자를 기준으로 오름차순 정렬 (1화 -> 8화)
+            // 기존 .reversed()는 HTML 구조 순서에 의존하므로 삭제함
+            getEpisodeNumber(it.name ?: "") 
+        }
+
+        println("[TVWiki] 최종 정렬된 에피소드 개수: ${episodes.size}")
+        if (episodes.isNotEmpty()) {
+            println("[TVWiki] 첫번째 에피소드: ${episodes.first().name} -> ${episodes.first().data}")
+            println("[TVWiki] 마지막 에피소드: ${episodes.last().name} -> ${episodes.last().data}")
+        }
 
         val type = determineTypeFromUrl(realUrl)
 
@@ -271,6 +300,7 @@ class TVWiki : MainAPI() {
         val iframe = doc.selectFirst("iframe#view_iframe")
         if (iframe != null) {
             val playerUrl = iframe.attr("src")
+            println("[TVWiki] iframe src 발견: $playerUrl")
             if (playerUrl.contains("player.bunny-frame.online")) {
                  val extracted = BunnyPoorCdn().extract(fixUrl(playerUrl).replace("&amp;", "&"), data, subtitleCallback, callback, null)
                  if(extracted) return true
@@ -296,6 +326,7 @@ class TVWiki : MainAPI() {
                 
                 if (match != null) {
                     val foundUrl = match.value.replace("&amp;", "&")
+                    println("[TVWiki] Script에서 URL 발견: $foundUrl")
                     if(BunnyPoorCdn().extract(foundUrl, data, subtitleCallback, callback, null)) return true
                 }
             }
@@ -303,12 +334,14 @@ class TVWiki : MainAPI() {
 
         val thumbnailHint = extractThumbnailHint(doc)
         if (thumbnailHint != null) {
+            println("[TVWiki] 썸네일 힌트로 m3u8 추측 시도: $thumbnailHint")
             try {
                 val pathRegex = Regex("""/v/[a-z]/[a-zA-Z0-9]+""")
                 val pathMatch = pathRegex.find(thumbnailHint)
                 if (pathMatch != null) {
                     val m3u8Url = thumbnailHint.substringBefore(pathMatch.value) + pathMatch.value + "/index.m3u8"
                     val fixedM3u8Url = m3u8Url.replace(Regex("//v/"), "/v/")
+                    println("[TVWiki] 생성된 m3u8 URL: $fixedM3u8Url")
                     callback(
                         newExtractorLink(name, name, fixedM3u8Url, ExtractorLinkType.M3U8) {
                             this.referer = mainUrl
