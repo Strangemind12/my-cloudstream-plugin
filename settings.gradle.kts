@@ -4,3 +4,4 @@ rootProject.name = "CloudstreamPlugins"
 include("TVMONProvider")
 include("MoviekingProvider")
 include("TVWikiProvider")
+include("KotbcProvider")
