@@ -5,12 +5,11 @@ import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.*
 import java.net.URI
 
 class LinkkfExtractor {
-    // 자막 도메인 (변경 가능성 대비 상수화)
+    // 자막 도메인 상수
     private val SUBTITLE_BASE_URL = "https://k1.sub1.top/s"
 
     suspend fun extract(
@@ -33,7 +32,6 @@ class LinkkfExtractor {
             }
 
             // JSON 데이터 추출
-            // var player_aaaa={"flag":"play", ... } 형태 파싱
             val jsonString = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\});""").find(scriptContent)?.groupValues?.get(1)
                 ?: return false
 
@@ -44,18 +42,15 @@ class LinkkfExtractor {
             val actualUrl = playerData.actualUrl ?: return false
 
             // M3U8 URL 생성 로직
-            // actualUrl 예시: https://playv2.sub3.top/r2/play.php?&id=n20&url=403791s7
-            // 목표 URL: https://playv2.sub3.top/r2/cache/n20-403791s7.m3u8
             val uri = URI(actualUrl)
-            val host = uri.host // playv2.sub3.top
-            val idParam = uri.query.split("&").find { it.startsWith("id=") }?.substringAfter("id=") // n20
+            val host = uri.host
+            val idParam = uri.query.split("&").find { it.startsWith("id=") }?.substringAfter("id=")
 
             if (host != null && idParam != null) {
                 val m3u8Url = "https://$host/r2/cache/$idParam-$videoKey.m3u8"
                 val subUrl = "$SUBTITLE_BASE_URL/$videoKey.vtt"
 
                 println("[LinkkfExtractor] Generated M3U8: $m3u8Url")
-                println("[LinkkfExtractor] Generated Subtitle: $subUrl")
 
                 // 자막 제공
                 subtitleCallback.invoke(
@@ -65,15 +60,15 @@ class LinkkfExtractor {
                     )
                 )
 
-                // 영상 링크 제공
+                // 영상 링크 제공 (수정됨: 호환성 높은 생성자 사용)
                 callback.invoke(
                     ExtractorLink(
-                        name = "Linkkf",
                         source = "Linkkf",
+                        name = "Linkkf",
                         url = m3u8Url,
                         referer = referer,
                         quality = getQualityFromName("HD"),
-                        type = ExtractorLinkType.M3U8
+                        isM3u8 = true
                     )
                 )
                 return true
@@ -87,7 +82,6 @@ class LinkkfExtractor {
         return false
     }
 
-    // JSON 파싱용 데이터 클래스
     private data class PlayerData(
         @JsonProperty("url") val url: String?,
         @JsonProperty("actual_url") val actualUrl: String?
