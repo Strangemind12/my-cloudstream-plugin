@@ -6,9 +6,9 @@ import com.lagradost.cloudstream3.SubtitleFile
 import com.fasterxml.jackson.annotation.JsonProperty
 
 /**
- * KotbcExtractor v2.6
- * - Fix: API 요청 URL 파라미터(data, do)와 Body 파라미터(hash, r) 분리 적용
- * - Fix: Origin 헤더 추가 및 securedLink 추출 우선순위 변경
+ * KotbcExtractor v2.8
+ * - Fix: securedLink 우선 추출 (MD5/Expires 파라미터 포함된 진짜 링크)
+ * - Fix: Hash 추출 패턴 강화 (모든 32자리 Hex 검색)
  */
 class KotbcExtractor : ExtractorApi() {
     override val name = "Kotbc"
@@ -46,7 +46,8 @@ class KotbcExtractor : ExtractorApi() {
                 html
             }
 
-            // 4. API를 통한 영상 추출 (Payload r값 설정을 위해 원래 URL 전달)
+            // 4. API를 통한 영상 추출
+            // originalReferer는 r값 생성을 위해 필요 (glamov 주소)
             if (fetchVideoApi(videoHtml, targetUrl, url, callback)) {
                 return
             }
@@ -64,70 +65,72 @@ class KotbcExtractor : ExtractorApi() {
     private suspend fun fetchVideoApi(
         html: String, 
         videoPageUrl: String, 
-        originalReferer: String, // mov.glamov.com 주소 (r값 용도)
+        originalReferer: String, 
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         try {
             println("[KotbcExtractor] Attempting API extraction...")
             
             // 1. Hash 추출 (32자리 hex)
-            val hashRegex = Regex("""['"]([a-f0-9]{32})['"]""")
-            val hashMatch = hashRegex.find(html) ?: return false
-            val hash = hashMatch.groupValues[1]
-            println("[KotbcExtractor] Found hash: $hash")
-
-            // 2. API 요청 구성
-            // URL: /player/index.php?data={hash}&do=getVideo
-            val apiUrl = "https://nnmo0oi1.com/player/index.php?data=$hash&do=getVideo"
+            // HTML 내에 있는 모든 32자리 소문자 Hex 값을 찾아서 시도해봄 (가장 확실한 방법)
+            val allHexPattern = Regex("""['"]([a-f0-9]{32})['"]""")
+            val matches = allHexPattern.findAll(html).map { it.groupValues[1] }.toSet()
             
-            val headers = mapOf(
-                "X-Requested-With" to "XMLHttpRequest",
-                "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
-                "Origin" to "https://nnmo0oi1.com",
-                "Referer" to videoPageUrl,
-                "Accept" to "*/*"
-            )
-            
-            // Body Payload: hash={hash}&r={mov.glamov.com}
-            // 주의: r 값은 비디오 페이지를 호출한 부모 페이지(glamov) 주소여야 함
-            val rValue = if (originalReferer.contains("glamov")) originalReferer else "https://mov.glamov.com/"
-            val params = mapOf(
-                "hash" to hash,
-                "r" to rValue
-            )
-
-            // 3. POST 전송
-            val apiResponse = app.post(apiUrl, headers = headers, data = params).text
-            println("[KotbcExtractor] API Response: $apiResponse")
-
-            // 4. JSON 파싱 및 링크 추출
-            // 응답 예: {"securedLink": "https://...m3u8?...", "videoSource": "..."}
-            // 정규식으로 securedLink 우선 추출
-            
-            // securedLink 찾기 (.m3u8 포함)
-            val securedLinkRegex = Regex("""["']securedLink["']\s*:\s*["']([^"']+)["']""")
-            var videoUrl = securedLinkRegex.find(apiResponse)?.groupValues?.get(1)?.replace("\\/", "/")
-
-            // 없으면 videoSource 찾기
-            if (videoUrl == null) {
-                val sourceRegex = Regex("""["']videoSource["']\s*:\s*["']([^"']+)["']""")
-                videoUrl = sourceRegex.find(apiResponse)?.groupValues?.get(1)?.replace("\\/", "/")
+            if (matches.isEmpty()) {
+                println("[KotbcExtractor] No hash found in HTML")
+                return false
             }
 
-            if (videoUrl != null) {
-                println("[KotbcExtractor] Found Video URL: $videoUrl")
-                callback(
-                    newExtractorLink(
-                        name = name,
-                        source = name,
-                        url = videoUrl,
-                        type = ExtractorLinkType.M3U8
-                    ) {
-                        this.referer = "https://nnmo0oi1.com"
-                        this.quality = Qualities.Unknown.value
-                    }
+            // r 값 설정 (mov.glamov.com)
+            val rValue = if (originalReferer.contains("glamov")) originalReferer else "https://mov.glamov.com/"
+
+            // 2. 각 Hash 후보에 대해 API 요청 시도
+            for (hash in matches) {
+                println("[KotbcExtractor] Trying hash: $hash")
+                
+                val apiUrl = "https://nnmo0oi1.com/player/index.php?data=$hash&do=getVideo"
+                
+                val headers = mapOf(
+                    "X-Requested-With" to "XMLHttpRequest",
+                    "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
+                    "Origin" to "https://nnmo0oi1.com",
+                    "Referer" to videoPageUrl,
+                    "Accept" to "*/*"
                 )
-                return true
+                
+                val params = mapOf(
+                    "hash" to hash,
+                    "r" to rValue
+                )
+
+                val apiResponse = app.post(apiUrl, headers = headers, data = params).text
+                
+                // 성공적인 응답인지 확인 (securedLink가 있어야 함)
+                if (apiResponse.contains("securedLink")) {
+                    println("[KotbcExtractor] API Success with hash: $hash")
+                    println("[KotbcExtractor] API Response: $apiResponse")
+                    
+                    // 3. JSON 파싱 및 링크 추출
+                    // securedLink 우선 추출
+                    val securedLinkRegex = Regex("""["']securedLink["']\s*:\s*["']([^"']+)["']""")
+                    var videoUrl = securedLinkRegex.find(apiResponse)?.groupValues?.get(1)?.replace("\\/", "/")
+
+                    if (videoUrl != null) {
+                        println("[KotbcExtractor] Found Secured Video URL: $videoUrl")
+                        callback(
+                            newExtractorLink(
+                                name = name,
+                                source = name,
+                                url = videoUrl,
+                                type = ExtractorLinkType.M3U8
+                            ) {
+                                this.referer = "https://nnmo0oi1.com"
+                                this.quality = Qualities.Unknown.value
+                            }
+                        )
+                        return true
+                    }
+                }
             }
 
         } catch (e: Exception) {
