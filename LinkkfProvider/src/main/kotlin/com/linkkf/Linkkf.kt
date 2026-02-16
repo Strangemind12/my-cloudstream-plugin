@@ -2,10 +2,12 @@ package com.linkkf
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.getQualityFromName
 import org.jsoup.nodes.Element
 
 class Linkkf : MainAPI() {
+    // v1.1 빌드 에러 수정: newExtractorLink 파라미터 호환성 개선
     override var mainUrl = "https://linkkf.tv"
     override var name = "Linkkf"
     override val hasMainPage = true
@@ -103,16 +105,18 @@ class Linkkf : MainAPI() {
                 SubtitleFile("Korean", result.subtitleUrl)
             )
 
-            // newExtractorLink 사용하여 링크 생성 (Deprecated 에러 해결)
+            // [수정됨] newExtractorLink 호환성 해결
+            // referer, quality 등은 람다 블록 내부에서 설정해야 합니다.
             callback.invoke(
                 newExtractorLink(
                     source = name,
                     name = name,
                     url = result.m3u8Url,
-                    referer = "$mainUrl/",
-                    quality = getQualityFromName("HD"),
-                    isM3u8 = true
-                )
+                    type = ExtractorLinkType.M3U8
+                ) {
+                    this.referer = "$mainUrl/"
+                    this.quality = getQualityFromName("HD")
+                }
             )
             return true
         }
