@@ -7,5 +7,6 @@ import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 class KotbcPlugin: BasePlugin() {
     override fun load() {
         registerMainAPI(Kotbc())
+        registerMainAPI(KotbcExtractor())
     }
 }
