@@ -7,8 +7,14 @@ import org.jsoup.nodes.Element
 import java.net.URLDecoder
 import java.net.URLEncoder
 
+/**
+ * MovieKing Provider v1.1
+ * [변경 이력]
+ * - v1.0: 초기 버전
+ * - v1.1: 상세 페이지 정보를 태그(Tags)로 분리하고 줄거리(Plot)를 소개 내용으로 한정함.
+ */
 class MovieKing : MainAPI() {
-    override var mainUrl = "https://mvking6.org" // 접속 안 되면 최신 도메인으로 변경
+    override var mainUrl = "https://mvking6.org"
     override var name = "MovieKing"
     override val hasMainPage = true
     override var lang = "ko"
@@ -24,10 +30,10 @@ class MovieKing : MainAPI() {
         "Referer" to "$mainUrl/"
     )
 
-    // 제목에서 (2024) 같은 연도 제거를 위한 정규식
     private val titleRegex = Regex("""\s*\(\d{4}\)$""")
+    // 태그 내용 정제용 정규식 (국가/연도 중복 표기 제거)
+    private val tagCleanRegex = Regex("""\s*(한국|해외)?영화\s*\(?\d{4}\)?.*""")
 
-    // 2. 카테고리 명칭 변경 ("무료" 제거)
     override val mainPage = mainPageOf(
         "/video?type=movie" to "영화",
         "/video?type=drama" to "드라마",
@@ -38,13 +44,15 @@ class MovieKing : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = "$mainUrl${request.data}&page=$page"
+        println("[MovieKing][v1.1] getMainPage 요청: $url")
         
         return try {
             val doc = app.get(url, headers = commonHeaders).document
             val list = doc.select(".video-card").mapNotNull { it.toSearchResponse() }
-            
+            println("[MovieKing] 메인 아이템 검색 성공: ${list.size}건")
             newHomePageResponse(request.name, list, hasNext = list.isNotEmpty())
         } catch (e: Exception) {
+            println("[MovieKing] 메인 페이지 로드 에러: ${e.message}")
             newHomePageResponse(request.name, emptyList(), hasNext = false)
         }
     }
@@ -54,8 +62,6 @@ class MovieKing : MainAPI() {
         val titleTag = this.selectFirst(".video-title a") ?: return null
         
         val href = fixUrl(linkTag.attr("href"))
-        
-        // 목록 제목에서 연도 제거
         val rawTitle = titleTag.text().trim()
         val title = rawTitle.replace(titleRegex, "").trim()
 
@@ -63,12 +69,10 @@ class MovieKing : MainAPI() {
         val rawPoster = imgTag?.attr("src") ?: imgTag?.attr("data-src")
         val fixedPoster = fixUrl(rawPoster ?: "")
 
-        // 1. 포스터 URL 전달 꼼수 (URL 인코딩 후 파라미터로 추가)
         var finalHref = href
         if (fixedPoster.isNotEmpty()) {
             try {
                 val encodedPoster = URLEncoder.encode(fixedPoster, "UTF-8")
-                // 기존 url에 파라미터가 이미 있으므로 &로 연결
                 finalHref = "$href&poster_url=$encodedPoster"
             } catch (e: Exception) {
                 e.printStackTrace()
@@ -89,98 +93,96 @@ class MovieKing : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
+        println("[MovieKing][v1.1] 검색 요청: $query")
         val searchUrl = "$mainUrl/video/search?keyword=$query"
         val doc = app.get(searchUrl, headers = commonHeaders).document
-        
         return doc.select(".video-card").mapNotNull { it.toSearchResponse() }
     }
 
     override suspend fun load(url: String): LoadResponse {
-        // 1. URL에서 poster_url 파라미터 추출 및 제거
+        println("[MovieKing][v1.1] 상세 페이지 로드 시작: $url")
         var passedPoster: String? = null
         var realUrl = url
 
         try {
-            // poster_url=... 패턴 찾기
             val match = Regex("""[&?]poster_url=([^&]+)""").find(url)
             if (match != null) {
                 val encodedPoster = match.groupValues[1]
                 passedPoster = URLDecoder.decode(encodedPoster, "UTF-8")
-                // 실제 통신용 URL에서 해당 파라미터 제거
                 realUrl = url.replace(match.value, "")
+                println("[MovieKing] 전달된 포스터 URL 복원 성공")
             }
         } catch (e: Exception) {
-            e.printStackTrace()
+            println("[MovieKing] 포스터 파라미터 처리 에러: ${e.message}")
         }
 
         val doc = app.get(realUrl, headers = commonHeaders).document
-
-        // 상세 페이지 정보 파싱
         val infoContent = doc.selectFirst(".single-video-info-content")
         
-        // 제목 파싱 및 연도 제거
         val rawTitle = infoContent?.selectFirst("h3")?.text()?.trim() ?: "Unknown"
         val title = rawTitle.replace(titleRegex, "").trim()
+        println("[MovieKing] 상세 제목: $title")
         
-        // 포스터 우선순위: 전달받은 포스터 > 상세페이지 이미지 > 메타태그
         var poster = passedPoster
         if (poster.isNullOrEmpty()) {
             poster = doc.selectFirst(".single-video-left img")?.attr("src")
                 ?: doc.selectFirst("meta[property='og:image']")?.attr("content")
         }
 
-        // 상세 정보 텍스트 추출 함수
         fun getInfoText(keyword: String): String? {
             return infoContent?.select("p:contains($keyword)")?.text()
                 ?.replace(keyword, "")?.replace(":", "")?.trim()
         }
 
+        // 데이터 추출
         val quality = getInfoText("화질")
-        val genre = getInfoText("장르")
+        val genre = getInfoText("장르")?.replace(tagCleanRegex, "")?.trim()
         val country = getInfoText("나라")
         val releaseDate = getInfoText("개봉")
         val director = getInfoText("감독")
         val cast = getInfoText("출연")
-
-        // 소개(줄거리) 추출
         val intro = infoContent?.selectFirst("h6:contains(소개)")?.nextElementSibling()?.text()?.trim()
 
-        // 메타데이터 텍스트 조합
-        val plotText = buildString {
-            if (!quality.isNullOrBlank()) append("화질: $quality / ")
-            if (!genre.isNullOrBlank()) append("장르: $genre / ")
-            if (!country.isNullOrBlank()) append("국가: $country / ")
-            if (!releaseDate.isNullOrBlank()) append("공개일: $releaseDate / ")
-            // 3. 감독 라벨 변경
-            if (!director.isNullOrBlank()) append("감독(방송사): $director / ")
-            if (!cast.isNullOrBlank()) append("출연: $cast / ")
-            if (!intro.isNullOrBlank()) append("줄거리: $intro")
-        }
+        println("[MovieKing] 데이터 파싱 완료 - 태그 생성 시작")
 
-        // 연도 정보
+        // 태그 리스트 생성 (태그명: 태그내용 형식)
+        val tagsList = mutableListOf<String>()
+        if (!quality.isNullOrBlank()) tagsList.add("화질: $quality")
+        if (!genre.isNullOrBlank()) tagsList.add("장르: $genre")
+        if (!country.isNullOrBlank()) tagsList.add("국가: $country")
+        if (!releaseDate.isNullOrBlank()) tagsList.add("공개일: $releaseDate")
+        if (!director.isNullOrBlank()) tagsList.add("감독(방송사): $director")
+        if (!cast.isNullOrBlank()) tagsList.add("출연: $cast")
+
         val year = releaseDate?.replace(Regex("[^0-9-]"), "")?.take(4)?.toIntOrNull()
 
         // 에피소드 파싱
         val episodeList = doc.select(".video-slider-right-list .eps_a").map { element ->
-            val href = fixUrl(element.attr("href"))
-            val name = element.text().trim()
-            newEpisode(href) {
-                this.name = name
+            val epHref = fixUrl(element.attr("href"))
+            val epName = element.text().trim()
+            newEpisode(epHref) {
+                this.name = epName
             }
         }.reversed()
+
+        println("[MovieKing] 에피소드 개수: ${episodeList.size}")
 
         val isMovie = episodeList.isEmpty() || (episodeList.size == 1 && realUrl.contains("type=movie"))
 
         return if (isMovie) {
+            println("[MovieKing] Movie 타입으로 결과 반환")
             newMovieLoadResponse(title, realUrl, TvType.Movie, realUrl) {
                 this.posterUrl = fixUrl(poster ?: "")
-                this.plot = plotText
+                this.plot = intro // 줄거리는 소개 내용만
+                this.tags = tagsList // 나머지 정보는 태그로
                 this.year = year
             }
         } else {
+            println("[MovieKing] TvSeries 타입으로 결과 반환")
             newTvSeriesLoadResponse(title, realUrl, TvType.TvSeries, episodeList) {
                 this.posterUrl = fixUrl(poster ?: "")
-                this.plot = plotText
+                this.plot = intro // 줄거리는 소개 내용만
+                this.tags = tagsList // 나머지 정보는 태그로
                 this.year = year
             }
         }
@@ -192,20 +194,19 @@ class MovieKing : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // data에는 poster_url이 포함되지 않은 순수 URL이 들어올 수도 있고 포함될 수도 있음 (load에서 에피소드 링크 생성 시점에 따라 다름)
-        // 안전하게 처리하려면 여기서도 poster_url 제거 로직이 필요할 수 있으나, 
-        // 보통 loadLinks는 iframe src를 찾기 위해 HTML을 긁는 용도이므로 파라미터가 있어도 무방함.
-        
+        println("[MovieKing][v1.1] loadLinks 실행: $data")
         val doc = app.get(data, headers = commonHeaders).document
-        
         val iframe = doc.selectFirst("iframe#view_iframe")
         val src = iframe?.attr("src")
 
-        if (src != null) {
+        return if (src != null) {
             val fixedSrc = fixUrl(src)
+            println("[MovieKing] iframe 발견: $fixedSrc")
             loadExtractor(fixedSrc, data, subtitleCallback, callback)
-            return true
+            true
+        } else {
+            println("[MovieKing] iframe을 찾을 수 없음")
+            false
         }
-        return false
     }
 }
