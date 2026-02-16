@@ -13,7 +13,12 @@ import com.fasterxml.jackson.annotation.JsonProperty
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
 
-// [v1.3] 세션 API 호출 로직 적용 및 Referer 헤더 수정
+/**
+ * TVWiki Provider v1.4
+ * * [v1.4 수정 사항]
+ * - 상세 정보 태그화: 줄거리를 제외한 정보를 태그(Tags) 리스트로 분리하여 TVMON과 동일한 구조로 변경.
+ * - 태그 정제: "제목" 태그 제외, "개봉년도" -> "공개일" 라벨 변경, 장르/출연 태그 통합 및 정규식 정제 적용.
+ */
 class TVWiki : MainAPI() {
     override var mainUrl = "https://tvwiki5.net"
     override var name = "TVWiki"
@@ -39,6 +44,9 @@ class TVWiki : MainAPI() {
         "Upgrade-Insecure-Requests" to "1"
     )
 
+    // 태그 내용 정제용 정규식 (TVMON과 동일)
+    private val tagCleanRegex = Regex("""\s*(한국|해외)?영화\s*\(\d{4}\).*""")
+
     data class SessionResponse(
         @JsonProperty("success") val success: Boolean,
         @JsonProperty("player_url") val playerUrl: String?,
@@ -63,11 +71,11 @@ class TVWiki : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = "$mainUrl${request.data}?page=$page"
+        println("[TVWiki][v1.4] getMainPage 요청: $url")
         
         return try {
             val doc = app.get(url, headers = commonHeaders).document
             val list = doc.select("#list_type ul li").mapNotNull { it.toSearchResponse() }
-            
             newHomePageResponse(request.name, list, hasNext = list.isNotEmpty())
         } catch (e: Exception) {
             newHomePageResponse(request.name, emptyList(), hasNext = false)
@@ -134,6 +142,7 @@ class TVWiki : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
+        println("[TVWiki][v1.4] 검색 실행: $query")
         val searchUrl = "$mainUrl/search?stx=$query"
         val doc = app.get(searchUrl, headers = commonHeaders).document
         
@@ -154,7 +163,7 @@ class TVWiki : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        println("[TVWiki v1.3] load 시작 - URL: $url")
+        println("[TVWiki v1.4] load 시작 - URL: $url")
 
         var passedPoster: String? = null
         var realUrl = url
@@ -169,9 +178,10 @@ class TVWiki : MainAPI() {
                 if (realUrl.endsWith("?") || realUrl.endsWith("&")) {
                     realUrl = realUrl.dropLast(1)
                 }
+                println("[TVWiki] 터널링 포스터 복원: $passedPoster")
             }
         } catch (e: Exception) {
-            e.printStackTrace()
+            println("[TVWiki] 포스터 복원 에러: ${e.message}")
         }
 
         val doc = app.get(realUrl, headers = commonHeaders).document
@@ -202,48 +212,55 @@ class TVWiki : MainAPI() {
         if (poster.isNullOrEmpty() && passedPoster != null) {
             poster = passedPoster
         }
-        
         poster = poster ?: ""
 
-        val infoList = doc.select(".bo_v_info dd").map { it.text().trim().replace("개봉년도:", "공개일:") }
+        // --- [v1.4 핵심 수정] 태그 파싱 로직 (TVMON/KOTBC 스타일) ---
+        val tagsList = mutableListOf<String>()
         
+        // 1. 기본 정보 태그화 (.bo_v_info dd)
+        doc.select(".bo_v_info dd").forEach { dd ->
+            var text = dd.text().trim()
+            if (text.isNotEmpty() && !text.startsWith("제목")) {
+                // 라벨 변경 및 정제
+                val renamedText = text.replace("개봉년도:", "공개일:")
+                val cleanedText = renamedText.replace(tagCleanRegex, "").trim()
+                
+                if (cleanedText.isNotEmpty()) {
+                    tagsList.add(cleanedText)
+                    println("[TVWiki] 기본 태그 추가: $cleanedText")
+                }
+            }
+        }
+
+        // 2. 장르 정보 태그화 (.tags dd a)
         val genreList = doc.select(".tags dd a").filter {
             val txt = it.text()
             !txt.contains("트레일러") && !it.hasClass("btn_watch")
-        }.map { it.text().trim() }
+        }.map { it.text().trim().replace(tagCleanRegex, "") }
 
-        val genreFormatted = if (genreList.isNotEmpty()) "장르: ${genreList.joinToString(", ")}" else ""
-
-        val castList = doc.select(".slider_act .item .name").map { it.text().trim() }
-        
-        val castFormatted = if (castList.isNotEmpty() && castList.none { it.contains("운영팀") }) {
-            "출연: ${castList.joinToString(", ")}"
-        } else {
-            ""
+        if (genreList.isNotEmpty()) {
+            val genreTag = "장르: ${genreList.joinToString(", ")}"
+            tagsList.add(genreTag)
+            println("[TVWiki] 장르 태그 추가: $genreTag")
         }
 
-        val metaParts = mutableListOf<String>()
-        if (infoList.isNotEmpty()) metaParts.add(infoList.joinToString(" / "))
-        if (genreFormatted.isNotEmpty()) metaParts.add(genreFormatted)
-        if (castFormatted.isNotEmpty()) metaParts.add(castFormatted)
-        val metaString = metaParts.joinToString(" / ")
+        // 3. 출연진 정보 태그화 (.slider_act .item .name)
+        val castList = doc.select(".slider_act .item .name").map { it.text().trim().replace(tagCleanRegex, "") }
+        if (castList.isNotEmpty() && castList.none { it.contains("운영팀") }) {
+            val castTag = "출연: ${castList.joinToString(", ")}"
+            tagsList.add(castTag)
+            println("[TVWiki] 출연진 태그 추가: $castTag")
+        }
 
+        // --- 줄거리 파싱 (순수 텍스트만) ---
         var story = doc.selectFirst("#bo_v_con")?.text()?.trim()
             ?: doc.selectFirst(".story")?.text()?.trim()
             ?: doc.selectFirst("meta[name='description']")?.attr("content")
-            ?: ""
+            ?: "다시보기"
 
         if (story.contains("다시보기") && story.contains("무료")) story = "다시보기"
-        if (story.isEmpty()) story = "다시보기"
-
-        val finalPlot = if (story == "다시보기") {
-                "다시보기"
-        } else {
-                if (metaString.isNullOrBlank()) "줄거리: $story".trim()
-                else "$metaString / 줄거리: $story".trim()
-        }
         
-        println("[TVWiki v1.3] 에피소드 파싱 시작")
+        println("[TVWiki v1.4] 에피소드 파싱 시작")
         val episodes = doc.select("#other_list ul li").mapNotNull { li ->
             val aTag = li.selectFirst("a.ep-link") ?: return@mapNotNull null
             val href = fixUrl(aTag.attr("href"))
@@ -254,8 +271,6 @@ class TVWiki : MainAPI() {
                 ?: thumbImg?.attr("src")?.ifEmpty { null }
                 ?: li.selectFirst("img")?.attr("src")
 
-            println("[TVWiki v1.3] 파싱됨 - 이름: $epName, 링크: $href")
-
             newEpisode(href) {
                 this.name = epName
                 this.posterUrl = fixUrl(epThumb ?: "")
@@ -264,7 +279,7 @@ class TVWiki : MainAPI() {
             getEpisodeNumber(it.name ?: "") 
         }
 
-        println("[TVWiki v1.3] 최종 정렬된 에피소드 개수: ${episodes.size}")
+        println("[TVWiki v1.4] 최종 에피소드 개수: ${episodes.size}")
         
         val type = determineTypeFromUrl(realUrl)
 
@@ -273,14 +288,16 @@ class TVWiki : MainAPI() {
                 val movieLink = episodes.firstOrNull()?.data ?: realUrl
                 newMovieLoadResponse(title, realUrl, type, movieLink) {
                     this.posterUrl = fixUrl(poster)
-                    this.plot = finalPlot
+                    this.plot = story
+                    this.tags = tagsList
                 }
             }
 
             else -> {
                 newTvSeriesLoadResponse(title, realUrl, type, episodes) {
                     this.posterUrl = fixUrl(poster)
-                    this.plot = finalPlot
+                    this.plot = story
+                    this.tags = tagsList
                 }
             }
         }
@@ -292,31 +309,26 @@ class TVWiki : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("[TVWiki v1.3] loadLinks 시작 - data: $data")
+        println("[TVWiki v1.4] loadLinks 시작 - data: $data")
         
         val doc = app.get(data, headers = commonHeaders).document
-        var foundLink = false
 
-        // 1. API 호출 방식 (가장 확실한 방법)
-        // 중요: Referer를 현재 페이지(data)로 설정해야 함
+        // 1. API 호출 방식
         if (extractFromApi(doc, data, subtitleCallback, callback)) {
-            println("[TVWiki v1.3] API 호출로 링크 추출 성공")
             return true
         }
 
-        // 2. 정적 파싱 (iframe src가 있는 경우)
+        // 2. 정적 파싱
         val iframe = doc.selectFirst("iframe#view_iframe")
         if (iframe != null) {
             val playerUrl = iframe.attr("src")
             if (playerUrl.contains("player.bunny-frame.online")) {
                  val extracted = BunnyPoorCdn().extract(fixUrl(playerUrl).replace("&amp;", "&"), data, subtitleCallback, callback, null)
-                 if(extracted) foundLink = true
+                 if(extracted) return true
             }
         }
-        if (foundLink) return true
 
-        // 3. WebView 방식 (최후의 수단)
-        println("[TVWiki v1.3] API 호출 실패. WebView로 재시도합니다.")
+        // 3. WebView 방식
         try {
             val webViewInterceptor = WebViewResolver(
                 Regex("bunny-frame|googleapis"), 
@@ -325,7 +337,6 @@ class TVWiki : MainAPI() {
             val response = app.get(data, headers = commonHeaders, interceptor = webViewInterceptor)
             val webViewDoc = response.document
             
-            // WebView 로드 후 다시 파싱
             val wbIframe = webViewDoc.selectFirst("iframe#view_iframe") ?: webViewDoc.selectFirst("iframe[src*='bunny-frame']")
             if (wbIframe != null) {
                 val playerUrl = wbIframe.attr("src")
@@ -335,32 +346,26 @@ class TVWiki : MainAPI() {
                 }
             }
         } catch (e: Exception) {
-            println("[TVWiki v1.3] WebView 로딩 중 에러: ${e.message}")
+            println("[TVWiki v1.4] WebView 에러: ${e.message}")
         }
 
         // 4. 썸네일 힌트
         val thumbnailHint = extractThumbnailHint(doc)
         if (thumbnailHint != null) {
-            println("[TVWiki v1.3] 썸네일 힌트로 m3u8 추측 시도")
             try {
                 val pathRegex = Regex("""/v/[a-z]/[a-zA-Z0-9]+""")
                 val pathMatch = pathRegex.find(thumbnailHint)
                 if (pathMatch != null) {
                     val m3u8Url = thumbnailHint.substringBefore(pathMatch.value) + pathMatch.value + "/index.m3u8"
-                    val fixedM3u8Url = m3u8Url.replace(Regex("//v/"), "/v/")
-                    
                     callback(
-                        newExtractorLink(name, name, fixedM3u8Url, ExtractorLinkType.M3U8) {
+                        newExtractorLink(name, name, m3u8Url.replace(Regex("//v/"), "/v/"), ExtractorLinkType.M3U8) {
                             this.referer = mainUrl
-                            this.quality = Qualities.Unknown.value
                             this.headers = commonHeaders
                         }
                     )
                     return true
                 }
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
+            } catch (e: Exception) { e.printStackTrace() }
         }
 
         return false
@@ -368,52 +373,33 @@ class TVWiki : MainAPI() {
 
     private suspend fun extractFromApi(
         doc: Document,
-        refererUrl: String, // Referer URL을 인자로 받음
+        refererUrl: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         try {
             val iframe = doc.selectFirst("iframe#view_iframe") ?: return false
-            
-            val sessionData = iframe.attr("data-session1").ifEmpty { 
-                iframe.attr("data-session2") 
-            }
+            val sessionData = iframe.attr("data-session1").ifEmpty { iframe.attr("data-session2") }
 
-            if (sessionData.isNullOrEmpty()) {
-                println("[TVWiki v1.3] data-session 속성 없음")
-                return false
-            }
+            if (sessionData.isNullOrEmpty()) return false
 
-            println("[TVWiki v1.3] 세션 데이터 발견")
-            
             val apiUrl = "$mainUrl/api/create_session.php"
-            
-            // [수정 포인트] Referer를 현재 페이지 URL로 설정
             val headers = commonHeaders.toMutableMap()
             headers["Content-Type"] = "application/json"
             headers["X-Requested-With"] = "XMLHttpRequest"
             headers["Referer"] = refererUrl 
 
             val requestBody = sessionData.toRequestBody("application/json".toMediaTypeOrNull())
-            
             val response = app.post(apiUrl, headers = headers, requestBody = requestBody)
             val json = response.parsedSafe<SessionResponse>()
 
             if (json != null && json.success && !json.playerUrl.isNullOrEmpty()) {
                 val fullUrl = "${json.playerUrl}?t=${json.t}&sig=${json.sig}"
-                println("[TVWiki v1.3] API 응답으로 URL 생성: $fullUrl")
-                
                 if (fullUrl.contains("player.bunny-frame.online")) {
                     return BunnyPoorCdn().extract(fullUrl, refererUrl, subtitleCallback, callback, null)
                 }
-            } else {
-                println("[TVWiki v1.3] API 응답 실패 또는 URL 없음")
             }
-
-        } catch (e: Exception) {
-            println("[TVWiki v1.3] API 호출 중 에러: ${e.message}")
-            e.printStackTrace()
-        }
+        } catch (e: Exception) { e.printStackTrace() }
         return false
     }
 
