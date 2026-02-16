@@ -7,7 +7,7 @@ import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Element
 
 class Linkkf : MainAPI() {
-    // v1.1 빌드 에러 수정: newExtractorLink 파라미터 호환성 개선
+    // v1.3: 가로 포스터 지원(isHorizontalImages) 및 상세 디버깅 로그 추가
     override var mainUrl = "https://linkkf.tv"
     override var name = "Linkkf"
     override val hasMainPage = true
@@ -43,48 +43,93 @@ class Linkkf : MainAPI() {
             "$mainUrl${baseUrl}page/$page/"
         }
 
-        val doc = app.get(url, headers = commonHeaders).document
-        val list = doc.select(".vod-item").mapNotNull { element ->
-            element.toSearchResponse()
-        }
+        println("[Linkkf] getMainPage 요청 시작: $url (Page: $page)")
+        
+        try {
+            val doc = app.get(url, headers = commonHeaders).document
+            val list = doc.select(".vod-item").mapNotNull { element ->
+                element.toSearchResponse()
+            }
+            
+            println("[Linkkf] getMainPage 파싱 완료: ${list.size}개 항목 발견")
+            
+            // v1.3 수정: 가로 포스터(isHorizontalImages) 적용
+            return newHomePageResponse(
+                list = HomePageList(
+                    name = request.name,
+                    list = list,
+                    isHorizontalImages = true // 가로형 포스터 활성화
+                ),
+                hasNext = list.isNotEmpty()
+            )
 
-        return newHomePageResponse(request.name, list, hasNext = list.isNotEmpty())
+        } catch (e: Exception) {
+            println("[Linkkf] getMainPage 에러 발생: ${e.message}")
+            e.printStackTrace()
+            return newHomePageResponse(request.name, emptyList())
+        }
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/view/wd/$query/"
-        val doc = app.get(url, headers = commonHeaders).document
-        return doc.select(".vod-item").mapNotNull { it.toSearchResponse() }
+        println("[Linkkf] search 요청: $url")
+        
+        return try {
+            val doc = app.get(url, headers = commonHeaders).document
+            val list = doc.select(".vod-item").mapNotNull { it.toSearchResponse() }
+            println("[Linkkf] search 결과: ${list.size}개 항목 발견")
+            list
+        } catch (e: Exception) {
+            println("[Linkkf] search 에러: ${e.message}")
+            emptyList()
+        }
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val doc = app.get(url, headers = commonHeaders).document
+        println("[Linkkf] load 요청: $url")
+        
+        try {
+            val doc = app.get(url, headers = commonHeaders).document
 
-        val title = doc.selectFirst(".detail-info-title")?.text()?.trim() ?: "Unknown Title"
-        val poster = doc.selectFirst(".detail-img img")?.let { img ->
-            img.attr("data-original").ifEmpty { img.attr("src") }
-        }
-        val description = doc.selectFirst(".detail-desc-content")?.text()?.trim()
-            ?: doc.selectFirst(".detail-info-desc")?.text()?.trim()
-        val tags = doc.select(".detail-info-desc a[href*='/class/']").map { it.text().trim() }
-        val year = doc.selectFirst("a[href*='/year/']")?.text()?.trim()?.toIntOrNull()
+            val title = doc.selectFirst(".detail-info-title")?.text()?.trim() ?: "Unknown Title"
+            
+            // 포스터: data-original 속성을 우선하여 고화질/원본 이미지 확보
+            val poster = doc.selectFirst(".detail-img img")?.let { img ->
+                val original = img.attr("data-original")
+                val src = img.attr("src")
+                if (original.isNotEmpty()) original else src
+            }
+            println("[Linkkf] 상세 정보: 제목='$title', 포스터='$poster'")
 
-        val episodes = doc.select(".episode-box .episodelist a").mapNotNull { aTag ->
-            val href = aTag.attr("href")
-            val name = aTag.text().trim()
-            if (href.isNotEmpty()) {
-                newEpisode(href) {
-                    this.name = name
-                    this.episode = name.filter { it.isDigit() }.toIntOrNull()
-                }
-            } else null
-        }.reversed()
+            val description = doc.selectFirst(".detail-desc-content")?.text()?.trim()
+                ?: doc.selectFirst(".detail-info-desc")?.text()?.trim()
+            
+            val tags = doc.select(".detail-info-desc a[href*='/class/']").map { it.text().trim() }
+            val year = doc.selectFirst("a[href*='/year/']")?.text()?.trim()?.toIntOrNull()
 
-        return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
-            this.posterUrl = poster
-            this.plot = description
-            this.tags = tags
-            this.year = year
+            val episodes = doc.select(".episode-box .episodelist a").mapNotNull { aTag ->
+                val href = aTag.attr("href")
+                val name = aTag.text().trim()
+                if (href.isNotEmpty()) {
+                    newEpisode(href) {
+                        this.name = name
+                        this.episode = name.filter { it.isDigit() }.toIntOrNull()
+                    }
+                } else null
+            }.reversed()
+
+            println("[Linkkf] 에피소드 파싱: ${episodes.size}개 발견")
+
+            return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
+                this.posterUrl = poster
+                this.plot = description
+                this.tags = tags
+                this.year = year
+            }
+        } catch (e: Exception) {
+            println("[Linkkf] load 에러: ${e.message}")
+            e.printStackTrace()
+            throw e
         }
     }
 
@@ -95,18 +140,20 @@ class Linkkf : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val fullUrl = if (data.startsWith("http")) data else "$mainUrl$data"
+        println("[Linkkf] loadLinks 진입: $fullUrl")
         
-        // Extractor를 통해 데이터만 추출
+        // Extractor 호출 및 결과 처리
         val result = LinkkfExtractor().extract(fullUrl, "$mainUrl/")
 
         if (result != null) {
+            println("[Linkkf] Extractor 성공. M3U8: ${result.m3u8Url}")
+            
             // 자막 처리
             subtitleCallback.invoke(
                 SubtitleFile("Korean", result.subtitleUrl)
             )
 
-            // [수정됨] newExtractorLink 호환성 해결
-            // referer, quality 등은 람다 블록 내부에서 설정해야 합니다.
+            // 링크 생성 (호환성 API 사용)
             callback.invoke(
                 newExtractorLink(
                     source = name,
@@ -119,14 +166,18 @@ class Linkkf : MainAPI() {
                 }
             )
             return true
+        } else {
+            println("[Linkkf] Extractor 실패: 결과를 반환받지 못했습니다.")
+            return false
         }
-        return false
     }
 
     private fun Element.toSearchResponse(): SearchResponse? {
         val aTag = this.selectFirst("a.vod-item-img") ?: return null
         val title = this.selectFirst(".vod-item-title a")?.text()?.trim() ?: return null
         val href = aTag.attr("href")
+        
+        // 포스터: 지연 로딩 이미지(data-original) 우선 처리
         val poster = this.selectFirst(".img-wrapper")?.attr("data-original")
             ?.ifEmpty { this.selectFirst("img")?.attr("src") }
 
