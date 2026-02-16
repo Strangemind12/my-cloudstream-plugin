@@ -3,11 +3,11 @@ package com.linkkf
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
-import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.utils.getQualityFromName
 import org.jsoup.nodes.Element
 
 class Linkkf : MainAPI() {
-    // v1.3: 가로 포스터 지원(isHorizontalImages) 및 상세 디버깅 로그 추가
+    // v1.4: 줄거리 파싱 로직 수정 및 가로 포스터 유지
     override var mainUrl = "https://linkkf.tv"
     override var name = "Linkkf"
     override val hasMainPage = true
@@ -53,12 +53,11 @@ class Linkkf : MainAPI() {
             
             println("[Linkkf] getMainPage 파싱 완료: ${list.size}개 항목 발견")
             
-            // v1.3 수정: 가로 포스터(isHorizontalImages) 적용
             return newHomePageResponse(
                 list = HomePageList(
                     name = request.name,
                     list = list,
-                    isHorizontalImages = true // 가로형 포스터 활성화
+                    isHorizontalImages = true // 가로 포스터 활성화
                 ),
                 hasNext = list.isNotEmpty()
             )
@@ -93,16 +92,20 @@ class Linkkf : MainAPI() {
 
             val title = doc.selectFirst(".detail-info-title")?.text()?.trim() ?: "Unknown Title"
             
-            // 포스터: data-original 속성을 우선하여 고화질/원본 이미지 확보
+            // 포스터
             val poster = doc.selectFirst(".detail-img img")?.let { img ->
                 val original = img.attr("data-original")
                 val src = img.attr("src")
                 if (original.isNotEmpty()) original else src
             }
-            println("[Linkkf] 상세 정보: 제목='$title', 포스터='$poster'")
+            println("[Linkkf] 상세 정보: 제목='$title'")
 
+            // [v1.4 수정] 줄거리 파싱 로직 변경
+            // 1순위: .detail-desc-content (실제 줄거리 영역)
+            // 2순위: meta 태그
+            // 차단: .detail-info-desc (메타데이터 영역이므로 사용하지 않음)
             val description = doc.selectFirst(".detail-desc-content")?.text()?.trim()
-                ?: doc.selectFirst(".detail-info-desc")?.text()?.trim()
+                ?: doc.selectFirst("meta[name='description']")?.attr("content")?.trim()
             
             val tags = doc.select(".detail-info-desc a[href*='/class/']").map { it.text().trim() }
             val year = doc.selectFirst("a[href*='/year/']")?.text()?.trim()?.toIntOrNull()
@@ -142,18 +145,16 @@ class Linkkf : MainAPI() {
         val fullUrl = if (data.startsWith("http")) data else "$mainUrl$data"
         println("[Linkkf] loadLinks 진입: $fullUrl")
         
-        // Extractor 호출 및 결과 처리
+        // Extractor 호출
         val result = LinkkfExtractor().extract(fullUrl, "$mainUrl/")
 
         if (result != null) {
             println("[Linkkf] Extractor 성공. M3U8: ${result.m3u8Url}")
             
-            // 자막 처리
             subtitleCallback.invoke(
                 SubtitleFile("Korean", result.subtitleUrl)
             )
 
-            // 링크 생성 (호환성 API 사용)
             callback.invoke(
                 newExtractorLink(
                     source = name,
@@ -177,7 +178,6 @@ class Linkkf : MainAPI() {
         val title = this.selectFirst(".vod-item-title a")?.text()?.trim() ?: return null
         val href = aTag.attr("href")
         
-        // 포스터: 지연 로딩 이미지(data-original) 우선 처리
         val poster = this.selectFirst(".img-wrapper")?.attr("data-original")
             ?.ifEmpty { this.selectFirst("img")?.attr("src") }
 
