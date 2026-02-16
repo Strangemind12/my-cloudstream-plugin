@@ -147,7 +147,6 @@ class MovieKing : MainAPI() {
 
         // 태그 리스트 생성 (태그명: 태그내용 형식)
         val tagsList = mutableListOf<String>()
-        if (!quality.isNullOrBlank()) tagsList.add("화질: $quality")
         if (!genre.isNullOrBlank()) tagsList.add("장르: $genre")
         if (!country.isNullOrBlank()) tagsList.add("국가: $country")
         if (!releaseDate.isNullOrBlank()) tagsList.add("공개일: $releaseDate")
