@@ -7,7 +7,7 @@ import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Element
 
 class Linkkf : MainAPI() {
-    // v1.4: 줄거리 파싱 로직 수정 및 가로 포스터 유지
+    // v1.6: Extractor 범용성 개선 (구형/신형 URL 모두 지원)
     override var mainUrl = "https://linkkf.tv"
     override var name = "Linkkf"
     override val hasMainPage = true
@@ -57,7 +57,7 @@ class Linkkf : MainAPI() {
                 list = HomePageList(
                     name = request.name,
                     list = list,
-                    isHorizontalImages = true // 가로 포스터 활성화
+                    isHorizontalImages = true
                 ),
                 hasNext = list.isNotEmpty()
             )
@@ -92,7 +92,6 @@ class Linkkf : MainAPI() {
 
             val title = doc.selectFirst(".detail-info-title")?.text()?.trim() ?: "Unknown Title"
             
-            // 포스터
             val poster = doc.selectFirst(".detail-img img")?.let { img ->
                 val original = img.attr("data-original")
                 val src = img.attr("src")
@@ -100,12 +99,10 @@ class Linkkf : MainAPI() {
             }
             println("[Linkkf] 상세 정보: 제목='$title'")
 
-            // [v1.4 수정] 줄거리 파싱 로직 변경
-            // 1순위: .detail-desc-content (실제 줄거리 영역)
-            // 2순위: meta 태그
-            // 차단: .detail-info-desc (메타데이터 영역이므로 사용하지 않음)
-            val description = doc.selectFirst(".detail-desc-content")?.text()?.trim()
-                ?: doc.selectFirst("meta[name='description']")?.attr("content")?.trim()
+            var description = doc.selectFirst(".detail-desc-content")?.text()?.trim()
+            if (description.isNullOrEmpty()) {
+                description = "다시보기"
+            }
             
             val tags = doc.select(".detail-info-desc a[href*='/class/']").map { it.text().trim() }
             val year = doc.selectFirst("a[href*='/year/']")?.text()?.trim()?.toIntOrNull()
@@ -151,9 +148,11 @@ class Linkkf : MainAPI() {
         if (result != null) {
             println("[Linkkf] Extractor 성공. M3U8: ${result.m3u8Url}")
             
-            subtitleCallback.invoke(
-                SubtitleFile("Korean", result.subtitleUrl)
-            )
+            if (result.subtitleUrl.isNotEmpty()) {
+                subtitleCallback.invoke(
+                    SubtitleFile("Korean", result.subtitleUrl)
+                )
+            }
 
             callback.invoke(
                 newExtractorLink(
