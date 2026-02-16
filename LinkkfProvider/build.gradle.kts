@@ -1,13 +1,14 @@
-package com.linkkf
+version = 1
 
-import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
-import com.lagradost.cloudstream3.plugins.Plugin
-import android.content.Context
-
-@CloudstreamPlugin
-class LinkkfPlugin : Plugin() {
-    override fun load(context: Context) {
-        // All providers should be added in this manner
-        registerMainAPI(Linkkf())
-    }
+cloudstream {
+    description = "애니메이션 한글 자막 제공"
+    authors = listOf("hsp1020") // 본인 계정명으로 변경
+    language = "ko"
+    
+    status = 1 // 0: Down, 1: Ok, 2: Slow, 3: Beta
+    tvTypes = listOf(
+        "Anime"
+    )
+    
+    iconUrl = "https://i.namu.wiki/i/4NbnTney9AChyoNRvChxbZQE806zcx9Z_wIjM32htHGOcp7ZOQWFvBCSyQfTu3NloC8WRcRE4hnGq2FNxOFdxjvYm82uiRnwMhu95ehEDONK8OSiIVctKBYVWmU7FjOItqs5Hf0OEZRbAbL9yE5a8w.webp"
 }
