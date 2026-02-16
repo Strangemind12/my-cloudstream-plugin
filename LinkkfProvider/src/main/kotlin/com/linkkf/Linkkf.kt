@@ -3,11 +3,12 @@ package com.linkkf
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
-import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.utils.getQualityFromName
+import com.lagradost.cloudstream3.network.WebViewResolver
 import org.jsoup.nodes.Element
 
 class Linkkf : MainAPI() {
-    // v1.6: Extractor 범용성 개선 (구형/신형 URL 모두 지원)
+    // v1.10: 구형 주소에 WebViewResolver 적용 (404 에러 해결)
     override var mainUrl = "https://linkkf.tv"
     override var name = "Linkkf"
     override val hasMainPage = true
@@ -43,15 +44,13 @@ class Linkkf : MainAPI() {
             "$mainUrl${baseUrl}page/$page/"
         }
 
-        println("[Linkkf] getMainPage 요청 시작: $url (Page: $page)")
+        println("[Linkkf] getMainPage 요청: $url")
         
         try {
             val doc = app.get(url, headers = commonHeaders).document
             val list = doc.select(".vod-item").mapNotNull { element ->
                 element.toSearchResponse()
             }
-            
-            println("[Linkkf] getMainPage 파싱 완료: ${list.size}개 항목 발견")
             
             return newHomePageResponse(
                 list = HomePageList(
@@ -63,7 +62,6 @@ class Linkkf : MainAPI() {
             )
 
         } catch (e: Exception) {
-            println("[Linkkf] getMainPage 에러 발생: ${e.message}")
             e.printStackTrace()
             return newHomePageResponse(request.name, emptyList())
         }
@@ -71,22 +69,15 @@ class Linkkf : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/view/wd/$query/"
-        println("[Linkkf] search 요청: $url")
-        
         return try {
             val doc = app.get(url, headers = commonHeaders).document
-            val list = doc.select(".vod-item").mapNotNull { it.toSearchResponse() }
-            println("[Linkkf] search 결과: ${list.size}개 항목 발견")
-            list
+            doc.select(".vod-item").mapNotNull { it.toSearchResponse() }
         } catch (e: Exception) {
-            println("[Linkkf] search 에러: ${e.message}")
             emptyList()
         }
     }
 
     override suspend fun load(url: String): LoadResponse {
-        println("[Linkkf] load 요청: $url")
-        
         try {
             val doc = app.get(url, headers = commonHeaders).document
 
@@ -97,7 +88,6 @@ class Linkkf : MainAPI() {
                 val src = img.attr("src")
                 if (original.isNotEmpty()) original else src
             }
-            println("[Linkkf] 상세 정보: 제목='$title'")
 
             var description = doc.selectFirst(".detail-desc-content")?.text()?.trim()
             if (description.isNullOrEmpty()) {
@@ -118,8 +108,6 @@ class Linkkf : MainAPI() {
                 } else null
             }.reversed()
 
-            println("[Linkkf] 에피소드 파싱: ${episodes.size}개 발견")
-
             return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
                 this.posterUrl = poster
                 this.plot = description
@@ -127,8 +115,6 @@ class Linkkf : MainAPI() {
                 this.year = year
             }
         } catch (e: Exception) {
-            println("[Linkkf] load 에러: ${e.message}")
-            e.printStackTrace()
             throw e
         }
     }
@@ -142,34 +128,52 @@ class Linkkf : MainAPI() {
         val fullUrl = if (data.startsWith("http")) data else "$mainUrl$data"
         println("[Linkkf] loadLinks 진입: $fullUrl")
         
-        // Extractor 호출
-        val result = LinkkfExtractor().extract(fullUrl, "$mainUrl/")
+        val result = LinkkfExtractor().extract(fullUrl, "$mainUrl/") ?: return false
 
-        if (result != null) {
-            println("[Linkkf] Extractor 성공. M3U8: ${result.m3u8Url}")
-            
-            if (result.subtitleUrl.isNotEmpty()) {
-                subtitleCallback.invoke(
-                    SubtitleFile("Korean", result.subtitleUrl)
-                )
-            }
-
-            callback.invoke(
-                newExtractorLink(
-                    source = name,
-                    name = name,
-                    url = result.m3u8Url,
-                    type = ExtractorLinkType.M3U8
-                ) {
-                    this.referer = "$mainUrl/"
-                    this.quality = getQualityFromName("HD")
-                }
-            )
-            return true
-        } else {
-            println("[Linkkf] Extractor 실패: 결과를 반환받지 못했습니다.")
-            return false
+        // 자막 처리 (자막 URL이 있는 경우)
+        if (result.subtitleUrl.isNotEmpty()) {
+            subtitleCallback.invoke(SubtitleFile("Korean", result.subtitleUrl))
         }
+
+        // --- [v1.10 핵심] WebViewResolver 분기 처리 ---
+        var finalM3u8Url = result.m3u8Url
+
+        if (result.needsWebView) {
+            println("[Linkkf] 구형 플레이어 감지. WebViewResolver로 M3U8 스니핑 시도... (Target: ${result.m3u8Url})")
+            try {
+                // .m3u8 패턴을 스니핑하는 WebViewResolver 사용
+                val response = app.get(
+                    result.m3u8Url, 
+                    headers = commonHeaders, 
+                    interceptor = WebViewResolver(Regex("""\.m3u8"""))
+                )
+                finalM3u8Url = response.url
+                println("[Linkkf] WebView 스니핑 성공! 발견된 URL: $finalM3u8Url")
+            } catch (e: Exception) {
+                println("[Linkkf] WebViewResolver 에러 (혹은 타임아웃): ${e.message}")
+                // 에러 발생 시에도 URL이 감지되었다면 사용 시도, 아니면 실패 처리
+                if (e.message?.contains("http") == true) {
+                    // 예외 메시지에 URL이 포함된 경우가 간혹 있음 (구현에 따라 다름)
+                }
+                // 실패해도 일단 진행해보거나 리턴
+                return false
+            }
+        } else {
+            println("[Linkkf] 신형/직공 플레이어. URL 사용: $finalM3u8Url")
+        }
+
+        callback.invoke(
+            newExtractorLink(
+                source = name,
+                name = name,
+                url = finalM3u8Url,
+                type = ExtractorLinkType.M3U8
+            ) {
+                this.referer = "$mainUrl/"
+                this.quality = getQualityFromName("HD")
+            }
+        )
+        return true
     }
 
     private fun Element.toSearchResponse(): SearchResponse? {
