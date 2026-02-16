@@ -8,7 +8,7 @@ import com.lagradost.cloudstream3.network.WebViewResolver
 import org.jsoup.nodes.Element
 
 class Linkkf : MainAPI() {
-    // v1.10: 구형 주소에 WebViewResolver 적용 (404 에러 해결)
+    // v1.11: 403 Forbidden 해결을 위한 Referer 전략 수정
     override var mainUrl = "https://linkkf.tv"
     override var name = "Linkkf"
     override val hasMainPage = true
@@ -130,36 +130,33 @@ class Linkkf : MainAPI() {
         
         val result = LinkkfExtractor().extract(fullUrl, "$mainUrl/") ?: return false
 
-        // 자막 처리 (자막 URL이 있는 경우)
+        // 자막 처리
         if (result.subtitleUrl.isNotEmpty()) {
             subtitleCallback.invoke(SubtitleFile("Korean", result.subtitleUrl))
         }
 
-        // --- [v1.10 핵심] WebViewResolver 분기 처리 ---
+        // [v1.11 수정] Referer 결정 로직
+        // needsWebView가 true인 경우(구형 플레이어), m3u8Url 변수에는 '플레이어 페이지 주소'가 들어있음.
+        // 이를 Referer로 사용해야 403 에러를 피할 수 있습니다.
+        val playerPageUrl = result.m3u8Url
+        val targetReferer = if (result.needsWebView) playerPageUrl else "$mainUrl/"
+
         var finalM3u8Url = result.m3u8Url
 
         if (result.needsWebView) {
-            println("[Linkkf] 구형 플레이어 감지. WebViewResolver로 M3U8 스니핑 시도... (Target: ${result.m3u8Url})")
+            println("[Linkkf] 구형 플레이어. WebViewResolver 사용. (Referer 예정: $targetReferer)")
             try {
-                // .m3u8 패턴을 스니핑하는 WebViewResolver 사용
                 val response = app.get(
                     result.m3u8Url, 
                     headers = commonHeaders, 
                     interceptor = WebViewResolver(Regex("""\.m3u8"""))
                 )
                 finalM3u8Url = response.url
-                println("[Linkkf] WebView 스니핑 성공! 발견된 URL: $finalM3u8Url")
+                println("[Linkkf] WebView 스니핑 성공: $finalM3u8Url")
             } catch (e: Exception) {
-                println("[Linkkf] WebViewResolver 에러 (혹은 타임아웃): ${e.message}")
-                // 에러 발생 시에도 URL이 감지되었다면 사용 시도, 아니면 실패 처리
-                if (e.message?.contains("http") == true) {
-                    // 예외 메시지에 URL이 포함된 경우가 간혹 있음 (구현에 따라 다름)
-                }
-                // 실패해도 일단 진행해보거나 리턴
+                println("[Linkkf] WebViewResolver 에러: ${e.message}")
                 return false
             }
-        } else {
-            println("[Linkkf] 신형/직공 플레이어. URL 사용: $finalM3u8Url")
         }
 
         callback.invoke(
@@ -169,7 +166,8 @@ class Linkkf : MainAPI() {
                 url = finalM3u8Url,
                 type = ExtractorLinkType.M3U8
             ) {
-                this.referer = "$mainUrl/"
+                // 수정된 Referer 적용
+                this.referer = targetReferer
                 this.quality = getQualityFromName("HD")
             }
         )
