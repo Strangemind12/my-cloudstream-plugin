@@ -20,9 +20,7 @@ class Kotbc : MainAPI() {
     override val supportedTypes = setOf(
         TvType.Movie,
         TvType.TvSeries,
-        TvType.AsianDrama,
-        TvType.Variety
-    )
+        TvType.AsianDrama    )
 
     override val mainPage = mainPageOf(
         "movie" to "영화",
