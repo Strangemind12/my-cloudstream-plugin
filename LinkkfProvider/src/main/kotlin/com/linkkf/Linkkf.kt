@@ -1,7 +1,7 @@
 package com.linkkf
 
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Element
 
 class Linkkf : MainAPI() {
