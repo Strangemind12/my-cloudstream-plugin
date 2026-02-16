@@ -8,8 +8,9 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URLDecoder
 import java.net.URLEncoder
+import com.fasterxml.jackson.annotation.JsonProperty
 
-// v1.1 - 에피소드 정렬 로직 개선 (밀림 현상 수정)
+// v1.2 - 다음화 재생 버그 수정 및 동적 세션 로직 추가
 class TVWiki : MainAPI() {
     override var mainUrl = "https://tvwiki5.net"
     override var name = "TVWiki"
@@ -33,6 +34,14 @@ class TVWiki : MainAPI() {
         "Accept-Language" to "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
         "Referer" to "$mainUrl/",
         "Upgrade-Insecure-Requests" to "1"
+    )
+
+    // 세션 응답용 데이터 클래스
+    data class SessionResponse(
+        @JsonProperty("success") val success: Boolean,
+        @JsonProperty("player_url") val playerUrl: String?,
+        @JsonProperty("t") val t: String?,
+        @JsonProperty("sig") val sig: String?
     )
 
     override val mainPage = mainPageOf(
@@ -79,7 +88,6 @@ class TVWiki : MainAPI() {
 
         val fixedPoster = fixUrl(poster)
 
-        // URL에 포스터 주소를 인코딩해서 붙임 (상세페이지 전달용)
         if (fixedPoster.isNotEmpty()) {
             try {
                 val encodedPoster = URLEncoder.encode(fixedPoster, "UTF-8")
@@ -134,21 +142,18 @@ class TVWiki : MainAPI() {
         return items
     }
 
-    // 에피소드 제목에서 숫자만 추출하는 헬퍼 함수
     private fun getEpisodeNumber(name: String): Int {
         return try {
-            // "레이디 두아 1화", "1화" 등에서 숫자만 추출
             val numberString = name.replace(Regex("[^0-9]"), "")
             if (numberString.isNotEmpty()) numberString.toInt() else Int.MAX_VALUE
         } catch (e: Exception) {
-            Int.MAX_VALUE // 숫자가 없으면 맨 뒤로 보냄
+            Int.MAX_VALUE
         }
     }
 
     override suspend fun load(url: String): LoadResponse {
         println("[TVWiki] load 시작 - URL: $url")
 
-        // 전달받은 URL에서 포스터 정보 추출 및 복원
         var passedPoster: String? = null
         var realUrl = url
 
@@ -179,7 +184,6 @@ class TVWiki : MainAPI() {
                 ?: "Unknown"
         }
         
-        // 제목 정제
         title = title!!.replace(Regex("\\s*\\d+[화회부].*"), "").replace(" 다시보기", "").trim()
 
         if (!oriTitleFull.isNullOrEmpty()) {
@@ -190,7 +194,6 @@ class TVWiki : MainAPI() {
             }
         }
 
-        // 포스터 우선순위: 상세페이지 > 메타태그 > 목록에서 가져온 포스터
         var poster = doc.selectFirst("#bo_v_poster img")?.attr("src")
             ?: doc.selectFirst("meta[property='og:image']")?.attr("content")
         
@@ -238,7 +241,6 @@ class TVWiki : MainAPI() {
                 else "$metaString / 줄거리: $story".trim()
         }
         
-        // [수정] 에피소드 파싱 및 정렬 로직 개선
         println("[TVWiki] 에피소드 파싱 시작")
         val episodes = doc.select("#other_list ul li").mapNotNull { li ->
             val aTag = li.selectFirst("a.ep-link") ?: return@mapNotNull null
@@ -257,8 +259,6 @@ class TVWiki : MainAPI() {
                 this.posterUrl = fixUrl(epThumb ?: "")
             }
         }.sortedBy { 
-            // 이름에 포함된 숫자를 기준으로 오름차순 정렬 (1화 -> 8화)
-            // 기존 .reversed()는 HTML 구조 순서에 의존하므로 삭제함
             getEpisodeNumber(it.name ?: "") 
         }
 
@@ -297,41 +297,75 @@ class TVWiki : MainAPI() {
         println("[TVWiki] loadLinks 시작 - data: $data")
         val doc = app.get(data, headers = commonHeaders).document
         
+        var foundUrl = false
         val iframe = doc.selectFirst("iframe#view_iframe")
+        
+        // 1. iframe src 확인
         if (iframe != null) {
             val playerUrl = iframe.attr("src")
             println("[TVWiki] iframe src 발견: $playerUrl")
-            if (playerUrl.contains("player.bunny-frame.online")) {
+            
+            if (playerUrl.isNotEmpty() && playerUrl.contains("player.bunny-frame.online")) {
                  val extracted = BunnyPoorCdn().extract(fixUrl(playerUrl).replace("&amp;", "&"), data, subtitleCallback, callback, null)
-                 if(extracted) return true
+                 if(extracted) foundUrl = true
             }
-             val playerUrl1 = iframe.attr("data-player1")
-             if (playerUrl1.contains("player.bunny-frame.online")) {
-                 val extracted = BunnyPoorCdn().extract(fixUrl(playerUrl1).replace("&amp;", "&"), data, subtitleCallback, callback, null)
-                 if(extracted) return true
-            }
-            val playerUrl2 = iframe.attr("data-player2")
-            if (playerUrl2.contains("player.bunny-frame.online")) {
-                 val extracted = BunnyPoorCdn().extract(fixUrl(playerUrl2).replace("&amp;", "&"), data, subtitleCallback, callback, null)
-                 if(extracted) return true
+            
+            // src가 비어있거나 실패했고, data-session1이 있다면 API로 URL 생성 시도
+            if (!foundUrl) {
+                val sessionData = iframe.attr("data-session1")
+                if (sessionData.isNotEmpty()) {
+                    println("[TVWiki] data-session1 발견, 세션 API 요청 시도")
+                    try {
+                        val sessionUrl = "$mainUrl/api/create_session.php"
+                        val response = app.post(
+                            sessionUrl,
+                            headers = commonHeaders + mapOf("Content-Type" to "application/json"),
+                            data = mapOf("raw" to sessionData) // body: JSON string directly
+                        ).parsedSafe<SessionResponse>()
+
+                        if (response != null && response.success && !response.playerUrl.isNullOrEmpty()) {
+                            val generatedUrl = "${response.playerUrl}?t=${response.t}&sig=${response.sig}"
+                            println("[TVWiki] 세션 API로 URL 생성 성공: $generatedUrl")
+                            val extracted = BunnyPoorCdn().extract(fixUrl(generatedUrl), data, subtitleCallback, callback, null)
+                            if (extracted) foundUrl = true
+                        } else {
+                            println("[TVWiki] 세션 API 요청 실패 또는 응답 오류")
+                        }
+                    } catch (e: Exception) {
+                        println("[TVWiki] 세션 API 요청 중 예외 발생: ${e.message}")
+                        e.printStackTrace()
+                    }
+                }
             }
         }
 
+        if (foundUrl) return true
+
+        // 2. Script 태그 폴백 (주의: nextEp 관련 URL 제외)
+        println("[TVWiki] iframe 실패, Script 태그 탐색 시작")
         val scriptTags = doc.select("script")
         for (script in scriptTags) {
             val scriptContent = script.html()
+            
+            // 다음화 정보(episodeData)에 있는 URL은 절대 사용하면 안됨 (현재 문제의 원인)
+            if (scriptContent.contains("nextEpPlayer1Url") || scriptContent.contains("nextEpUrl")) {
+                println("[TVWiki] Script에서 URL 발견했으나 다음화(NextEpisode) 정보이므로 스킵함")
+                continue
+            }
+
             if (scriptContent.contains("player.bunny-frame.online")) {
                 val urlRegex = Regex("""https://player\.bunny-frame\.online/[^"'\s]+""")
                 val match = urlRegex.find(scriptContent)
                 
                 if (match != null) {
-                    val foundUrl = match.value.replace("&amp;", "&")
-                    println("[TVWiki] Script에서 URL 발견: $foundUrl")
-                    if(BunnyPoorCdn().extract(foundUrl, data, subtitleCallback, callback, null)) return true
+                    val url = match.value.replace("&amp;", "&")
+                    println("[TVWiki] Script에서 URL 발견: $url")
+                    if(BunnyPoorCdn().extract(url, data, subtitleCallback, callback, null)) return true
                 }
             }
         }
 
+        // 3. 썸네일 힌트 (최후의 수단)
         val thumbnailHint = extractThumbnailHint(doc)
         if (thumbnailHint != null) {
             println("[TVWiki] 썸네일 힌트로 m3u8 추측 시도: $thumbnailHint")
