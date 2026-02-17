@@ -6,10 +6,10 @@ import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
 
 /**
- * Anilife Provider v15.0
- * - [Fix] Anilife.kt / Extractor.kt 파일 분리 완료
- * - [Rollback] 에피소드 정렬 로직 v4.1 방식으로 원복 (렉 문제 해결)
- * - [Debug] 모든 프로세스 상세 로그 추가
+ * Anilife Provider v16.0
+ * - [Fix] Anilife.kt / Extractor.kt 파일 분리
+ * - [Fix] 에피소드 로직 v4.1 원복 유지 (렉 없음)
+ * - [Debug] 실행 단계별 상세 로그 포함
  */
 class Anilife : MainAPI() {
     override var mainUrl = "https://anilife.live"
@@ -38,14 +38,13 @@ class Anilife : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (request.name.contains("TOP 20")) "$mainUrl${request.data}" 
                   else "$mainUrl${request.data.substringBeforeLast("/")}/$page"
-        println("$TAG [MainPage] 요청 시작: $url")
+        println("$TAG [MainPage] Request: $url")
         return try {
             val doc = app.get(url, headers = commonHeaders).document
             val home = parseCommonList(doc)
-            println("$TAG [MainPage] 로드 성공: ${home.size}개 아이템")
             newHomePageResponse(request.name, home)
         } catch (e: Exception) {
-            println("$TAG [MainPage] 에러: ${e.message}")
+            println("$TAG [MainPage] Error: ${e.message}")
             newHomePageResponse(request.name, emptyList())
         }
     }
@@ -75,7 +74,7 @@ class Anilife : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/search?keyword=$query"
-        println("$TAG [Search] 검색어: $query")
+        println("$TAG [Search] Query: $url")
         val doc = app.get(url, headers = commonHeaders).document
         return parseCommonList(doc)
     }
@@ -88,16 +87,13 @@ class Anilife : MainAPI() {
             url.substringBefore("?poster=")
         } else url
 
-        println("$TAG [Load] 상세 페이지 로드: $cleanUrl")
+        println("$TAG [Load] Details URL: $cleanUrl")
         val doc = app.get(cleanUrl, headers = commonHeaders).document
         val title = doc.selectFirst(".entry-title")?.text()?.trim() ?: "Unknown"
 
-        var htmlPoster = doc.selectFirst(".thumb img")?.attr("src") ?: tunnelingPoster
-        
-        // Referer 파라미터 생성 (차단 우회용)
         val encodedRef = Base64.encodeToString(cleanUrl.toByteArray(), Base64.NO_WRAP)
 
-        // v4.1 방식 롤백: 단순 파싱 (렉 없음)
+        // v4.1 로직 유지: 단순 파싱
         val episodes = doc.select(".eplister > ul > li > a").mapNotNull { element ->
             val rawHref = fixUrl(element.attr("href"))
             val numText = element.selectFirst(".epl-num")?.text()?.trim() ?: ""
@@ -112,10 +108,10 @@ class Anilife : MainAPI() {
             }
         }.reversed()
 
-        println("$TAG [Load] 에피소드 파싱 완료: ${episodes.size}개")
+        println("$TAG [Load] Parsed ${episodes.size} episodes")
 
         return newAnimeLoadResponse(title, cleanUrl, TvType.Anime) {
-            this.posterUrl = htmlPoster
+            this.posterUrl = doc.selectFirst(".thumb img")?.attr("src") ?: tunnelingPoster
             this.posterHeaders = commonHeaders
             this.plot = doc.selectFirst(".synp .entry-content")?.text()?.trim()
             this.tags = doc.select(".genxed a").map { it.text() }
@@ -129,7 +125,7 @@ class Anilife : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("$TAG [LoadLinks] 프로세스 시작. Data: $data")
+        println("$TAG [LoadLinks] Start. Data: $data")
         val extractor = AnilifeExtractor()
         return extractor.extract(data, callback)
     }
