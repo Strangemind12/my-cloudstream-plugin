@@ -209,7 +209,7 @@ class Anilife : MainAPI() {
                     // [v32.0 유지] URL 재조립 (API 주소 -> 최종 영상 주소)
                     if (finalM3u8.contains("/m3u8/st/")) {
                         println("$TAG [3단계] API 주소 감지됨. 재조립 수행...")
-                        finalM3u8 = finalM3u8.replace("/m3u8/st/", "/v1/manifest/b/") + "/master.m3u8"
+                        finalM3u8 = finalM3u8.replace("/m3u8/st/", "/v1/manifest/b/") + "/1080/playlist.m3u8"
                         println("$TAG [3단계] 재조립된 최종 URL: $finalM3u8")
                     }
 
