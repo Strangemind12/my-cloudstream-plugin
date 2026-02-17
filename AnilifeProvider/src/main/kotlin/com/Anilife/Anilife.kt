@@ -7,10 +7,11 @@ import com.lagradost.cloudstream3.network.WebViewResolver
 import org.jsoup.nodes.Document
 
 /**
- * Anilife Provider v33.0
- * - [Critical Fix] 'Response code: 403 (Forbidden)' 에러 해결을 위해 헤더 전략 수정
- * - [Fix] Referer를 메인 주소로 원복하고, Origin 헤더를 추가하여 서버 인증 통과 시도
- * - [Fix] v32.0의 URL 재조립 및 웹뷰 통합 로직 유지
+ * Anilife Provider v34.0
+ * - [Critical Fix] User-Agent를 모바일에서 'PC(Windows)'로 변경
+ * -> 사용자가 제공한 성공 헤더(Windows Chrome)와 환경을 일치시켜 403 Forbidden 해결 시도
+ * - [Fix] Referer 및 Origin 헤더를 브라우저 환경과 동일하게 'https://anilife.live/'로 고정
+ * - [Fix] v33.0의 로직(URL 재조립, 웹뷰 통합) 유지
  */
 class Anilife : MainAPI() {
     override var mainUrl = "https://anilife.live"
@@ -21,11 +22,11 @@ class Anilife : MainAPI() {
 
     private val TAG = "[Anilife]"
 
-    // 모바일 User-Agent
-    private val mobileUserAgent = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+    // [v34.0 변경] 성공한 브라우저 헤더에 맞춰 PC용 User-Agent 사용
+    private val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
     private val commonHeaders = mapOf(
-        "User-Agent" to mobileUserAgent,
+        "User-Agent" to userAgent,
         "Referer" to "$mainUrl/"
     )
 
@@ -142,7 +143,7 @@ class Anilife : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("$TAG [LoadLinks] === 프로세스 시작 (v33.0) ===")
+        println("$TAG [LoadLinks] === 프로세스 시작 (v34.0) ===")
         
         var cleanData = data.substringBefore("?poster=")
         var detailReferer = "$mainUrl/"
@@ -168,7 +169,7 @@ class Anilife : MainAPI() {
                 cleanData, 
                 headers = mapOf(
                     "Referer" to detailReferer,
-                    "User-Agent" to mobileUserAgent
+                    "User-Agent" to userAgent // PC User-Agent 사용
                 ), 
                 interceptor = WebViewResolver(Regex(".*"))
             )
@@ -198,7 +199,7 @@ class Anilife : MainAPI() {
                     val m3u8Response = app.get(
                         playerUrl,
                         headers = mapOf(
-                            "User-Agent" to mobileUserAgent,
+                            "User-Agent" to userAgent, // PC User-Agent 사용
                             "Referer" to currentUrl
                         ),
                         interceptor = m3u8Interceptor
@@ -209,7 +210,7 @@ class Anilife : MainAPI() {
                     // [v32.0 유지] URL 재조립 (API 주소 -> 최종 영상 주소)
                     if (finalM3u8.contains("/m3u8/st/")) {
                         println("$TAG [3단계] API 주소 감지됨. 재조립 수행...")
-                        finalM3u8 = finalM3u8.replace("/m3u8/st/", "/v1/manifest/b/") + "/1080/playlist.m3u8"
+                        finalM3u8 = finalM3u8.replace("/m3u8/st/", "/v1/manifest/b/") + "/playlist.m3u8"
                         println("$TAG [3단계] 재조립된 최종 URL: $finalM3u8")
                     }
 
@@ -221,16 +222,12 @@ class Anilife : MainAPI() {
                                 url = finalM3u8,
                                 type = ExtractorLinkType.M3U8
                             ) {
-                                // [v33.0 수정] 403 Forbidden 해결을 위한 헤더 변경
-                                // 1. Referer를 메인 주소로 설정 (일부 CDN은 메인 도메인을 요구함)
-                                this.referer = "https://anilife.live/" 
-                                
-                                // 2. Origin 헤더 추가 (CORS 문제 방지)
+                                // [v34.0 수정] 성공한 브라우저 헤더 그대로 적용
+                                this.referer = "https://anilife.live/"
                                 this.headers = mapOf(
-                                    "User-Agent" to mobileUserAgent,
+                                    "User-Agent" to userAgent,
                                     "Origin" to "https://anilife.live"
                                 )
-                                
                                 this.quality = getQualityFromName("HD")
                             }
                         )
