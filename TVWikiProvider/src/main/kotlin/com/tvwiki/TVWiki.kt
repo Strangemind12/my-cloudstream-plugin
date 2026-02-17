@@ -14,10 +14,11 @@ import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
 
 /**
- * TVWiki Provider v1.4
- * * [v1.4 수정 사항]
- * - 상세 정보 태그화: 줄거리를 제외한 정보를 태그(Tags) 리스트로 분리하여 TVMON과 동일한 구조로 변경.
- * - 태그 정제: "제목" 태그 제외, "개봉년도" -> "공개일" 라벨 변경, 장르/출연 태그 통합 및 정규식 정제 적용.
+ * TVWiki Provider v1.5
+ * [v1.5 수정 사항]
+ * - 상세 페이지 포스터 Fallback 로직 강화 (애니/예능 포스터 누락 수정)
+ * - 사이트가 og:image에 메인 URL이나 'no_image'를 넣을 경우, 이를 무효 처리하고 터널링된 포스터 사용.
+ * - toSearchResponse에서 포스터 절대 경로 변환 로직 추가.
  */
 class TVWiki : MainAPI() {
     override var mainUrl = "https://tvwiki5.net"
@@ -44,7 +45,7 @@ class TVWiki : MainAPI() {
         "Upgrade-Insecure-Requests" to "1"
     )
 
-    // 태그 내용 정제용 정규식 (TVMON과 동일)
+    // 태그 내용 정제용 정규식
     private val tagCleanRegex = Regex("""\s*(한국|해외)?영화\s*\(\d{4}\).*""")
 
     data class SessionResponse(
@@ -71,7 +72,6 @@ class TVWiki : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = "$mainUrl${request.data}?page=$page"
-        println("[TVWiki][v1.4] getMainPage 요청: $url")
         
         return try {
             val doc = app.get(url, headers = commonHeaders).document
@@ -91,14 +91,18 @@ class TVWiki : MainAPI() {
             ?: return null
 
         val imgTag = aTag.selectFirst("img")
-        val poster = imgTag?.attr("data-original")?.ifEmpty { null }
+        var rawPoster = imgTag?.attr("data-original")?.ifEmpty { null }
             ?: imgTag?.attr("data-src")?.ifEmpty { null }
             ?: imgTag?.attr("src")
             ?: ""
 
-        val fixedPoster = fixUrl(poster)
+        // [v1.5 수정] 포스터가 상대 경로일 경우 절대 경로로 변환하여 전달 (중요)
+        if (rawPoster.startsWith("/")) {
+            rawPoster = "$mainUrl$rawPoster"
+        }
+        val fixedPoster = fixUrl(rawPoster)
 
-        if (fixedPoster.isNotEmpty()) {
+        if (fixedPoster.isNotEmpty() && !fixedPoster.contains("no3.png")) {
             try {
                 val encodedPoster = URLEncoder.encode(fixedPoster, "UTF-8")
                 val separator = if (link.contains("?")) "&" else "?"
@@ -142,7 +146,6 @@ class TVWiki : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        println("[TVWiki][v1.4] 검색 실행: $query")
         val searchUrl = "$mainUrl/search?stx=$query"
         val doc = app.get(searchUrl, headers = commonHeaders).document
         
@@ -163,8 +166,9 @@ class TVWiki : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        println("[TVWiki v1.4] load 시작 - URL: $url")
+        println("[TVWiki v1.5] load 시작 - URL: $url")
 
+        // 1. URL 파라미터(cw_poster) 복원
         var passedPoster: String? = null
         var realUrl = url
 
@@ -178,10 +182,10 @@ class TVWiki : MainAPI() {
                 if (realUrl.endsWith("?") || realUrl.endsWith("&")) {
                     realUrl = realUrl.dropLast(1)
                 }
-                println("[TVWiki] 터널링 포스터 복원: $passedPoster")
+                // println("[TVWiki] 터널링 포스터 복원: $passedPoster")
             }
         } catch (e: Exception) {
-            println("[TVWiki] 포스터 복원 에러: ${e.message}")
+            e.printStackTrace()
         }
 
         val doc = app.get(realUrl, headers = commonHeaders).document
@@ -206,33 +210,41 @@ class TVWiki : MainAPI() {
             }
         }
 
+        // 2. 상세 페이지 포스터 추출
         var poster = doc.selectFirst("#bo_v_poster img")?.attr("src")
             ?: doc.selectFirst("meta[property='og:image']")?.attr("content")
-        
-        if (poster.isNullOrEmpty() && passedPoster != null) {
-            poster = passedPoster
-        }
-        poster = poster ?: ""
+            ?: ""
 
-        // --- [v1.4 핵심 수정] 태그 파싱 로직 (TVMON/KOTBC 스타일) ---
+        // [v1.5 핵심 수정] 포스터 유효성 검사 (애니/예능 등에서 사이트 주소가 들어오는 경우 방지)
+        val isInvalidPoster = poster.isEmpty() 
+            || poster.contains("no3.png") 
+            || poster.contains("no_image")
+            || poster == mainUrl // "https://tvwiki5.net" 과 완전히 같으면 가짜
+            || poster == "$mainUrl/" // "https://tvwiki5.net/"
+            || poster.endsWith("/") // 디렉토리 경로만 있는 경우
+
+        if (isInvalidPoster) {
+            if (passedPoster != null) {
+                // println("[TVWiki] 상세페이지 포스터 무효 -> 목록 포스터 사용")
+                poster = passedPoster
+            }
+        }
+
+        // 태그 처리
         val tagsList = mutableListOf<String>()
         
-        // 1. 기본 정보 태그화 (.bo_v_info dd)
         doc.select(".bo_v_info dd").forEach { dd ->
             var text = dd.text().trim()
             if (text.isNotEmpty() && !text.startsWith("제목")) {
-                // 라벨 변경 및 정제
                 val renamedText = text.replace("개봉년도:", "공개일:")
                 val cleanedText = renamedText.replace(tagCleanRegex, "").trim()
                 
                 if (cleanedText.isNotEmpty()) {
                     tagsList.add(cleanedText)
-                    println("[TVWiki] 기본 태그 추가: $cleanedText")
                 }
             }
         }
 
-        // 2. 장르 정보 태그화 (.tags dd a)
         val genreList = doc.select(".tags dd a").filter {
             val txt = it.text()
             !txt.contains("트레일러") && !it.hasClass("btn_watch")
@@ -241,18 +253,14 @@ class TVWiki : MainAPI() {
         if (genreList.isNotEmpty()) {
             val genreTag = "장르: ${genreList.joinToString(", ")}"
             tagsList.add(genreTag)
-            println("[TVWiki] 장르 태그 추가: $genreTag")
         }
 
-        // 3. 출연진 정보 태그화 (.slider_act .item .name)
         val castList = doc.select(".slider_act .item .name").map { it.text().trim().replace(tagCleanRegex, "") }
         if (castList.isNotEmpty() && castList.none { it.contains("운영팀") }) {
             val castTag = "출연: ${castList.joinToString(", ")}"
             tagsList.add(castTag)
-            println("[TVWiki] 출연진 태그 추가: $castTag")
         }
 
-        // --- 줄거리 파싱 (순수 텍스트만) ---
         var story = doc.selectFirst("#bo_v_con")?.text()?.trim()
             ?: doc.selectFirst(".story")?.text()?.trim()
             ?: doc.selectFirst("meta[name='description']")?.attr("content")
@@ -260,7 +268,6 @@ class TVWiki : MainAPI() {
 
         if (story.contains("다시보기") && story.contains("무료")) story = "다시보기"
         
-        println("[TVWiki v1.4] 에피소드 파싱 시작")
         val episodes = doc.select("#other_list ul li").mapNotNull { li ->
             val aTag = li.selectFirst("a.ep-link") ?: return@mapNotNull null
             val href = fixUrl(aTag.attr("href"))
@@ -278,8 +285,6 @@ class TVWiki : MainAPI() {
         }.sortedBy { 
             getEpisodeNumber(it.name ?: "") 
         }
-
-        println("[TVWiki v1.4] 최종 에피소드 개수: ${episodes.size}")
         
         val type = determineTypeFromUrl(realUrl)
 
@@ -309,16 +314,13 @@ class TVWiki : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("[TVWiki v1.4] loadLinks 시작 - data: $data")
-        
+        // 기존 코드 유지
         val doc = app.get(data, headers = commonHeaders).document
 
-        // 1. API 호출 방식
         if (extractFromApi(doc, data, subtitleCallback, callback)) {
             return true
         }
 
-        // 2. 정적 파싱
         val iframe = doc.selectFirst("iframe#view_iframe")
         if (iframe != null) {
             val playerUrl = iframe.attr("src")
@@ -328,7 +330,6 @@ class TVWiki : MainAPI() {
             }
         }
 
-        // 3. WebView 방식
         try {
             val webViewInterceptor = WebViewResolver(
                 Regex("bunny-frame|googleapis"), 
@@ -346,10 +347,9 @@ class TVWiki : MainAPI() {
                 }
             }
         } catch (e: Exception) {
-            println("[TVWiki v1.4] WebView 에러: ${e.message}")
+            // e.printStackTrace()
         }
 
-        // 4. 썸네일 힌트
         val thumbnailHint = extractThumbnailHint(doc)
         if (thumbnailHint != null) {
             try {
