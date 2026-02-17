@@ -7,6 +7,12 @@ import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 
+/**
+ * Anilife Provider v2.1
+ * - 포스터 파싱 로직 개선 (src 우선, fallback 처리)
+ * - 제목 중복 출력 수정 (.tt vs h2)
+ * - 헤더(User-Agent) 추가
+ */
 class Anilife : MainAPI() {
     override var mainUrl = "https://anilife.live"
     override var name = "Anilife"
@@ -15,6 +21,12 @@ class Anilife : MainAPI() {
     override val supportedTypes = setOf(TvType.Anime)
 
     private val TAG = "[Anilife]"
+
+    // 차단 방지용 공통 헤더
+    private val commonHeaders = mapOf(
+        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Referer" to "$mainUrl/"
+    )
 
     override val mainPage = mainPageOf(
         "/top20" to "실시간 TOP 20",
@@ -37,7 +49,7 @@ class Anilife : MainAPI() {
         println("$TAG [MainPage] Request: $url")
         
         try {
-            val doc = app.get(url).document
+            val doc = app.get(url, headers = commonHeaders).document
             val home = parseCommonList(doc)
             return newHomePageResponse(request.name, home)
         } catch (e: Exception) {
@@ -48,24 +60,35 @@ class Anilife : MainAPI() {
     }
 
     private fun parseCommonList(doc: Document): List<SearchResponse> {
-        // .listupd > article.bs 구조
         val items = doc.select(".listupd > article.bs").mapNotNull { element ->
             try {
                 // 1. 링크 파싱
                 val aTag = element.selectFirst("div.bsx > a") ?: return@mapNotNull null
                 val href = fixUrl(aTag.attr("href"))
 
-                // 2. 제목 중복 수정 (.tt 안에 텍스트와 h2가 같이 있음)
-                // 우선 h2 태그의 텍스트를 가져오고, 없으면 .tt의 text를 가져옴
+                // 2. 제목 파싱 (중복 방지)
+                // 구조: <div class="tt"> 텍스트 <h2 itemprop="headline"> 제목 </h2> </div>
+                // h2가 있으면 h2의 텍스트만 가져오고, 없으면 .tt 전체 텍스트 사용
                 val titleElement = element.selectFirst(".tt h2") ?: element.selectFirst(".tt")
                 val title = titleElement?.text()?.trim() ?: "Unknown"
 
-                // 3. 포스터 파싱 (selectFirst("img")가 가끔 빗나갈 수 있으므로 구체화)
-                val imgTag = element.selectFirst(".limit img") ?: element.selectFirst("img")
-                val poster = imgTag?.attr("src")?.let { fixUrl(it) } ?: ""
+                // 3. 포스터 파싱 (v2.1 개선)
+                // 구조: <div class="limit"> ... <img src="..."> </div>
+                val imgTag = element.selectFirst("img")
+                var poster = imgTag?.attr("src")
+                
+                // src가 비어있을 경우를 대비해 다른 속성 확인
+                if (poster.isNullOrEmpty()) {
+                    poster = imgTag?.attr("data-src")
+                }
+                if (poster.isNullOrEmpty()) {
+                    poster = imgTag?.attr("data-original")
+                }
+                
+                poster = poster?.let { fixUrl(it) } ?: ""
 
-                // 디버깅: 포스터나 제목이 이상하면 로그 출력
-                // println("$TAG [ListItem] Title: $title | Poster: $poster | Link: $href")
+                // 디버깅 로그 (필요시 주석 해제)
+                // println("$TAG [Item] Title: $title | Poster: $poster")
 
                 newAnimeSearchResponse(title, href, TvType.Anime) {
                     this.posterUrl = poster
@@ -82,16 +105,21 @@ class Anilife : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/search?keyword=$query"
         println("$TAG [Search] Query: $query -> $url")
-        val doc = app.get(url).document
+        val doc = app.get(url, headers = commonHeaders).document
         return parseCommonList(doc)
     }
 
     override suspend fun load(url: String): LoadResponse {
         println("$TAG [Load] Details URL: $url")
-        val doc = app.get(url).document
+        val doc = app.get(url, headers = commonHeaders).document
 
         val title = doc.selectFirst(".entry-title")?.text()?.trim() ?: "Unknown"
-        val poster = doc.selectFirst(".thumb img")?.attr("src")?.let { fixUrl(it) }
+        
+        // 상세 페이지 포스터 파싱
+        val poster = doc.selectFirst(".thumb img")?.let { img ->
+            img.attr("src").ifEmpty { img.attr("data-src") }
+        }?.let { fixUrl(it) }
+
         val description = doc.selectFirst(".synp .entry-content")?.text()?.trim()
         val tags = doc.select(".genxed a, .taged a").map { it.text() }
         
