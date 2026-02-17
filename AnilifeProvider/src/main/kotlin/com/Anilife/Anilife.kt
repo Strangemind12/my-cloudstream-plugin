@@ -9,9 +9,13 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 
 /**
- * Anilife Provider v1.0
- * - 메인, 검색, 상세, 에피소드 로드 구현
- * - Base64 _aldata 디코딩 방식 적용
+ * Anilife Provider v1.1
+ * - v1.0: 초기 구현
+ * - v1.1: 빌드 에러 수정
+ * - SearchResponse addEpisode 타입 불일치 수정
+ * - String Template 변수명 모호성 수정 (${num}화)
+ * - Deprecated Episode 생성자를 newEpisode로 변경
+ * - addEpisodes DubStatus 타입 불일치 수정
  */
 class Anilife : MainAPI() {
     override var mainUrl = "https://anilife.live"
@@ -34,14 +38,12 @@ class Anilife : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // TOP 20 페이지는 페이징이 없을 수 있으나, 일반 리스트는 페이지 번호가 필요할 수 있음
-        // 예: /vodtype/categorize/TV/1 -> page 인자를 받아서 처리
         // 제공된 URL 패턴이 /vodtype/categorize/TV/1 형식이므로 page 변수를 경로에 적용
         val url = if (request.name.contains("TOP 20")) {
             "$mainUrl${request.data}"
         } else {
             // /vodtype/categorize/TV/1 에서 마지막 숫자를 페이지로 교체
-            // 원본 data가 "/vodtype/categorize/TV/1" 이라고 가정
+            // 원본 data가 "/vodtype/categorize/TV/1" 이라고 가정할 때, 마지막 / 뒤의 숫자를 page로 변경
             val basePath = request.data.substringBeforeLast("/")
             "$mainUrl$basePath/$page"
         }
@@ -63,12 +65,15 @@ class Anilife : MainAPI() {
                 val poster = element.selectFirst("img")?.attr("src") ?: ""
                 val epText = element.selectFirst(".bt .epx")?.text() ?: ""
 
-                // 디버깅 로그
-                // println("$TAG [List] Found: $title ($href)")
+                // [v1.1 수정] String인 epText를 Int로 변환하여 addEpisode에 전달
+                val episodeNum = epText.filter { it.isDigit() }.toIntOrNull()
 
                 newAnimeSearchResponse(title, href, TvType.Anime) {
                     this.posterUrl = poster
-                    addSub(epText)
+                    // 에피소드 번호가 있으면 추가
+                    if (episodeNum != null) {
+                        addEpisode(episodeNum)
+                    }
                 }
             } catch (e: Exception) {
                 println("$TAG [List] Error parsing item: ${e.message}")
@@ -102,9 +107,16 @@ class Anilife : MainAPI() {
             val href = fixUrl(element.attr("href"))
             val num = element.selectFirst(".epl-num")?.text()?.trim() ?: ""
             val epTitle = element.selectFirst(".epl-title")?.text()?.trim() ?: ""
-            val fullName = if(num.isNotEmpty()) "$num화 - $epTitle" else epTitle
+            
+            // [v1.1 수정] "$num화" -> "${num}화" (변수명 모호성 해결)
+            val fullName = if(num.isNotEmpty()) "${num}화 - $epTitle" else epTitle
+            val episodeInt = num.toIntOrNull()
 
-            Episode(href, fullName)
+            // [v1.1 수정] Episode(...) 생성자 대신 newEpisode 사용
+            newEpisode(href) {
+                this.name = fullName
+                this.episode = episodeInt
+            }
         }.reversed() // 최신화가 위에 있는 경우 역순 정렬 (필요시)
 
         println("$TAG [Load] Found ${episodes.size} episodes for $title")
@@ -113,7 +125,9 @@ class Anilife : MainAPI() {
             this.posterUrl = poster
             this.plot = description
             this.tags = tags
-            addEpisodes(TvType.Anime, episodes)
+            // [v1.1 수정] TvType.Anime -> DubStatus.Subbed
+            // Anilife는 기본적으로 자막이 많으므로 Subbed로 설정 (필요시 로직 추가 가능)
+            addEpisodes(DubStatus.Subbed, episodes)
         }
     }
 
