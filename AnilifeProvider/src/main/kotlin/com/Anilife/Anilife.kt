@@ -10,10 +10,10 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 
 /**
- * Anilife Provider v12.0
- * - [Debug] 모든 주요 프로세스에 상세 println 로그 추가 (사용자 요청)
- * - [Fix] 영상 링크 추출: MainAPI 내에서 HTML 파싱 -> WebViewResolver 실행 (가장 확실한 방법)
- * - [Fix] 에피소드 정렬: v11.0 방식 유지 (단순 파싱, 렉 없음)
+ * Anilife Provider v13.0
+ * - [Fix] 정규식 대폭 완화: 도메인 유무 관계없이 '/h/live?p=' 패턴 검색
+ * - [Debug] 실패 시 HTML 원본 로그 출력 (원인 분석용)
+ * - [Fix] 에피소드 정렬: v11.0 방식(단순 파싱) 유지
  */
 class Anilife : MainAPI() {
     override var mainUrl = "https://anilife.live"
@@ -52,7 +52,7 @@ class Anilife : MainAPI() {
         return try {
             val doc = app.get(url, headers = commonHeaders).document
             val home = parseCommonList(doc)
-            println("$TAG [MainPage] Success. Found ${home.size} items.")
+            println("$TAG [MainPage] Found ${home.size} items.")
             newHomePageResponse(request.name, home)
         } catch (e: Exception) {
             println("$TAG [MainPage] Error: ${e.message}")
@@ -86,7 +86,6 @@ class Anilife : MainAPI() {
                     this.posterHeaders = commonHeaders
                 }
             } catch (e: Exception) { 
-                println("$TAG [List] Parse Error: ${e.message}")
                 null 
             }
         }
@@ -94,7 +93,7 @@ class Anilife : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/search?keyword=$query"
-        println("$TAG [Search] Query: $query -> $url")
+        println("$TAG [Search] Query: $url")
         val doc = app.get(url, headers = commonHeaders).document
         return parseCommonList(doc)
     }
@@ -126,7 +125,7 @@ class Anilife : MainAPI() {
         val description = doc.selectFirst(".synp .entry-content")?.text()?.trim()
         val tags = doc.select(".genxed a, .taged a").map { it.text() }
 
-        // v11.0 방식: 단순 파싱 (렉 없음)
+        // v11.0 방식 유지 (렉 없음)
         val episodes = doc.select(".eplister > ul > li > a").mapNotNull { element ->
             val href = fixUrl(element.attr("href"))
             val numText = element.selectFirst(".epl-num")?.text()?.trim() ?: ""
@@ -139,8 +138,6 @@ class Anilife : MainAPI() {
                 this.episode = epNum
             }
         }.reversed()
-
-        println("$TAG [Load] Loaded ${episodes.size} episodes")
 
         return newAnimeLoadResponse(title, cleanUrl, TvType.Anime) {
             this.posterUrl = htmlPoster
@@ -167,13 +164,23 @@ class Anilife : MainAPI() {
             val response = app.get(cleanData, headers = commonHeaders)
             val html = response.text
             
-            // 3. 실제 플레이어 주소 파싱 (HTML 전체 검색)
-            // 패턴: https://anilife.live/h/live?p=...&player=...
-            val regex = Regex("""https://anilife\.live/h/live\?p=[^"']+(?:&player=[^"']+)*""")
+            println("$TAG [LoadLinks] HTML Fetched (Length: ${html.length})")
+
+            // 3. 실제 플레이어 주소 파싱 (정규식 대폭 완화)
+            // 도메인이 있든 없든, 따옴표 안에 /h/live?p=... 패턴이 있으면 잡습니다.
+            // 예: "https://anilife.live/h/live?p=..." 또는 "/h/live?p=..."
+            val regex = Regex("""["']([^"']*\/?h\/live\?p=[^"']+)["']""")
             val match = regex.find(html)
-            val playerUrl = match?.value
+            var playerUrl = match?.groupValues?.get(1)
 
             if (playerUrl != null) {
+                // 상대 경로일 경우 도메인 추가
+                if (!playerUrl.startsWith("http")) {
+                    playerUrl = if (playerUrl.startsWith("/")) "$mainUrl$playerUrl" else "$mainUrl/$playerUrl"
+                }
+                // 이스케이프 문자 제거 (혹시 자바스크립트 내부에 \/ 로 되어있을 경우)
+                playerUrl = playerUrl.replace("\\/", "/")
+
                 println("$TAG [LoadLinks] Found Player URL: $playerUrl")
                 println("$TAG [LoadLinks] Starting WebViewResolver...")
 
@@ -210,8 +217,8 @@ class Anilife : MainAPI() {
                 }
             } else {
                 println("$TAG [LoadLinks] Failed to find player URL in HTML.")
-                // 디버깅용: HTML 일부 출력 (너무 길면 자름)
-                // println("$TAG [Debug] HTML Snippet: ${html.take(500)}")
+                // [중요] 디버깅을 위해 HTML 앞부분 1000자를 출력합니다. 로그캣 확인 필수.
+                println("$TAG [Debug] HTML Dump (Start): ${html.take(1000)}")
             }
         } catch (e: Exception) {
             println("$TAG [LoadLinks] Critical Error: ${e.message}")
