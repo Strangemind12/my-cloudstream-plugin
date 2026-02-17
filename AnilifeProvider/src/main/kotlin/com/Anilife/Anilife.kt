@@ -4,16 +4,16 @@ import android.util.Base64
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.network.WebViewResolver // [필수] 웹뷰 리졸버 사용
+import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 
 /**
- * Anilife Provider v6.1
- * - [Performance] 에피소드 처리 루프 내의 디버그 로그 전면 제거 (오버로드 방지)
- * - [Fix] 에피소드 소수점 정렬: Float 변환 -> 오름차순 정렬 -> ID 재할당 (1145.5 위치 보정)
- * - [Fix] 영상 링크: WebViewResolver를 사용하여 리다이렉트 및 m3u8 자동 추출
+ * Anilife Provider v7.0
+ * - [Fix] 링크 추출 로직 변경: Provider 페이지 HTML에서 'https://anilife.live/h/live...' URL을 직접 파싱 후 WebView 실행
+ * - [Fix] 에피소드 정렬 최적화: Float 정렬 + 로그 제거 (렉 방지 및 1145.5화 정렬 지원)
+ * - [Fix] 빌드 에러 방지 (posterHeaders 제거)
  */
 class Anilife : MainAPI() {
     override var mainUrl = "https://anilife.live"
@@ -58,7 +58,6 @@ class Anilife : MainAPI() {
     }
 
     private fun parseCommonList(doc: Document): List<SearchResponse> {
-        // 목록 파싱은 개수가 적으므로 로그를 남겨도 되지만, 성능을 위해 최소화
         return doc.select(".listupd > article.bs").mapNotNull { element ->
             try {
                 val aTag = element.selectFirst("div.bsx > a") ?: return@mapNotNull null
@@ -92,7 +91,6 @@ class Anilife : MainAPI() {
         return parseCommonList(doc)
     }
 
-    // 정렬을 위한 임시 데이터 클래스 (가볍게 유지)
     data class TempEpisode(
         val url: String,
         val fullName: String,
@@ -110,7 +108,7 @@ class Anilife : MainAPI() {
             } catch (e: Exception) { url }
         } else { url }
 
-        println("$TAG [Load] URL: $cleanUrl") // 중요 로그 하나만 남김
+        println("$TAG [Load] URL: $cleanUrl")
         val doc = app.get(cleanUrl, headers = commonHeaders).document
         val title = doc.selectFirst(".entry-title")?.text()?.trim() ?: "Unknown"
 
@@ -125,29 +123,24 @@ class Anilife : MainAPI() {
         val description = doc.selectFirst(".synp .entry-content")?.text()?.trim()
         val tags = doc.select(".genxed a, .taged a").map { it.text() }
 
-        // [v6.1 최적화] 대량의 에피소드 파싱 시 로그 절대 금지
+        // [v7.0] 렉 방지를 위해 로그 제거 후 Float 정렬 수행
         val rawEpisodes = doc.select(".eplister > ul > li > a").mapNotNull { element ->
             val href = fixUrl(element.attr("href"))
             val numText = element.selectFirst(".epl-num")?.text()?.trim() ?: ""
             val epTitle = element.selectFirst(".epl-title")?.text()?.trim() ?: ""
             val fullName = if (numText.isNotEmpty()) "${numText}화 - $epTitle" else epTitle
-            // 정렬 키 추출 (실패 시 0 처리)
             val floatNum = numText.toFloatOrNull() ?: 0f
-            
             TempEpisode(href, fullName, floatNum)
         }
 
-        // 1. 메모리 상에서 빠르게 정렬 (오름차순: 1화 -> 1145화 -> 1145.5화 -> 1146화)
-        // 코틀린의 sort는 매우 빠르므로 1000개 정도는 순식간에 처리됨 (로그만 안 찍으면 됨)
         val sortedEpisodes = rawEpisodes.sortedBy { it.floatNum }
 
-        // 2. 정수 ID 순차 부여 (앱이 ID 순서대로 정렬하도록 유도)
         val finalEpisodes = sortedEpisodes.mapIndexed { index, temp ->
             newEpisode(temp.url) {
                 this.name = temp.fullName
                 this.episode = index + 1
             }
-        }.reversed() // 최신화가 상단에 오도록 반전
+        }.reversed()
 
         println("$TAG [Load] Loaded ${finalEpisodes.size} episodes.")
 
@@ -166,44 +159,58 @@ class Anilife : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // 포스터 파라미터 제거
+        // 1. URL 정리 (포스터 파라미터 제거)
         val cleanData = if (data.contains("poster=")) data.substringBefore("?poster=") else data
         println("$TAG [LoadLinks] Start: $cleanData")
 
         try {
-            // [v6.1 수정] WebViewResolver를 메인으로 사용
-            // 자동으로 리다이렉트(js)를 수행하고 .m3u8 요청을 감지합니다.
-            // Anilife 구조: Provider URL -> (JS Redirect) -> Player URL -> .m3u8
-            val webViewInterceptor = WebViewResolver(
-                Regex("""\.m3u8"""), // .m3u8 요청을 감지
-                userAgent = commonHeaders["User-Agent"],
-                referer = "https://anilife.live/"
-            )
-            
-            // WebViewResolver를 interceptor로 사용하여 요청
-            val response = app.get(cleanData, headers = commonHeaders, interceptor = webViewInterceptor)
-            val interceptedUrl = response.url
-            
-            println("$TAG [WebView] Sniffed URL: $interceptedUrl")
+            // 2. Provider 페이지 로드 (HTML 텍스트 가져오기)
+            val response = app.get(cleanData, headers = commonHeaders)
+            val html = response.text
 
-            if (interceptedUrl.contains(".m3u8")) {
-                 callback.invoke(
-                    newExtractorLink(
-                        source = name,
-                        name = name,
-                        url = interceptedUrl,
-                        type = ExtractorLinkType.M3U8
-                    ) {
-                        this.referer = "https://anilife.live/"
-                        this.quality = getQualityFromName("HD")
-                    }
+            // 3. 실제 플레이어 주소 파싱
+            // 자바스크립트 내의 "https://anilife.live/h/live?p=...&player=..." 패턴 추출
+            // 예: location.href = "https://anilife.live/h/live?p=...&player=jawcloud";
+            val regex = Regex("""https://anilife\.live/h/live\?p=[^"']+(?:&player=[^"']+)*""")
+            val match = regex.find(html)
+            val playerUrl = match?.value
+
+            if (playerUrl != null) {
+                println("$TAG [LoadLinks] Found Player URL: $playerUrl")
+                
+                // 4. 추출한 플레이어 주소로 WebViewResolver 실행
+                // 이 주소로 접속해야 실제 비디오 리소스를 불러옵니다.
+                val webViewInterceptor = WebViewResolver(
+                    Regex("""\.m3u8"""),
+                    userAgent = commonHeaders["User-Agent"],
+                    referer = "https://anilife.live/"
                 )
-                return true
+                
+                val webViewResponse = app.get(playerUrl, headers = commonHeaders, interceptor = webViewInterceptor)
+                val sniffedUrl = webViewResponse.url
+                
+                println("$TAG [WebView] Sniffed URL: $sniffedUrl")
+
+                if (sniffedUrl.contains(".m3u8")) {
+                     callback.invoke(
+                        newExtractorLink(
+                            source = name,
+                            name = name,
+                            url = sniffedUrl,
+                            type = ExtractorLinkType.M3U8
+                        ) {
+                            this.referer = "https://anilife.live/"
+                            this.quality = getQualityFromName("HD")
+                        }
+                    )
+                    return true
+                }
             } else {
-                println("$TAG [WebView] Failed to sniff m3u8. URL: $interceptedUrl")
+                println("$TAG [LoadLinks] Failed to find player URL in HTML.")
             }
         } catch (e: Exception) {
-            println("$TAG [WebView] Error: ${e.message}")
+            println("$TAG [LoadLinks] Error: ${e.message}")
+            e.printStackTrace()
         }
 
         return false
