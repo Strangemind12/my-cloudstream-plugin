@@ -7,10 +7,10 @@ import com.lagradost.cloudstream3.network.WebViewResolver
 import org.jsoup.nodes.Document
 
 /**
- * Anilife Provider v26.0
- * - [Critical Fix] 상세 페이지 접속 시 서버가 리다이렉트 시키는 '최종 URL'을 포착하여 Referer로 사용하도록 수정
- * - [Fix] 사용자가 제보한 신규 URL 패턴(g/l?id=...)에 완벽 대응하여 봇 차단 우회
- * - [Fix] HTTP 요청 제거 및 완전 웹뷰 통합 (v25.0 로직 계승)
+ * Anilife Provider v27.0
+ * - [Critical Fix] 3단계 M3U8 스니핑 정규식 수정 (\.m3u8 -> m3u8)
+ * -> 로그에서 발견된 'api.gcdn.app/m3u8/...' 패턴을 인식하지 못해 타임아웃되던 문제 해결
+ * - [Fix] 리다이렉트 주소 캡처 및 완전 웹뷰 통합 로직 유지 (v26.0 계승)
  */
 class Anilife : MainAPI() {
     override var mainUrl = "https://anilife.live"
@@ -21,7 +21,7 @@ class Anilife : MainAPI() {
 
     private val TAG = "[Anilife]"
 
-    // 모바일 User-Agent (WebView와 동일하게 설정)
+    // 모바일 User-Agent
     private val mobileUserAgent = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
     private val commonHeaders = mapOf(
@@ -102,26 +102,22 @@ class Anilife : MainAPI() {
 
         println("$TAG [Load] 접속 시도: $cleanUrl")
         
-        // [v26.0 핵심] 접속 후 리다이렉트된 최종 URL(response.url)을 가져옵니다.
+        // 리다이렉트된 최종 URL 획득
         val response = app.get(cleanUrl, headers = commonHeaders)
         val doc = response.document
-        val finalUrl = response.url // 예: .../g/l?id=...
+        val finalUrl = response.url
         
         println("$TAG [Load] 최종 리다이렉트 URL: $finalUrl")
 
         val title = doc.selectFirst(".entry-title")?.text()?.trim() ?: "Unknown"
-        
-        // 최종 URL을 암호화하여 Referer로 사용 (서버가 기대하는 진짜 주소)
         val encodedRef = Base64.encodeToString(finalUrl.toByteArray(), Base64.NO_WRAP)
 
-        // v4.1 로직 (단순 파싱)
         val episodes = doc.select(".eplister > ul > li > a").mapNotNull { element ->
             val rawHref = fixUrl(element.attr("href"))
             val numText = element.selectFirst(".epl-num")?.text()?.trim() ?: ""
             val epTitle = element.selectFirst(".epl-title")?.text()?.trim() ?: ""
             val fullName = if (numText.isNotEmpty()) "${numText}화 - $epTitle" else epTitle
             
-            // ref 파라미터 추가
             val finalHref = if (rawHref.contains("?")) "$rawHref&ref=$encodedRef" else "$rawHref?ref=$encodedRef"
 
             newEpisode(finalHref) {
@@ -145,7 +141,7 @@ class Anilife : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("$TAG [LoadLinks] === 프로세스 시작 (v26.0) ===")
+        println("$TAG [LoadLinks] === 프로세스 시작 (v27.0) ===")
         
         var cleanData = data.substringBefore("?poster=")
         var detailReferer = "$mainUrl/"
@@ -182,7 +178,7 @@ class Anilife : MainAPI() {
             println("$TAG [1단계] WebView 완료. 현재 URL: $currentUrl")
             
             if (currentUrl == mainUrl || currentUrl == "$mainUrl/" || html.contains("메인 홈페이지")) {
-                println("$TAG [실패] 메인 페이지로 리다이렉트 되었습니다. 봇 차단을 뚫지 못했습니다.")
+                println("$TAG [실패] 메인 페이지로 리다이렉트 되었습니다.")
                 return false
             }
 
@@ -197,19 +193,20 @@ class Anilife : MainAPI() {
 
                 // [3단계] WebView로 플레이어 페이지 접속 -> M3U8 낚아채기
                 try {
-                    val m3u8Interceptor = WebViewResolver(Regex("""\.m3u8"""))
+                    // [중요] 정규식을 "m3u8"로 변경하여 점(.) 없는 URL도 낚아채도록 수정
+                    val m3u8Interceptor = WebViewResolver(Regex("""m3u8"""))
                     val m3u8Response = app.get(
                         playerUrl,
                         headers = mapOf(
                             "User-Agent" to mobileUserAgent,
-                            "Referer" to currentUrl // Provider 페이지를 Referer로 사용
+                            "Referer" to currentUrl
                         ),
                         interceptor = m3u8Interceptor
                     )
                     val finalM3u8 = m3u8Response.url
                     println("$TAG [3단계] 결과 URL: $finalM3u8")
 
-                    if (finalM3u8.contains(".m3u8")) {
+                    if (finalM3u8.contains("m3u8")) {
                         callback.invoke(
                             newExtractorLink(
                                 source = name,
@@ -224,7 +221,7 @@ class Anilife : MainAPI() {
                         println("$TAG [완료] 링크 반환 성공.")
                         return true
                     } else {
-                        println("$TAG [3단계] 실패: 스니핑된 주소가 m3u8이 아닙니다.")
+                        println("$TAG [3단계] 실패: 스니핑된 주소에 m3u8이 없습니다.")
                     }
                 } catch (e: Exception) {
                     println("$TAG [3단계] WebView 에러: ${e.message}")
