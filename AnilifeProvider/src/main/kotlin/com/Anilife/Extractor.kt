@@ -4,10 +4,8 @@ import android.util.Base64
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
-import java.net.URLDecoder
 
 class AnilifeExtractor {
     private val TAG = "[AnilifeExtractor]"
@@ -24,70 +22,82 @@ class AnilifeExtractor {
     ): Boolean {
         try {
             var currentUrl = url
+            println("$TAG [Extract] Step 1: Visiting $currentUrl")
+            
             var doc = app.get(currentUrl).document
 
-            // 1. 플레이어 선택 페이지인지 확인 (예: "원피스 1155화 플레이어 선택페이지.txt")
-            // moveCloudvideo() 또는 moveJawcloud() 같은 함수가 있는지 확인
-            // 혹은 location.href = "..." 패턴 검색
+            // 1. 플레이어 선택 페이지 처리 (자바스크립트 리다이렉트 감지)
+            // 소스 파일: "원피스 1155화 플레이어 선택페이지.txt"
+            // 패턴: function moveCloudvideo(){ location.href = "..." }
             val scriptContent = doc.select("script").joinToString("\n") { it.data() }
             
-            // 플레이어 선택 로직이 있다면 리다이렉트 URL 추출
-            val redirectMatch = Regex("""location\.href\s*=\s*["']([^"']+)["']""").find(scriptContent)
+            // "location.href"를 포함하는 URL 찾기 (https://anilife.live/h/live...)
+            val redirectMatch = Regex("""location\.href\s*=\s*["'](https:\/\/anilife\.live\/h\/live[^"']+)["']""").find(scriptContent)
+            
             if (redirectMatch != null) {
                 val nextUrl = redirectMatch.groupValues[1]
-                println("$TAG [Redirect] Found redirect URL: $nextUrl")
-                if (nextUrl.contains("http")) {
-                    currentUrl = nextUrl
-                    doc = app.get(currentUrl).document
-                }
+                println("$TAG [Extract] Found Redirect URL: $nextUrl")
+                
+                // 리다이렉트 URL로 이동
+                currentUrl = nextUrl
+                doc = app.get(currentUrl).document
+            } else {
+                println("$TAG [Extract] No redirect found. Assuming current page is player page.")
             }
 
-            // 2. 최종 재생 페이지에서 _aldata 추출 (예: "원피스 1155화 플레이어 재생페이지.txt")
-            // var _aldata = 'ey...'
+            // 2. 최종 재생 페이지에서 _aldata 추출
+            // 소스 파일: "원피스 1155화 플레이어 재생페이지.txt"
+            // 패턴: var _aldata = 'ey...'
             val aldataMatch = Regex("""var\s+_aldata\s*=\s*['"]([^"']+)['"]""").find(doc.html())
             
             if (aldataMatch != null) {
                 val base64Data = aldataMatch.groupValues[1]
-                println("$TAG [Extract] Found _aldata length: ${base64Data.length}")
+                println("$TAG [Extract] Found _aldata (Length: ${base64Data.length})")
 
-                // Base64 Decode
-                val decodedBytes = Base64.decode(base64Data, Base64.DEFAULT)
-                val jsonString = String(decodedBytes)
-                
-                println("$TAG [Extract] Decoded JSON: $jsonString")
+                try {
+                    // Base64 Decode
+                    val decodedBytes = Base64.decode(base64Data, Base64.DEFAULT)
+                    val jsonString = String(decodedBytes)
+                    println("$TAG [Extract] Decoded JSON: $jsonString")
 
-                // JSON Parsing
-                val data = parseJson<AlData>(jsonString)
-                
-                // M3U8 URL 추출 (우선순위: 1080 -> 720 -> 480)
-                // JSON 안의 URL은 슬래시가 이스케이프 되어 있을 수 있음 (jackson이 처리해주지만 혹시 몰라 replace)
-                var m3u8Url = data.vidUrl1080 ?: data.vidUrl720 ?: data.vidUrl480
-                
-                if (m3u8Url != null && m3u8Url != "none") {
-                    m3u8Url = m3u8Url.replace("\\/", "/")
-                    if (!m3u8Url.startsWith("http")) {
-                        m3u8Url = "https://$m3u8Url"
+                    // JSON Parsing
+                    val data = parseJson<AlData>(jsonString)
+                    
+                    // URL 선택 (1080 -> 720 -> 480)
+                    var m3u8Url = data.vidUrl1080 ?: data.vidUrl720 ?: data.vidUrl480
+                    
+                    if (m3u8Url != null && m3u8Url != "none") {
+                        // 슬래시 이스케이프 제거 (api.gcdn.app\/m3u8 -> api.gcdn.app/m3u8)
+                        m3u8Url = m3u8Url.replace("\\/", "/")
+                        
+                        if (!m3u8Url.startsWith("http")) {
+                            m3u8Url = "https://$m3u8Url"
+                        }
+                        
+                        println("$TAG [Extract] Final M3U8 URL: $m3u8Url")
+
+                        // M3U8 Helper로 트랙 생성
+                        M3u8Helper.generateM3u8(
+                            "Anilife",
+                            m3u8Url,
+                            "https://anilife.live/" // Referer 헤더 중요
+                        ).forEach(callback)
+                        
+                        return true
+                    } else {
+                        println("$TAG [Error] No valid video URL found in JSON.")
                     }
-                    
-                    println("$TAG [Extract] Found M3U8: $m3u8Url")
-
-                    // M3U8 Helper를 사용하여 퀄리티별 링크 생성
-                    M3u8Helper.generateM3u8(
-                        "Anilife",
-                        m3u8Url,
-                        "https://anilife.live/" // Referer
-                    ).forEach(callback)
-                    
-                    return true
-                } else {
-                    println("$TAG [Error] No valid video URL in JSON")
+                } catch (e: Exception) {
+                    println("$TAG [Error] Failed to decode/parse _aldata: ${e.message}")
                 }
             } else {
-                println("$TAG [Error] _aldata not found in page")
+                println("$TAG [Error] '_aldata' variable not found in page HTML.")
+                // 디버깅용: HTML 일부 출력
+                // println("$TAG [Debug] HTML Dump: ${doc.html().take(500)}")
             }
 
         } catch (e: Exception) {
-            println("$TAG [Error] Exception: ${e.message}")
+            println("$TAG [Error] Critical Exception: ${e.message}")
             e.printStackTrace()
         }
         return false
