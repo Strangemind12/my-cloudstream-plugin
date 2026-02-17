@@ -9,10 +9,9 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 
 /**
- * Anilife Provider v3.0
- * - 포스터 터널링 구현 (목록 -> 상세 페이지로 포스터 URL 전달)
- * - 상세 페이지 포스터 파싱 로직 강화
- * - Base64 인코딩/디코딩 적용
+ * Anilife Provider v4.0
+ * - [Fix] 이미지 HTTP 403 에러 해결: posterHeaders 추가
+ * - [Fix] 포스터 터널링 및 파싱 로직 유지
  */
 class Anilife : MainAPI() {
     override var mainUrl = "https://anilife.live"
@@ -23,6 +22,7 @@ class Anilife : MainAPI() {
 
     private val TAG = "[Anilife]"
 
+    // 이미지/페이지 요청 공통 헤더
     private val commonHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Referer" to "$mainUrl/"
@@ -76,7 +76,6 @@ class Anilife : MainAPI() {
                 poster = poster?.let { fixUrl(it) } ?: ""
 
                 // 2. 포스터 터널링 (URL에 포스터 정보 숨기기)
-                // 상세 페이지에서 포스터를 못 불러올 경우를 대비해, 여기서 찾은 포스터 URL을 Base64로 인코딩해서 넘김
                 val finalHref = if (poster.isNotEmpty()) {
                     try {
                         val encodedPoster = Base64.encodeToString(poster.toByteArray(), Base64.NO_WRAP)
@@ -91,6 +90,8 @@ class Anilife : MainAPI() {
 
                 newAnimeSearchResponse(title, finalHref, TvType.Anime) {
                     this.posterUrl = poster
+                    // [핵심] 포스터 로딩 시 403 에러 방지 헤더 설정
+                    this.posterHeaders = commonHeaders
                 }
             } catch (e: Exception) {
                 println("$TAG [ListItem] Parse Error: ${e.message}")
@@ -116,16 +117,10 @@ class Anilife : MainAPI() {
         val cleanUrl = if (url.contains("poster=")) {
             try {
                 val posterParam = url.substringAfter("poster=")
-                // 파라미터가 더 있다면(&) 제거
                 val encodedPoster = if (posterParam.contains("&")) posterParam.substringBefore("&") else posterParam
-                
                 tunnelingPoster = String(Base64.decode(encodedPoster, Base64.NO_WRAP))
-                println("$TAG [Load] Found tunneling poster: $tunnelingPoster")
-                
-                // 실제 요청할 URL은 파라미터 제거
                 url.substringBefore("?poster=")
             } catch (e: Exception) {
-                println("$TAG [Load] Tunneling decode failed: ${e.message}")
                 url
             }
         } else {
@@ -137,15 +132,13 @@ class Anilife : MainAPI() {
 
         val title = doc.selectFirst(".entry-title")?.text()?.trim() ?: "Unknown"
         
-        // 2. HTML에서 포스터 파싱 시도 (제공된 소스 기준 .thumb img)
+        // 2. HTML에서 포스터 파싱 시도
         var htmlPoster = doc.selectFirst(".thumb img")?.let { img ->
             img.attr("src").ifEmpty { img.attr("data-src") }
         }?.let { fixUrl(it) }
 
         // 3. 포스터 유효성 검사 및 터널링 데이터 사용
-        // HTML 포스터가 없거나, 메인 URL과 같거나(잘못된 로드), 아이콘/로고 등인 경우
         if (htmlPoster.isNullOrEmpty() || htmlPoster == mainUrl || htmlPoster == "$mainUrl/") {
-            println("$TAG [Load] HTML poster invalid ($htmlPoster). Using tunneling poster.")
             if (!tunnelingPoster.isNullOrEmpty()) {
                 htmlPoster = tunnelingPoster
             }
@@ -154,7 +147,6 @@ class Anilife : MainAPI() {
         val description = doc.selectFirst(".synp .entry-content")?.text()?.trim()
         val tags = doc.select(".genxed a, .taged a").map { it.text() }
         
-        // 에피소드 파싱
         val episodes = doc.select(".eplister > ul > li > a").mapNotNull { element ->
             val href = fixUrl(element.attr("href"))
             val num = element.selectFirst(".epl-num")?.text()?.trim() ?: ""
@@ -166,11 +158,14 @@ class Anilife : MainAPI() {
             newEpisode(href) {
                 this.name = fullName
                 this.episode = episodeInt
+                // [핵심] 에피소드 썸네일에도 헤더 적용 (필요 시)
+                this.posterHeaders = commonHeaders
             }
         }.reversed()
 
         return newAnimeLoadResponse(title, cleanUrl, TvType.Anime) {
             this.posterUrl = htmlPoster
+            this.posterHeaders = commonHeaders // [핵심] 상세 페이지 포스터 헤더
             this.plot = description
             this.tags = tags
             addEpisodes(DubStatus.Subbed, episodes)
@@ -183,9 +178,7 @@ class Anilife : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // loadLinks로 넘어오는 data에도 ?poster=... 가 붙어있을 수 있으므로 제거
         val cleanData = if (data.contains("poster=")) data.substringBefore("?poster=") else data
-        
         println("$TAG [LoadLinks] Start: $cleanData")
         val extractor = AnilifeExtractor()
         return extractor.extract(cleanData, callback)
