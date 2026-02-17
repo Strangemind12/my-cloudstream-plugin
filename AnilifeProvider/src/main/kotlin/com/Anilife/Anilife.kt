@@ -1,229 +1,282 @@
 package com.anilife
 
-import android.util.Base64
-import android.webkit.CookieManager
-import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.network.WebViewResolver
-import org.jsoup.nodes.Document
+import com.lagradost.cloudstream3.SubtitleFile
+import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.utils.ExtractorApi
+import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import kotlinx.coroutines.runBlocking
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import java.net.ServerSocket
+import java.net.Socket
+import java.net.URI
+import java.net.URLDecoder
+import java.util.Collections
+import javax.crypto.Cipher
+import javax.crypto.spec.IvParameterSpec
+import javax.crypto.spec.SecretKeySpec
+import kotlin.concurrent.thread
 
 /**
- * Anilife Provider v69.0
- * - [Critical Fix] 키 수집 0개 해결: M3U8에서 추출한 키 주소를 Extractor에 전달하여 'JS 강제 다운로드' 수행
- * - [Logic] 감시(Passive)가 아닌 명령(Active) 방식으로 변경하여 플레이어 동작 여부와 무관하게 키 확보
- * - [Maintain] v4.1 메타데이터 로직 완전 유지
+ * Anilife Proxy Extractor v71.0
+ * - [Fix] "키 수집 0개" 및 "성공 로그 부재" 해결을 위한 Kotlin 직접 다운로드 로직 정밀 구현
+ * - [Critical] 32바이트 키 데이터 수신 시 16바이트 슬라이딩 윈도우 방식으로 키 후보군 생성
+ * - [Debug] 키 다운로드 실패 시 HTTP 상태 코드 및 에러 내용을 상세히 로깅
  */
-class Anilife : MainAPI() {
-    override var mainUrl = "https://anilife.live"
-    override var name = "Anilife"
-    override val hasMainPage = true
-    override var lang = "ko"
-    override val supportedTypes = setOf(TvType.Anime)
+class AnilifeProxyExtractor : ExtractorApi() {
+    override val name = "AnilifeProxy"
+    override val mainUrl = "https://api.gcdn.app"
+    override val requiresReferer = false
 
-    private val TAG = "[Anilife]"
-    private val pcUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
+    private val DESKTOP_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
 
-    private val commonHeaders = mapOf(
-        "User-Agent" to pcUserAgent,
-        "Referer" to "$mainUrl/"
-    )
-
-    private fun logFullContent(tag: String, prefix: String, msg: String) {
-        val maxLogSize = 4000
-        if (msg.length > maxLogSize) {
-            println("$tag $prefix [Part] ${msg.substring(0, maxLogSize)}")
-            logFullContent(tag, prefix, msg.substring(maxLogSize))
-        } else {
-            println("$tag $prefix [End] $msg")
-        }
+    companion object {
+        @Volatile private var currentProxyServer: ProxyWebServer? = null
     }
 
-    override val mainPage = mainPageOf(
-        "/top20" to "실시간 TOP 20",
-        "/vodtype/categorize/TV/1" to "TV 애니메이션",
-        "/vodtype/categorize/OVA/1" to "OVA",
-        "/vodtype/categorize/ONA/1" to "ONA",
-        "/vodtype/categorize/Web/1" to "Web",
-        "/vodtype/categorize/SP/1" to "SP",
-        "/vodtype/categorize/Movie/1" to "극장판"
-    )
+    override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) { }
 
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (request.name.contains("TOP 20")) "$mainUrl${request.data}" 
-                  else "$mainUrl${request.data.substringBeforeLast("/")}/$page"
-        
-        println("$TAG [MainPage] 요청: $url")
-        return try {
-            val doc = app.get(url, headers = commonHeaders).document
-            val home = parseCommonList(doc)
-            println("$TAG [MainPage] 파싱 완료: ${home.size}개")
-            newHomePageResponse(request.name, home)
-        } catch (e: Exception) {
-            println("$TAG [MainPage] 에러: ${e.message}")
-            newHomePageResponse(request.name, emptyList())
-        }
-    }
-
-    private fun parseCommonList(doc: Document): List<SearchResponse> {
-        return doc.select(".listupd > article.bs").mapNotNull { element ->
-            try {
-                val aTag = element.selectFirst("div.bsx > a") ?: return@mapNotNull null
-                val rawHref = fixUrl(aTag.attr("href"))
-                val title = (element.selectFirst(".tt h2") ?: element.selectFirst(".tt"))?.text()?.trim() ?: "Unknown"
-                val imgTag = element.selectFirst("img")
-                var poster = imgTag?.attr("src") ?: imgTag?.attr("data-src") ?: ""
-                poster = fixUrl(poster)
-                val finalHref = if (poster.isNotEmpty()) {
-                    val encoded = Base64.encodeToString(poster.toByteArray(), Base64.NO_WRAP)
-                    if (rawHref.contains("?")) "$rawHref&poster=$encoded" else "$rawHref?poster=$encoded"
-                } else rawHref
-                newAnimeSearchResponse(title, finalHref, TvType.Anime) {
-                    this.posterUrl = poster
-                    this.posterHeaders = commonHeaders
+    // 플레이어 URL 파싱 (기존 유지)
+    fun extractPlayerUrl(html: String, domain: String): String? {
+        val patterns = listOf(
+            Regex("""location\.href\s*=\s*["']([^"']+)["']"""),
+            Regex("""["']([^"']*h\/live\?p=[^"']+)["']""")
+        )
+        for (regex in patterns) {
+            regex.find(html)?.let {
+                var url = it.groupValues[1]
+                if (url.contains("h/live") && url.contains("p=")) {
+                    if (!url.startsWith("http")) url = if (url.startsWith("/")) "$domain$url" else "$domain/$url"
+                    return url.replace("\\/", "/")
                 }
-            } catch (e: Exception) { null }
-        }
-    }
-
-    override suspend fun search(query: String): List<SearchResponse> {
-        val url = "$mainUrl/search?keyword=$query"
-        return parseCommonList(app.get(url, headers = commonHeaders).document)
-    }
-
-    override suspend fun load(url: String): LoadResponse {
-        var tunnelingPoster: String? = null
-        val cleanUrl = if (url.contains("poster=")) {
-            val posterParam = url.substringAfter("poster=")
-            tunnelingPoster = String(Base64.decode(posterParam.substringBefore("&"), Base64.NO_WRAP))
-            url.substringBefore("?poster=")
-        } else url
-
-        val response = app.get(cleanUrl, headers = commonHeaders)
-        val doc = response.document
-        val finalUrl = response.url
-        val encodedRef = Base64.encodeToString(finalUrl.toByteArray(), Base64.NO_WRAP)
-
-        val title = doc.selectFirst(".entry-title")?.text()?.trim() ?: "Unknown"
-        val plot = doc.selectFirst(".synp .entry-content")?.text()?.trim()
-        val tags = doc.select(".genxed a").map { it.text() }
-
-        val episodes = doc.select(".eplister > ul > li > a").mapNotNull { element ->
-            val rawHref = fixUrl(element.attr("href"))
-            val numText = element.selectFirst(".epl-num")?.text()?.trim() ?: ""
-            val epTitle = element.selectFirst(".epl-title")?.text()?.trim() ?: ""
-            val fullName = if (numText.isNotEmpty()) "${numText}화 - $epTitle" else epTitle
-            val finalHref = if (rawHref.contains("?")) "$rawHref&ref=$encodedRef" else "$rawHref?ref=$encodedRef"
-            newEpisode(finalHref) {
-                this.name = fullName
-                this.episode = numText.toIntOrNull()
             }
-        }.reversed()
-
-        return newAnimeLoadResponse(title, cleanUrl, TvType.Anime) {
-            this.posterUrl = doc.selectFirst(".thumb img")?.attr("src") ?: tunnelingPoster
-            this.posterHeaders = commonHeaders
-            this.plot = plot
-            this.tags = tags
-            addEpisodes(DubStatus.Subbed, episodes)
         }
+        return null
     }
 
-    override suspend fun loadLinks(
-        data: String,
-        isCasting: Boolean,
-        subtitleCallback: (SubtitleFile) -> Unit,
+    suspend fun extractWithProxy(
+        m3u8Url: String,
+        playerUrl: String, // 직접 다운로드 방식에선 미사용
+        referer: String,
+        ssid: String?,
+        cookies: String,
+        directKeyUrl: String?,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("$TAG [LoadLinks] =================== v69.0 시작 ===================")
-        
-        var cleanData = data.substringBefore("?poster=")
-        var detailReferer = "$mainUrl/"
-        if (cleanData.contains("ref=")) {
-            try {
-                val refEncoded = cleanData.substringAfter("ref=").substringBefore("&")
-                detailReferer = String(Base64.decode(refEncoded, Base64.NO_WRAP))
-                cleanData = cleanData.substringBefore("?ref=").substringBefore("&ref=")
-            } catch (e: Exception) { }
+        // 기존 프록시 정리
+        synchronized(this) { currentProxyServer?.stop(); currentProxyServer = null }
+
+        println("[Anilife][Proxy] 1. 프록시 서버 초기화")
+        val sessionKeys = Collections.synchronizedSet(mutableSetOf<String>())
+
+        val proxy = ProxyWebServer(sessionKeys).apply { 
+            start()
+            val headers = mutableMapOf(
+                "User-Agent" to DESKTOP_UA,
+                "Origin" to "https://anilife.live",
+                "Cookie" to cookies,
+                "Accept" to "*/*"
+            )
+            if (!ssid.isNullOrBlank()) {
+                headers["x-user-ssid"] = ssid
+                headers["X-User-Ssid"] = ssid
+            }
+            updateSession(headers)
         }
+        currentProxyServer = proxy
 
         try {
-            // [1단계] 플레이어 페이지 로드
-            val webResponse = app.get(
-                cleanData, 
-                headers = mapOf("Referer" to detailReferer, "User-Agent" to pcUserAgent), 
-                interceptor = WebViewResolver(Regex(".*"))
-            )
+            println("[Anilife][Proxy] 2. M3U8 요청 및 키 파싱")
+            // M3U8 요청 시 성공했던 헤더를 그대로 사용
+            val res = app.get(m3u8Url, headers = proxy.getCurrentHeaders())
+            val content = res.text
+            val baseUri = URI(m3u8Url)
+            val sb = StringBuilder()
+            
+            // 키 주소 결정 (인자로 받은 것 우선, 없으면 파싱)
+            var keyUrlToDownload = directKeyUrl
+            
+            content.lines().forEach { line ->
+                val trimmed = line.trim()
+                if (trimmed.isEmpty()) return@forEach
+                
+                when {
+                    trimmed.startsWith("#EXT-X-KEY") -> {
+                        val match = Regex("""URI="([^"]+)"""").find(trimmed)
+                        if (match != null) {
+                            var uri = match.groupValues[1]
+                            if (!uri.startsWith("http")) uri = baseUri.resolve(uri).toString()
+                            
+                            if (keyUrlToDownload == null) keyUrlToDownload = uri
 
-            // [2단계] 플레이어 주소 추출
-            val playerUrl = AnilifeProxyExtractor().extractPlayerUrl(webResponse.text, mainUrl) ?: return false
-            println("$TAG [Step 2] 플레이어 주소: $playerUrl")
+                            // 프록시 주소로 변환
+                            val encKey = java.net.URLEncoder.encode(uri, "UTF-8")
+                            sb.append(trimmed.replace(match.groupValues[1], "http://127.0.0.1:${proxy.port}/key?url=$encKey")).append("\n")
+                        } else sb.append(trimmed).append("\n")
+                    }
+                    !trimmed.startsWith("#") -> {
+                        val absSeg = baseUri.resolve(trimmed).toString()
+                        proxy.setTestSegment(absSeg)
+                        val encSeg = java.net.URLEncoder.encode(absSeg, "UTF-8")
+                        sb.append("http://127.0.0.1:${proxy.port}/seg?url=$encSeg").append("\n")
+                    }
+                    else -> sb.append(trimmed).append("\n")
+                }
+            }
 
-            // [3단계] M3U8 API 스니핑
-            val gcdnInterceptor = WebViewResolver(Regex(""".*api\.gcdn\.app.*"""))
-            val gcdnResponse = app.get(
-                playerUrl,
-                headers = mapOf("User-Agent" to pcUserAgent, "Referer" to webResponse.url),
-                interceptor = gcdnInterceptor
-            )
-            val sniffedUrl = gcdnResponse.url
-            println("$TAG [Step 3] 가로챈 URL: $sniffedUrl")
-
-            // [4단계] 쿠키 및 정보 추출
-            val finalCookies = CookieManager.getInstance().getCookie("https://anilife.live") ?: ""
-            var xUserSsid: String? = null
-            var finalM3u8: String? = null
-            // [v69.0] 키 주소를 여기서 파싱
-            var targetKeyUrl: String? = null
-
-            if (sniffedUrl.contains("/m3u8/st/")) {
-                val apiResponse = app.get(
-                    sniffedUrl,
-                    headers = mapOf("User-Agent" to pcUserAgent, "Referer" to "https://anilife.live/", "Cookie" to finalCookies)
-                )
-                xUserSsid = apiResponse.headers["x-user-ssid"] ?: apiResponse.headers["X-User-Ssid"]
-                val match = Regex("""https://api\.gcdn\.app/v1/manifest/[^"']+""").find(apiResponse.text)
-                if (match != null) {
-                    finalM3u8 = match.value.replace("\\/", "/")
+            // [v71.0 핵심] Kotlin 직접 다운로드 시도
+            if (keyUrlToDownload != null) {
+                println("[Anilife][Direct] 키 다운로드 시작: $keyUrlToDownload")
+                try {
+                    // 헤더 준비 (Referer 제거 필수)
+                    val keyHeaders = proxy.getCurrentHeaders().toMutableMap()
+                    keyHeaders.remove("Referer") 
                     
-                    // [v69.0 핵심] M3U8 내용을 미리 읽어 키 주소 추출
-                    try {
-                        val m3u8Content = app.get(finalM3u8!!, headers = mapOf("User-Agent" to pcUserAgent, "Referer" to "https://anilife.live/")).text
-                        val keyMatch = Regex("""URI="([^"]+)"""").find(m3u8Content)
-                        if (keyMatch != null) {
-                            var kUrl = keyMatch.groupValues[1]
-                            // 상대 주소 처리
-                            if (!kUrl.startsWith("http")) {
-                                // 간단한 상대 주소 처리 (필요시 URI resolve 사용)
-                                kUrl = if (kUrl.startsWith("/")) "https://api.gcdn.app$kUrl" 
-                                       else finalM3u8!!.substringBeforeLast("/") + "/" + kUrl
+                    val keyRes = app.get(keyUrlToDownload!!, headers = keyHeaders)
+                    
+                    if (keyRes.code == 200) {
+                        val keyBytes = keyRes.body.bytes()
+                        val size = keyBytes.size
+                        println("[Anilife][Direct] 응답 수신 성공. 크기: $size bytes")
+
+                        if (size == 16) {
+                            // 16바이트면 바로 등록
+                            val hex = keyBytes.joinToString("") { "%02x".format(it) }
+                            sessionKeys.add(hex)
+                            println("[Anilife][Direct] 16바이트 키 등록: $hex")
+                        } else if (size == 32) {
+                            // 32바이트면 슬라이딩 윈도우로 17개 후보군 등록
+                            println("[Anilife][Direct] 32바이트 키 감지 -> 슬라이딩 윈도우 적용")
+                            for (i in 0..16) {
+                                val part = keyBytes.copyOfRange(i, i + 16)
+                                val hex = part.joinToString("") { "%02x".format(it) }
+                                sessionKeys.add(hex)
                             }
-                            targetKeyUrl = kUrl
-                            println("$TAG [Step 4] 타겟 키 주소 확보: $targetKeyUrl")
+                            println("[Anilife][Direct] 17개 후보 키 등록 완료.")
+                        } else {
+                            println("[Anilife][Direct] 경고: 예상치 못한 키 크기 ($size)")
                         }
-                    } catch (e: Exception) { println("$TAG [Step 4] 키 주소 파싱 실패: ${e.message}") }
+                    } else {
+                        println("[Anilife][Direct] 실패: HTTP ${keyRes.code}")
+                    }
+                } catch (e: Exception) {
+                    println("[Anilife][Direct] 예외 발생: ${e.message}")
                 }
             } else {
-                finalM3u8 = sniffedUrl
+                println("[Anilife][Direct] 키 URL을 찾지 못했습니다.")
             }
-
-            // [5단계] JS 강제 다운로드 엔진 가동
-            if (finalM3u8 != null) {
-                println("$TAG [Step 5] 키 강제 다운로드 엔진 시작")
-                return AnilifeProxyExtractor().extractWithProxy(
-                    m3u8Url = finalM3u8!!,
-                    playerUrl = playerUrl,
-                    referer = "https://anilife.live/",
-                    ssid = xUserSsid,
-                    cookies = finalCookies,
-                    directKeyUrl = targetKeyUrl, // 키 주소 전달
-                    callback = callback
-                )
-            }
+            
+            proxy.setPlaylist(sb.toString())
+            val finalProxyUrl = "http://127.0.0.1:${proxy.port}/playlist.m3u8"
+            
+            println("[Anilife][Proxy] 3. 프록시 링크 반환: $finalProxyUrl")
+            callback(newExtractorLink(name, name, finalProxyUrl, ExtractorLinkType.M3U8) {
+                this.referer = ""
+                this.headers = proxy.getCurrentHeaders()
+            })
+            return true
 
         } catch (e: Exception) {
-            println("$TAG [Error] ${e.message}")
-            e.printStackTrace()
+            println("[Anilife][Proxy] Error: ${e.message}")
+            return false
         }
-        return false
     }
+
+    class ProxyWebServer(private val sessionKeys: MutableSet<String>) {
+        var port: Int = 0
+        private var server: ServerSocket? = null
+        private var isRunning = false
+        @Volatile private var headers: Map<String, String> = emptyMap()
+        @Volatile private var playlist: String = ""
+        @Volatile private var verifiedKey: ByteArray? = null
+        @Volatile private var testSegment: String? = null
+
+        fun start() {
+            server = ServerSocket(0).also { port = it.localPort }
+            isRunning = true
+            thread { while (isRunning) { try { handle(server!!.accept()) } catch (e: Exception) {} } }
+        }
+
+        fun stop() { isRunning = false; server?.close() }
+        fun updateSession(h: Map<String, String>) { headers = h }
+        fun setPlaylist(p: String) { playlist = p }
+        fun setTestSegment(u: String) { if (testSegment == null) testSegment = u }
+        fun getCurrentHeaders() = headers
+
+        private fun handle(socket: Socket) {
+            val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
+            val line = reader.readLine() ?: return
+            val path = line.split(" ")[1]
+            val out = socket.getOutputStream()
+
+            when {
+                path.contains("playlist.m3u8") -> {
+                    out.write("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\n\r\n".toByteArray())
+                    out.write(playlist.toByteArray())
+                }
+                path.contains("/key") -> {
+                    // 키가 있으면 반환, 없으면 검증 시도
+                    if (verifiedKey == null) verifiedKey = verify()
+                    
+                    if (verifiedKey != null) {
+                        out.write("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nAccess-Control-Allow-Origin: *\r\n\r\n".toByteArray())
+                        out.write(verifiedKey!!)
+                    } else {
+                        // 키가 없으면 404
+                        out.write("HTTP/1.1 404 Not Found\r\n\r\n".toByteArray())
+                    }
+                }
+                path.contains("/seg") -> {
+                    val url = URLDecoder.decode(path.substringAfter("url="), "UTF-8")
+                    runBlocking {
+                        try {
+                            val res = app.get(url, headers = headers)
+                            out.write("HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\n\r\n".toByteArray())
+                            out.write(res.body.bytes())
+                        } catch (e: Exception) { }
+                    }
+                }
+            }
+            out.flush(); socket.close()
+        }
+
+        private fun verify(): ByteArray? = runBlocking {
+            val url = testSegment ?: return@runBlocking null
+            println("[Anilife][Verify] 키 검증 진입 (후보: ${sessionKeys.size}개)")
+            
+            if (sessionKeys.isEmpty()) {
+                println("[Anilife][Verify] 실패: 후보 키가 없습니다.")
+                return@runBlocking null
+            }
+
+            try {
+                val data = app.get(url, headers = headers).body.bytes()
+                val chunk = data.take(1024).toByteArray()
+
+                sessionKeys.forEach { hex ->
+                    try {
+                        val key = hex.hexToByteArray()
+                        // 16바이트 키만 테스트 (AES-128)
+                        if (key.size == 16) {
+                            val cipher = Cipher.getInstance("AES/CBC/NoPadding")
+                            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(ByteArray(16)))
+                            val dec = cipher.doFinal(chunk)
+                            if (dec.size > 188 && dec[0] == 0x47.toByte() && dec[188] == 0x47.toByte()) {
+                                println("[Anilife][Verify] 정답 키 확정: $hex")
+                                return@runBlocking key
+                            }
+                        }
+                    } catch (e: Exception) {}
+                }
+            } catch (e: Exception) { println("[Anilife][Verify] 검증 중 에러: ${e.message}") }
+            null
+        }
+    }
+}
+
+fun String.hexToByteArray(): ByteArray {
+    val data = ByteArray(length / 2)
+    for (i in 0 until length step 2) data[i / 2] = ((Character.digit(this[i], 16) shl 4) + Character.digit(this[i + 1], 16)).toByte()
+    return data
 }
