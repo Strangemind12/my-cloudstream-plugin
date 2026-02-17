@@ -1,11 +1,20 @@
 package com.anilife
 
+import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import android.webkit.ConsoleMessage
+import android.webkit.WebChromeClient
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.AcraApplication
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.suspendCancellableCoroutine
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.ServerSocket
@@ -17,12 +26,13 @@ import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import kotlin.concurrent.thread
+import kotlin.coroutines.resume
 
 /**
- * Anilife Proxy Extractor v71.0
- * - [Fix] "키 수집 0개" 및 "성공 로그 부재" 해결을 위한 Kotlin 직접 다운로드 로직 정밀 구현
- * - [Critical] 32바이트 키 데이터 수신 시 16바이트 슬라이딩 윈도우 방식으로 키 후보군 생성
- * - [Debug] 키 다운로드 실패 시 HTTP 상태 코드 및 에러 내용을 상세히 로깅
+ * Anilife Proxy Extractor v73.0
+ * - [Critical Fix] JS Fetch 실패 원인(CORS Credential) 수정: credentials: 'include' 옵션 추가
+ * - [Logic] M3U8에서 추출한 키 URL을 웹뷰 내 JS가 '인증 정보를 포함하여' 강제로 다운로드
+ * - [Fix] 32바이트 키 대응 및 Sliding Window 검증
  */
 class AnilifeProxyExtractor : ExtractorApi() {
     override val name = "AnilifeProxy"
@@ -37,7 +47,6 @@ class AnilifeProxyExtractor : ExtractorApi() {
 
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) { }
 
-    // 플레이어 URL 파싱 (기존 유지)
     fun extractPlayerUrl(html: String, domain: String): String? {
         val patterns = listOf(
             Regex("""location\.href\s*=\s*["']([^"']+)["']"""),
@@ -57,18 +66,26 @@ class AnilifeProxyExtractor : ExtractorApi() {
 
     suspend fun extractWithProxy(
         m3u8Url: String,
-        playerUrl: String, // 직접 다운로드 방식에선 미사용
+        playerUrl: String,
         referer: String,
         ssid: String?,
         cookies: String,
         directKeyUrl: String?,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // 기존 프록시 정리
         synchronized(this) { currentProxyServer?.stop(); currentProxyServer = null }
 
         println("[Anilife][Proxy] 1. 프록시 서버 초기화")
         val sessionKeys = Collections.synchronizedSet(mutableSetOf<String>())
+
+        // [v73.0] JS 강제 다운로드 (Credential 포함) 시도
+        if (directKeyUrl != null) {
+            println("[Anilife][Proxy] 2. JS 강제 다운로드 시작 (Target: $directKeyUrl)...")
+            runWebViewCredentialFetch(playerUrl, referer, directKeyUrl, sessionKeys)
+        } else {
+            println("[Anilife][Proxy] 2. 키 URL 없음. Passive Hook만 작동.")
+            runWebViewCredentialFetch(playerUrl, referer, null, sessionKeys)
+        }
 
         val proxy = ProxyWebServer(sessionKeys).apply { 
             start()
@@ -87,15 +104,10 @@ class AnilifeProxyExtractor : ExtractorApi() {
         currentProxyServer = proxy
 
         try {
-            println("[Anilife][Proxy] 2. M3U8 요청 및 키 파싱")
-            // M3U8 요청 시 성공했던 헤더를 그대로 사용
             val res = app.get(m3u8Url, headers = proxy.getCurrentHeaders())
             val content = res.text
             val baseUri = URI(m3u8Url)
             val sb = StringBuilder()
-            
-            // 키 주소 결정 (인자로 받은 것 우선, 없으면 파싱)
-            var keyUrlToDownload = directKeyUrl
             
             content.lines().forEach { line ->
                 val trimmed = line.trim()
@@ -105,13 +117,8 @@ class AnilifeProxyExtractor : ExtractorApi() {
                     trimmed.startsWith("#EXT-X-KEY") -> {
                         val match = Regex("""URI="([^"]+)"""").find(trimmed)
                         if (match != null) {
-                            var uri = match.groupValues[1]
-                            if (!uri.startsWith("http")) uri = baseUri.resolve(uri).toString()
-                            
-                            if (keyUrlToDownload == null) keyUrlToDownload = uri
-
-                            // 프록시 주소로 변환
-                            val encKey = java.net.URLEncoder.encode(uri, "UTF-8")
+                            val absKey = baseUri.resolve(match.groupValues[1]).toString()
+                            val encKey = java.net.URLEncoder.encode(absKey, "UTF-8")
                             sb.append(trimmed.replace(match.groupValues[1], "http://127.0.0.1:${proxy.port}/key?url=$encKey")).append("\n")
                         } else sb.append(trimmed).append("\n")
                     }
@@ -123,48 +130,6 @@ class AnilifeProxyExtractor : ExtractorApi() {
                     }
                     else -> sb.append(trimmed).append("\n")
                 }
-            }
-
-            // [v71.0 핵심] Kotlin 직접 다운로드 시도
-            if (keyUrlToDownload != null) {
-                println("[Anilife][Direct] 키 다운로드 시작: $keyUrlToDownload")
-                try {
-                    // 헤더 준비 (Referer 제거 필수)
-                    val keyHeaders = proxy.getCurrentHeaders().toMutableMap()
-                    keyHeaders.remove("Referer") 
-                    
-                    val keyRes = app.get(keyUrlToDownload!!, headers = keyHeaders)
-                    
-                    if (keyRes.code == 200) {
-                        val keyBytes = keyRes.body.bytes()
-                        val size = keyBytes.size
-                        println("[Anilife][Direct] 응답 수신 성공. 크기: $size bytes")
-
-                        if (size == 16) {
-                            // 16바이트면 바로 등록
-                            val hex = keyBytes.joinToString("") { "%02x".format(it) }
-                            sessionKeys.add(hex)
-                            println("[Anilife][Direct] 16바이트 키 등록: $hex")
-                        } else if (size == 32) {
-                            // 32바이트면 슬라이딩 윈도우로 17개 후보군 등록
-                            println("[Anilife][Direct] 32바이트 키 감지 -> 슬라이딩 윈도우 적용")
-                            for (i in 0..16) {
-                                val part = keyBytes.copyOfRange(i, i + 16)
-                                val hex = part.joinToString("") { "%02x".format(it) }
-                                sessionKeys.add(hex)
-                            }
-                            println("[Anilife][Direct] 17개 후보 키 등록 완료.")
-                        } else {
-                            println("[Anilife][Direct] 경고: 예상치 못한 키 크기 ($size)")
-                        }
-                    } else {
-                        println("[Anilife][Direct] 실패: HTTP ${keyRes.code}")
-                    }
-                } catch (e: Exception) {
-                    println("[Anilife][Direct] 예외 발생: ${e.message}")
-                }
-            } else {
-                println("[Anilife][Direct] 키 URL을 찾지 못했습니다.")
             }
             
             proxy.setPlaylist(sb.toString())
@@ -180,6 +145,103 @@ class AnilifeProxyExtractor : ExtractorApi() {
         } catch (e: Exception) {
             println("[Anilife][Proxy] Error: ${e.message}")
             return false
+        }
+    }
+
+    // [v73.0 핵심] 쿠키(Credentials)를 포함한 JS Fetch 실행
+    private suspend fun runWebViewCredentialFetch(
+        pageUrl: String, 
+        referer: String, 
+        targetKeyUrl: String?, 
+        sessionKeys: MutableSet<String>
+    ) = suspendCancellableCoroutine<Unit> { cont ->
+        val handler = Handler(Looper.getMainLooper())
+        
+        // JS 스크립트
+        val script = StringBuilder()
+        
+        // 1. Passive Hook (기존 유지)
+        script.append("""
+            (function() {
+                if (window.crypto && window.crypto.subtle) {
+                    const oI = window.crypto.subtle.importKey;
+                    window.crypto.subtle.importKey = function(f, k, ...) {
+                        if (f === 'raw' && (k.byteLength === 16 || k.byteLength === 32 || k.length === 16 || k.length === 32)) {
+                            let hex = Array.from(new Uint8Array(k)).map(b => b.toString(16).padStart(2, '0')).join('');
+                            console.log("CapturedKeyHex:" + hex);
+                        }
+                        return oI.apply(this, arguments);
+                    };
+                }
+            })();
+        """.trimIndent())
+
+        // 2. Active Fetch (credentials: include 필수!)
+        if (targetKeyUrl != null) {
+            script.append("""
+                ; (async function() {
+                    console.log("[JS] Fetching Key with Credentials: $targetKeyUrl");
+                    try {
+                        const response = await fetch("$targetKeyUrl", { 
+                            referrerPolicy: "no-referrer",
+                            credentials: "include" 
+                        });
+                        if (!response.ok) {
+                            console.log("[JS] Fetch Failed. Status: " + response.status);
+                            return;
+                        }
+                        const buffer = await response.arrayBuffer();
+                        const bytes = new Uint8Array(buffer);
+                        const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+                        console.log("CapturedKeyHex:" + hex);
+                    } catch(e) {
+                        console.log("[JS] Fetch Error: " + e.message);
+                    }
+                })();
+            """.trimIndent())
+        }
+
+        handler.post {
+            try {
+                val context: Context = (AcraApplication.context ?: app) as Context
+                val webView = WebView(context)
+                
+                webView.settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    userAgentString = DESKTOP_UA
+                    mediaPlaybackRequiresUserGesture = false
+                }
+
+                webView.webChromeClient = object : WebChromeClient() {
+                    override fun onConsoleMessage(cm: ConsoleMessage?): Boolean {
+                        val msg = cm?.message() ?: ""
+                        if (msg.contains("CapturedKeyHex:")) {
+                            val key = msg.substringAfter("CapturedKeyHex:").trim()
+                            if (sessionKeys.add(key)) println("[Anilife][Hook] JS 키 확보 성공: $key")
+                        } else if (msg.contains("[JS]")) {
+                            println("[Anilife][JS] $msg")
+                        }
+                        return true
+                    }
+                }
+
+                webView.webViewClient = object : WebViewClient() {
+                    override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                        super.onPageStarted(view, url, favicon)
+                        view?.evaluateJavascript(script.toString(), null)
+                    }
+
+                    override fun onPageFinished(view: WebView?, url: String?) {
+                        super.onPageFinished(view, url)
+                        view?.evaluateJavascript(script.toString(), null)
+                        // 10초 대기
+                        handler.postDelayed({ if (cont.isActive) { webView.destroy(); cont.resume(Unit) } }, 10000)
+                    }
+                }
+                
+                webView.loadUrl(pageUrl, mapOf("Referer" to referer))
+            } catch (e: Exception) { if (cont.isActive) cont.resume(Unit) }
         }
     }
 
@@ -216,14 +278,12 @@ class AnilifeProxyExtractor : ExtractorApi() {
                     out.write(playlist.toByteArray())
                 }
                 path.contains("/key") -> {
-                    // 키가 있으면 반환, 없으면 검증 시도
                     if (verifiedKey == null) verifiedKey = verify()
                     
                     if (verifiedKey != null) {
                         out.write("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nAccess-Control-Allow-Origin: *\r\n\r\n".toByteArray())
                         out.write(verifiedKey!!)
                     } else {
-                        // 키가 없으면 404
                         out.write("HTTP/1.1 404 Not Found\r\n\r\n".toByteArray())
                     }
                 }
@@ -243,10 +303,10 @@ class AnilifeProxyExtractor : ExtractorApi() {
 
         private fun verify(): ByteArray? = runBlocking {
             val url = testSegment ?: return@runBlocking null
-            println("[Anilife][Verify] 키 검증 진입 (후보: ${sessionKeys.size}개)")
+            println("[Anilife][Verify] 키 검증 시도 (후보: ${sessionKeys.size}개)")
             
             if (sessionKeys.isEmpty()) {
-                println("[Anilife][Verify] 실패: 후보 키가 없습니다.")
+                println("[Anilife][Verify] 실패: 후보 키 없음.")
                 return@runBlocking null
             }
 
@@ -255,21 +315,27 @@ class AnilifeProxyExtractor : ExtractorApi() {
                 val chunk = data.take(1024).toByteArray()
 
                 sessionKeys.forEach { hex ->
-                    try {
-                        val key = hex.hexToByteArray()
-                        // 16바이트 키만 테스트 (AES-128)
-                        if (key.size == 16) {
+                    val rawKey = hex.hexToByteArray()
+                    val candidates = mutableListOf<ByteArray>()
+                    
+                    if (rawKey.size == 16) candidates.add(rawKey)
+                    else if (rawKey.size == 32) {
+                        for (i in 0..16) candidates.add(rawKey.copyOfRange(i, i + 16))
+                    }
+
+                    for (key in candidates) {
+                        try {
                             val cipher = Cipher.getInstance("AES/CBC/NoPadding")
                             cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(ByteArray(16)))
                             val dec = cipher.doFinal(chunk)
                             if (dec.size > 188 && dec[0] == 0x47.toByte() && dec[188] == 0x47.toByte()) {
-                                println("[Anilife][Verify] 정답 키 확정: $hex")
+                                println("[Anilife][Verify] 검증 성공: ${key.joinToString("") { "%02x".format(it) }}")
                                 return@runBlocking key
                             }
-                        }
-                    } catch (e: Exception) {}
+                        } catch (e: Exception) {}
+                    }
                 }
-            } catch (e: Exception) { println("[Anilife][Verify] 검증 중 에러: ${e.message}") }
+            } catch (e: Exception) { println("[Anilife][Verify] 실패: ${e.message}") }
             null
         }
     }
