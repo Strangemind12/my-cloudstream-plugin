@@ -3,13 +3,15 @@ package com.anilife
 import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.network.WebViewResolver
 import org.jsoup.nodes.Document
 
 /**
- * Anilife Provider v18.0
- * - [Fix] Anilife.kt / Extractor.kt 파일 분리
- * - [Fix] 에피소드 로직 v4.1 유지 (렉 없음)
- * - [Debug] 실행 단계별 상세 로그 포함
+ * Anilife Provider v19.0
+ * - [Fix] 빌드 에러 해결: WebViewResolver 사용을 Anilife.kt(MainAPI)로 통합하여 제한 우회
+ * - [Fix] 파일 분리: Anilife.kt / Extractor.kt
+ * - [Fix] 모든 과정 웹뷰화: Provider 로드부터 M3U8 스니핑까지 웹뷰로 진행 (봇 차단 해결)
+ * - [Debug] 모든 프로세스 상세 println 로그 추가
  */
 class Anilife : MainAPI() {
     override var mainUrl = "https://anilife.live"
@@ -90,10 +92,9 @@ class Anilife : MainAPI() {
         println("$TAG [Load] cleanUrl: $cleanUrl")
         val doc = app.get(cleanUrl, headers = commonHeaders).document
         val title = doc.selectFirst(".entry-title")?.text()?.trim() ?: "Unknown"
-
         val encodedRef = Base64.encodeToString(cleanUrl.toByteArray(), Base64.NO_WRAP)
 
-        // v4.1 로직 유지
+        // v4.1 로직 유지 (렉 없음)
         val episodes = doc.select(".eplister > ul > li > a").mapNotNull { element ->
             val rawHref = fixUrl(element.attr("href"))
             val numText = element.selectFirst(".epl-num")?.text()?.trim() ?: ""
@@ -123,8 +124,70 @@ class Anilife : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("$TAG [LoadLinks] Start. Data: $data")
-        val extractor = AnilifeExtractor()
-        return extractor.extract(data, callback)
+        println("$TAG [LoadLinks] 프로세스 시작")
+        
+        // 1. 파라미터 분석 (Referer 추출)
+        var cleanData = data.substringBefore("?poster=")
+        var detailReferer = "$mainUrl/"
+        if (cleanData.contains("ref=")) {
+            val refEncoded = cleanData.substringAfter("ref=").substringBefore("&")
+            detailReferer = String(Base64.decode(refEncoded, Base64.NO_WRAP))
+            cleanData = cleanData.substringBefore("?ref=").substringBefore("&ref=")
+        }
+        println("$TAG [LoadLinks] Target: $cleanData | Referer: $detailReferer")
+
+        try {
+            // [Step 1] 웹뷰로 Provider 페이지 로드하여 봇 차단 우회 및 HTML 획득
+            println("$TAG [Step 1] 웹뷰를 사용하여 Provider 페이지를 로드합니다 (봇 차단 해제)")
+            // Regex(".*")를 사용해 페이지가 로드되자마자 HTML을 가져옵니다.
+            val providerResponse = app.get(
+                cleanData,
+                headers = mapOf("Referer" to detailReferer),
+                interceptor = WebViewResolver(Regex(".*"))
+            )
+            val html = providerResponse.text
+            println("$TAG [Step 1] HTML 획득 성공 (길이: ${html.length})")
+
+            // [Step 2] 추출기(Extractor)를 사용하여 플레이어 주소 파싱
+            val playerUrl = AnilifeExtractor().extractPlayerUrl(html, mainUrl)
+            
+            if (playerUrl != null) {
+                println("$TAG [Step 2] 플레이어 주소 발견: $playerUrl")
+
+                // [Step 3] 웹뷰로 최종 M3U8 스니핑
+                println("$TAG [Step 3] 웹뷰를 사용하여 최종 M3U8을 스니핑합니다...")
+                val m3u8Interceptor = WebViewResolver(Regex("""\.m3u8"""))
+                val m3u8Response = app.get(
+                    playerUrl,
+                    headers = commonHeaders,
+                    interceptor = m3u8Interceptor
+                )
+                val finalM3u8 = m3u8Response.url
+                println("$TAG [Step 3] 스니핑 성공: $finalM3u8")
+
+                if (finalM3u8.contains(".m3u8")) {
+                    callback.invoke(
+                        newExtractorLink(
+                            source = name,
+                            name = name,
+                            url = finalM3u8,
+                            type = ExtractorLinkType.M3U8
+                        ) {
+                            this.referer = "https://anilife.live/"
+                            this.quality = getQualityFromName("HD")
+                        }
+                    )
+                    println("$TAG [LoadLinks] 모든 프로세스 완료 (성공)")
+                    return true
+                }
+            } else {
+                println("$TAG [Error] HTML에서 플레이어 주소를 추출하지 못했습니다.")
+            }
+        } catch (e: Exception) {
+            println("$TAG [Critical Error] ${e.message}")
+            e.printStackTrace()
+        }
+        println("$TAG [LoadLinks] 실패")
+        return false
     }
 }
