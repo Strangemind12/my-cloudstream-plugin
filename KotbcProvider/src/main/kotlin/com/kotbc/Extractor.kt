@@ -27,7 +27,7 @@ import kotlin.coroutines.resume
  * - Uses WebView to intercept M3U8 requests from nnmo0oi1.com / mov.glamov.com
  */
 class KotbcExtractor : ExtractorApi() {
-    override val name = "Kotbc"
+    override val name = "KOTBC"
     override val mainUrl = "https://mov.glamov.com"
     override val requiresReferer = true
     
