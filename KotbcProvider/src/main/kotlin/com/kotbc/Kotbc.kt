@@ -10,7 +10,7 @@ import org.jsoup.nodes.Element
  * - Logic: 영화/드라마 구분 없이 에피소드 리스트를 먼저 파싱한 후, 영화는 첫 번째 링크를 dataUrl로 사용.
  */
 class Kotbc : MainAPI() {
-    override var mainUrl = "https://m135.kotbc2.com"
+    override var mainUrl = "https://m136.kotbc2.com"
     override var name = "Kotbc"
     override val hasMainPage = true
     override var lang = "ko"
