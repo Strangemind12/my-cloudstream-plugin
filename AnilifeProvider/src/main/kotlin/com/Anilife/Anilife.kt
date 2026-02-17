@@ -7,11 +7,11 @@ import com.lagradost.cloudstream3.network.WebViewResolver
 import org.jsoup.nodes.Document
 
 /**
- * Anilife Provider v43.0
- * - [Log] 중간 API(st) 주소 감지 시, 요청 헤더 및 응답 본문 전체(Full Body) 상세 로깅 추가
- * - [Debug] 로그캣 글자수 제한 우회를 위해 분할 출력 로직 강화 (logFullContent)
- * - [Fix] 60초 타임아웃 방지를 위한 넓은 범위의 웹뷰 스니핑 정규식 유지
- * - [Fix] PC User-Agent 및 성공한 브라우저 헤더 동기화
+ * Anilife Provider v44.0
+ * - [Critical Fix] 중간 API(/m3u8/st/)의 JSON 응답에서 진짜 영상 주소(v1/manifest/)를 추출하는 로직 확정.
+ * - [Feature] JSON 내 이스케이프 문자(\/) 제거 및 정밀 정규식 파싱 적용.
+ * - [Log] API 응답 본문 및 추출된 최종 URL 상세 로깅.
+ * - [Fix] PC User-Agent 및 성공 헤더 설정 유지.
  */
 class Anilife : MainAPI() {
     override var mainUrl = "https://anilife.live"
@@ -22,10 +22,9 @@ class Anilife : MainAPI() {
 
     private val TAG = "[Anilife]"
 
-    // PC User-Agent (브라우저 성공 로그 기반)
+    // PC User-Agent (사용자 성공 로그 기반)
     private val pcUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
 
-    // 긴 메시지를 로그캣에서 잘리지 않게 전체 출력하는 함수
     private fun logFullContent(tag: String, prefix: String, msg: String) {
         val maxLogSize = 4000
         if (msg.length > maxLogSize) {
@@ -75,7 +74,7 @@ class Anilife : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("$TAG [LoadLinks] =================== v43.0 시작 ===================")
+        println("$TAG [LoadLinks] =================== v44.0 시작 ===================")
         
         var cleanData = data
         var detailReferer = "$mainUrl/"
@@ -85,8 +84,7 @@ class Anilife : MainAPI() {
             cleanData = data.substringBefore("&ref=").substringBefore("?ref=")
         }
         
-        println("$TAG [Step 1] 웹뷰 로딩 시작: $cleanData")
-        println("$TAG [Step 1] 헤더 설정 - UA: PC Chrome, Referer: $detailReferer")
+        println("$TAG [Step 1] 웹뷰 실행: Provider 페이지 접속...")
 
         try {
             // [1단계] Provider 페이지 로드
@@ -95,21 +93,18 @@ class Anilife : MainAPI() {
                 headers = mapOf("Referer" to detailReferer, "User-Agent" to pcUserAgent),
                 interceptor = WebViewResolver(Regex(".*"))
             )
-            println("$TAG [Step 1] 웹뷰 로드 완료. 최종 URL: ${webResponse.url}")
 
             // [2단계] 플레이어 URL 추출
             val playerUrl = AnilifeExtractor().extractPlayerUrl(webResponse.text, mainUrl)
             if (playerUrl == null) {
-                println("$TAG [Step 2] 실패: HTML에서 플레이어(h/live) 주소를 찾지 못함.")
-                logFullContent(TAG, "[HTML-Dump]", webResponse.text)
+                println("$TAG [Step 2] 실패: 플레이어 주소를 찾지 못함.")
                 return false
             }
-            println("$TAG [Step 2] 플레이어 주소 추출 성공: $playerUrl")
+            println("$TAG [Step 2] 추출 성공: $playerUrl")
 
             // [3단계] M3U8 API 스니핑
             println("$TAG [Step 3] 웹뷰 스니핑 시작 (Target: api.gcdn.app)...")
             
-            // 모든 gcdn 관련 요청을 잡아내어 타임아웃 방지
             val gcdnInterceptor = WebViewResolver(Regex(""".*api\.gcdn\.app.*"""))
             val gcdnResponse = app.get(
                 playerUrl,
@@ -121,45 +116,44 @@ class Anilife : MainAPI() {
 
             var finalM3u8: String? = null
 
-            // [Step 3-B] 중간 API(st) 주소 처리 및 상세 로깅
+            // [Step 3-B] 가로챈 URL이 중간 API(st)인 경우 처리
             if (sniffedUrl.contains("/m3u8/st/")) {
-                println("$TAG [Step 3-B] 중간 API(st) 주소가 확인되었습니다.")
-                println("$TAG [Step 3-B] [API-REQUEST-START] 직접 호출을 시작합니다...")
+                println("$TAG [Step 3-B] 중간 API 응답 본문에서 진짜 주소를 추출합니다.")
                 
-                val apiHeaders = mapOf(
-                    "User-Agent" to pcUserAgent,
-                    "Referer" to "https://anilife.live/",
-                    "Origin" to "https://anilife.live",
-                    "Accept" to "*/*"
+                val apiResponse = app.get(
+                    sniffedUrl,
+                    headers = mapOf(
+                        "User-Agent" to pcUserAgent,
+                        "Referer" to "https://anilife.live/",
+                        "Origin" to "https://anilife.live",
+                        "Accept" to "*/*"
+                    )
                 )
-                println("$TAG [Step 3-B] [API-REQUEST-HEADERS] $apiHeaders")
-
-                val apiResponse = app.get(sniffedUrl, headers = apiHeaders)
                 
-                println("$TAG [Step 3-B] [API-RESPONSE-STATUS] Code: ${apiResponse.code}")
-                println("$TAG [Step 3-B] [API-RESPONSE-BODY] 전체 응답 데이터를 출력합니다:")
+                println("$TAG [Step 3-B] API 응답 코드: ${apiResponse.code}")
+                println("$TAG [Step 3-B] API 응답 전문 출력:")
                 logFullContent(TAG, "[API-Body]", apiResponse.text)
 
-                // 응답 본문에서 manifest 주소 정밀 추출
-                println("$TAG [Step 3-B] 응답 본문에서 진짜 영상 주소(manifest) 검색 중...")
-                val manifestMatch = Regex("""https://api\.gcdn\.app/v1/manifest/[^"']+""").find(apiResponse.text)
-                if (manifestMatch != null) {
-                    finalM3u8 = manifestMatch.value.replace("\\/", "/")
-                    println("$TAG [Step 3-B] [SUCCESS] 진짜 주소 발견: $finalM3u8")
+                // [v44.0 핵심] 응답 본문(JSON)에서 진짜 주소 추출
+                // 정규식 설명: https://api.gcdn.app/v1/manifest/ 로 시작해서 따옴표(")가 나올 때까지 모든 문자 추출
+                val manifestRegex = Regex("""https://api\.gcdn\.app/v1/manifest/[^"']+""")
+                val match = manifestRegex.find(apiResponse.text)
+                
+                if (match != null) {
+                    // 이스케이프 제거 (\/ -> /)
+                    finalM3u8 = match.value.replace("\\/", "/")
+                    println("$TAG [Step 3-B] [SUCCESS] 진짜 주소 파싱 성공: $finalM3u8")
                 } else {
-                    println("$TAG [Step 3-B] [FAILED] 응답 본문 내에 manifest 주소 패턴이 존재하지 않습니다.")
+                    println("$TAG [Step 3-B] [FAILED] 응답 본문에서 manifest 패턴을 찾지 못했습니다.")
                 }
             } else if (sniffedUrl.contains("manifest") || sniffedUrl.contains(".m3u8")) {
                 finalM3u8 = sniffedUrl
-                println("$TAG [Step 3-C] 웹뷰가 이미 최종 주소를 찾았습니다: $finalM3u8")
+                println("$TAG [Step 3-C] 이미 최종 주소입니다: $finalM3u8")
             }
 
-            // [4단계] 최종 링크 전달
+            // [4단계] 최종 링크 반환
             if (finalM3u8 != null) {
-                println("$TAG [Step 4] 플레이어(ExoPlayer)에 링크 및 헤더를 전달합니다.")
-                println("$TAG [Step 4] 전달 URL: $finalM3u8")
-                println("$TAG [Step 4] 전달 Referer: https://anilife.live/")
-                
+                println("$TAG [Step 4] 최종 링크를 플레이어에 전달합니다: $finalM3u8")
                 callback.invoke(
                     newExtractorLink(
                         source = name,
@@ -175,16 +169,16 @@ class Anilife : MainAPI() {
                         this.quality = getQualityFromName("HD")
                     }
                 )
-                println("$TAG [LoadLinks] 모든 프로세스 완료.")
+                println("$TAG [완료] 프로세스 성공.")
                 return true
             }
 
         } catch (e: Exception) {
-            println("$TAG [Critical Error] 예외 발생: ${e.message}")
+            println("$TAG [Error] 예외 발생: ${e.message}")
             e.printStackTrace()
         }
         
-        println("$TAG [LoadLinks] 링크를 찾지 못하고 종료되었습니다.")
+        println("$TAG [LoadLinks] 실패.")
         return false
     }
 }
