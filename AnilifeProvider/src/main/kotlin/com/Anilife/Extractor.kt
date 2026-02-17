@@ -9,6 +9,7 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.webkit.CookieManager
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.AcraApplication
@@ -29,10 +30,10 @@ import kotlin.concurrent.thread
 import kotlin.coroutines.resume
 
 /**
- * Anilife Proxy Extractor v66.0
- * - [Feature] 'Active Fetch': onPageStarted 시점에 JS를 주입하여 M3U8과 Key를 강제로 fetch()
- * - [Fix] 32바이트 키에 대한 Sliding Window 전수 조사 유지
- * - [Fix] 웹뷰 미디어 제스처 요구 해제 (자동 재생/로딩 유도)
+ * Anilife Proxy Extractor v68.0
+ * - [Critical Fix] 캐싱된 키 데이터까지 확보하기 위해 'XHR/Fetch Wrapping' 방식 도입
+ * - [Logic] 브라우저의 기본 통신 함수(XMLHttpRequest, fetch)를 오버라이딩하여 데이터 수신 시점을 후킹
+ * - [Fix] 네트워크 탭에 안 찍히는(캐시된) 요청도 Application Layer에서 가로채기 가능
  */
 class AnilifeProxyExtractor : ExtractorApi() {
     override val name = "AnilifeProxy"
@@ -77,9 +78,9 @@ class AnilifeProxyExtractor : ExtractorApi() {
         println("[Anilife][Proxy] 1. 키 저장소 초기화")
         val sessionKeys = Collections.synchronizedSet(mutableSetOf<String>())
         
-        println("[Anilife][Proxy] 2. 하이브리드(Active+Passive) 후킹 시작...")
-        // [v66.0] m3u8Url 전달
-        runWebViewHybridHook(playerUrl, m3u8Url, referer, ssid, cookies, sessionKeys)
+        println("[Anilife][Proxy] 2. XHR/Fetch 래핑 후킹 시작 (캐시 무시)...")
+        // [v68.0] XHR Wrapping 방식 호출
+        runWebViewXHRHook(playerUrl, referer, sessionKeys)
 
         val proxy = ProxyWebServer(sessionKeys).apply { 
             start()
@@ -129,7 +130,7 @@ class AnilifeProxyExtractor : ExtractorApi() {
             proxy.setPlaylist(sb.toString())
             val finalProxyUrl = "http://127.0.0.1:${proxy.port}/playlist.m3u8"
             
-            println("[Anilife][Proxy] 4. 프록시 링크 반환: $finalProxyUrl")
+            println("[Anilife][Proxy] 3. 프록시 링크 반환: $finalProxyUrl")
             callback(newExtractorLink(name, name, finalProxyUrl, ExtractorLinkType.M3U8) {
                 this.referer = ""
                 this.headers = proxy.getCurrentHeaders()
@@ -142,65 +143,60 @@ class AnilifeProxyExtractor : ExtractorApi() {
         }
     }
 
-    private suspend fun runWebViewHybridHook(
-        url: String,
-        m3u8Url: String, 
+    // [v68.0 핵심] XHR/Fetch API 자체를 덮어쓰는 스크립트 주입
+    private suspend fun runWebViewXHRHook(
+        url: String, 
         referer: String, 
-        ssid: String?, 
-        cookies: String, 
         sessionKeys: MutableSet<String>
     ) = suspendCancellableCoroutine<Unit> { cont ->
         val handler = Handler(Looper.getMainLooper())
         
-        // [v66.0] Active Fetch Script: M3U8을 직접 다운로드하고 파싱하여 키를 가져옴
-        val hookScript = """
-            (async function() {
-                // 1. Passive Hook (기존 로직)
-                if (window.crypto && window.crypto.subtle) {
-                    const oI = window.crypto.subtle.importKey;
-                    window.crypto.subtle.importKey = function(f, k, ...) {
-                        if (f === 'raw' && (k.byteLength === 16 || k.byteLength === 32 || k.length === 16 || k.length === 32)) {
-                            let hex = Array.from(new Uint8Array(k)).map(b => b.toString(16).padStart(2, '0')).join('');
-                            console.log("CapturedKeyHex:" + hex);
+        val xhrScript = """
+            (function() {
+                // 중복 주입 방지
+                if (window.xhrHookInjected) return;
+                window.xhrHookInjected = true;
+                console.log("CapturedKeyHex: [INIT] XHR Hook Injected");
+
+                // 1. Fetch Hook
+                const originalFetch = window.fetch;
+                window.fetch = async function(...args) {
+                    const response = await originalFetch(...args);
+                    try {
+                        const url = response.url;
+                        if (url && (url.includes('enc.bin') || url.includes('/key'))) {
+                            const clone = response.clone();
+                            clone.arrayBuffer().then(buffer => {
+                                let bytes = new Uint8Array(buffer);
+                                let hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+                                console.log("CapturedKeyHex:" + hex);
+                            });
                         }
-                        return oI.apply(this, arguments);
-                    };
-                }
-                const oS = Uint8Array.prototype.set;
-                Uint8Array.prototype.set = function(src, off) {
-                    if (src && (src.length === 16 || src.length === 32)) {
-                        let hex = Array.from(src).map(b => b.toString(16).padStart(2, '0')).join('');
-                        console.log("CapturedKeyHex:" + hex);
-                    }
-                    return oS.apply(this, arguments);
+                    } catch(e) {}
+                    return response;
                 };
 
-                // 2. Active Fetch (강제 키 추출)
-                try {
-                    console.log("[JS] Fetching M3U8: $m3u8Url");
-                    // no-referrer 정책 준수
-                    const response = await fetch("$m3u8Url", { referrerPolicy: "no-referrer" });
-                    const text = await response.text();
-                    
-                    // 정규식으로 URI="..." 추출
-                    const match = text.match(/URI="([^"]+)"/);
-                    if (match && match[1]) {
-                        let keyUrl = match[1];
-                        // 상대 주소 처리
-                        if (!keyUrl.startsWith('http')) {
-                            keyUrl = new URL(keyUrl, "$m3u8Url").href;
+                // 2. XMLHttpRequest Hook
+                const originalOpen = XMLHttpRequest.prototype.open;
+                XMLHttpRequest.prototype.open = function(method, url) {
+                    this._url = url;
+                    return originalOpen.apply(this, arguments);
+                };
+                const originalSend = XMLHttpRequest.prototype.send;
+                XMLHttpRequest.prototype.send = function() {
+                    this.addEventListener('load', function() {
+                        if (this._url && (typeof this._url === 'string') && (this._url.includes('enc.bin') || this._url.includes('/key'))) {
+                            try {
+                                if (this.responseType === 'arraybuffer' && this.response) {
+                                    let bytes = new Uint8Array(this.response);
+                                    let hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+                                    console.log("CapturedKeyHex:" + hex);
+                                }
+                            } catch(e) {}
                         }
-                        console.log("[JS] Key URL Found: " + keyUrl);
-                        
-                        const keyResp = await fetch(keyUrl, { referrerPolicy: "no-referrer" });
-                        const keyBuf = await keyResp.arrayBuffer();
-                        const bytes = new Uint8Array(keyBuf);
-                        const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
-                        console.log("CapturedKeyHex:" + hex); // 결과 전송
-                    }
-                } catch(e) {
-                    console.log("[JS] Active fetch failed: " + e.message);
-                }
+                    });
+                    return originalSend.apply(this, arguments);
+                };
             })();
         """.trimIndent()
 
@@ -209,36 +205,40 @@ class AnilifeProxyExtractor : ExtractorApi() {
                 val context: Context = (AcraApplication.context ?: app) as Context
                 val webView = WebView(context)
                 
-                // [v66.0] 자동 재생 및 제스처 무시 설정
                 webView.settings.apply {
                     javaScriptEnabled = true
                     domStorageEnabled = true
                     userAgentString = DESKTOP_UA
-                    mediaPlaybackRequiresUserGesture = false // 중요!
+                    mediaPlaybackRequiresUserGesture = false // 자동 재생 허용
                 }
 
                 webView.webChromeClient = object : WebChromeClient() {
                     override fun onConsoleMessage(cm: ConsoleMessage?): Boolean {
                         val msg = cm?.message() ?: ""
                         if (msg.contains("CapturedKeyHex:")) {
-                            val key = msg.substringAfter("CapturedKeyHex:")
-                            if (sessionKeys.add(key)) println("[Anilife][Hook] 키 확보 성공: $key")
+                            val key = msg.substringAfter("CapturedKeyHex:").trim()
+                            if (!key.startsWith("[INIT]") && sessionKeys.add(key)) {
+                                println("[Anilife][Hook] 캐시 무시 키 확보: $key")
+                            } else if (key.startsWith("[INIT]")) {
+                                println("[Anilife][Hook] 래핑 스크립트 작동 중")
+                            }
                         }
                         return true
                     }
                 }
 
                 webView.webViewClient = object : WebViewClient() {
+                    // 페이지 로드 시작 시점에 XHR/Fetch 함수를 바꿔치기함
                     override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                         super.onPageStarted(view, url, favicon)
-                        // [v66.0] onPageStarted 즉시 주입
-                        view?.evaluateJavascript(hookScript, null)
+                        view?.evaluateJavascript(xhrScript, null)
                     }
 
                     override fun onPageFinished(view: WebView?, url: String?) {
                         super.onPageFinished(view, url)
-                        // 혹시 모르니 다시 주입
-                        view?.evaluateJavascript(hookScript, null)
+                        // 다시 주입 (Iframe 등 대비)
+                        view?.evaluateJavascript(xhrScript, null)
+                        // 10초 대기
                         handler.postDelayed({ if (cont.isActive) { webView.destroy(); cont.resume(Unit) } }, 10000)
                     }
                 }
@@ -310,13 +310,9 @@ class AnilifeProxyExtractor : ExtractorApi() {
                     val rawKey = hex.hexToByteArray()
                     val candidates = mutableListOf<ByteArray>()
                     
-                    if (rawKey.size == 16) {
-                        candidates.add(rawKey)
-                    } else if (rawKey.size == 32) {
-                        // [v66.0] 32바이트 Sliding Window 검증 유지
-                        for (i in 0..16) {
-                            candidates.add(rawKey.copyOfRange(i, i + 16))
-                        }
+                    if (rawKey.size == 16) candidates.add(rawKey)
+                    else if (rawKey.size == 32) {
+                        for (i in 0..16) candidates.add(rawKey.copyOfRange(i, i + 16))
                     }
 
                     for (key in candidates) {
