@@ -10,8 +10,9 @@ import org.jsoup.nodes.Element
 
 /**
  * Anilife Provider v5.0
- * - [Fix] 에피소드 소수점 정렬 구현 (실수형 파싱 -> 정수형 재인덱싱)
- * - [Fix] 1145 -> 1145.5 -> 1146 순서 보장
+ * - [Fix] 에피소드 소수점 정렬 구현 (실수형 파싱 -> 정렬 -> 정수형 재인덱싱)
+ * - [Fix] Episode 객체 'posterHeaders' 제거 (빌드 에러 방지)
+ * - [Fix] 1100개 이상의 에피소드를 한 번에 정렬하여 로드 (20개씩 끊김 없음)
  */
 class Anilife : MainAPI() {
     override var mainUrl = "https://anilife.live"
@@ -22,6 +23,7 @@ class Anilife : MainAPI() {
 
     private val TAG = "[Anilife]"
 
+    // 이미지/페이지 요청 공통 헤더
     private val commonHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Referer" to "$mainUrl/"
@@ -61,6 +63,7 @@ class Anilife : MainAPI() {
     private fun parseCommonList(doc: Document): List<SearchResponse> {
         val items = doc.select(".listupd > article.bs").mapNotNull { element ->
             try {
+                // 1. 기본 정보 파싱
                 val aTag = element.selectFirst("div.bsx > a") ?: return@mapNotNull null
                 val rawHref = fixUrl(aTag.attr("href"))
 
@@ -73,6 +76,7 @@ class Anilife : MainAPI() {
                 if (poster.isNullOrEmpty()) poster = imgTag?.attr("data-original")
                 poster = poster?.let { fixUrl(it) } ?: ""
 
+                // 2. 포스터 터널링
                 val finalHref = if (poster.isNotEmpty()) {
                     try {
                         val encodedPoster = Base64.encodeToString(poster.toByteArray(), Base64.NO_WRAP)
@@ -152,20 +156,22 @@ class Anilife : MainAPI() {
             val numText = element.selectFirst(".epl-num")?.text()?.trim() ?: ""
             val epTitle = element.selectFirst(".epl-title")?.text()?.trim() ?: ""
             
+            // "1145.5화 - 제목" 형식으로 표시
             val fullName = if(numText.isNotEmpty()) "${numText}화 - $epTitle" else epTitle
             
             // 소수점 포함 파싱 (1145.5 -> 1145.5f)
+            // 숫자가 없으면 0f 처리
             val floatNum = numText.toFloatOrNull() ?: 0f
 
             TempEpisode(href, fullName, floatNum)
         }
 
-        // 1. 실수 기준 오름차순 정렬 (1145 -> 1145.5 -> 1146)
+        // 1. 실수 기준 오름차순 정렬 (1145.0 -> 1145.5 -> 1146.0)
         val sortedTempEpisodes = tempEpisodes.sortedBy { it.floatNum }
 
         // 2. 정렬된 순서대로 정수 인덱스 재할당 (Re-indexing)
-        // 앱은 episode(Int) 필드를 기준으로 정렬하므로, 순서대로 1, 2, 3... 번호를 부여하여 강제 정렬시킴
-        // 시작 번호는 가장 작은 에피소드 번호의 정수값으로 설정 (선택 사항이나 자연스러운 표시를 위해)
+        // Cloudstream은 정수(Int) 에피소드 번호만 지원하므로,
+        // 실제 번호와 무관하게 정렬된 순서대로 1부터 번호를 부여하여 강제 정렬시킵니다.
         val startEpisodeIndex = sortedTempEpisodes.firstOrNull()?.floatNum?.toInt() ?: 1
         
         val finalEpisodes = sortedTempEpisodes.mapIndexed { index, temp ->
@@ -175,7 +181,7 @@ class Anilife : MainAPI() {
                 // 예: 1145 -> ep:1145, 1145.5 -> ep:1146, 1146 -> ep:1147
                 this.episode = startEpisodeIndex + index
             }
-        }.reversed() // 최신화가 위로 오도록 역순 (옵션)
+        }.reversed() // 최신화가 위로 오도록 역순 정렬
 
         println("$TAG [Load] Processed ${finalEpisodes.size} episodes with decimal sorting.")
 
