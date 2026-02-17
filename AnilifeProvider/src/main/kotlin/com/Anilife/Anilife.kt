@@ -7,10 +7,10 @@ import com.lagradost.cloudstream3.network.WebViewResolver
 import org.jsoup.nodes.Document
 
 /**
- * Anilife Provider v32.0
- * - [Feature] 'm3u8/st' API 주소를 감지하여 'v1/manifest/b/.../playlist.m3u8' 형태로 직접 변환(재조립)
- * - [Fix] 리다이렉트를 기다리다 발생하는 Timeout 문제 해결
- * - [Fix] v30.0의 웹뷰 통합 로직 유지
+ * Anilife Provider v33.0
+ * - [Critical Fix] 'Response code: 403 (Forbidden)' 에러 해결을 위해 헤더 전략 수정
+ * - [Fix] Referer를 메인 주소로 원복하고, Origin 헤더를 추가하여 서버 인증 통과 시도
+ * - [Fix] v32.0의 URL 재조립 및 웹뷰 통합 로직 유지
  */
 class Anilife : MainAPI() {
     override var mainUrl = "https://anilife.live"
@@ -102,6 +102,7 @@ class Anilife : MainAPI() {
 
         println("$TAG [Load] 접속 시도: $cleanUrl")
         
+        // 리다이렉트된 최종 URL 획득
         val response = app.get(cleanUrl, headers = commonHeaders)
         val doc = response.document
         val finalUrl = response.url
@@ -116,6 +117,8 @@ class Anilife : MainAPI() {
             val numText = element.selectFirst(".epl-num")?.text()?.trim() ?: ""
             val epTitle = element.selectFirst(".epl-title")?.text()?.trim() ?: ""
             val fullName = if (numText.isNotEmpty()) "${numText}화 - $epTitle" else epTitle
+            
+            // ref 파라미터 추가
             val finalHref = if (rawHref.contains("?")) "$rawHref&ref=$encodedRef" else "$rawHref?ref=$encodedRef"
 
             newEpisode(finalHref) {
@@ -139,7 +142,7 @@ class Anilife : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("$TAG [LoadLinks] === 프로세스 시작 (v32.0) ===")
+        println("$TAG [LoadLinks] === 프로세스 시작 (v33.0) ===")
         
         var cleanData = data.substringBefore("?poster=")
         var detailReferer = "$mainUrl/"
@@ -189,9 +192,8 @@ class Anilife : MainAPI() {
                 println("$TAG [2단계] 추출 성공: $playerUrl")
                 println("$TAG [3단계] M3U8 API 스니핑 및 재조립 시도...")
 
-                // [3단계] WebView로 플레이어 페이지 접속 -> 'm3u8' 키워드 감지
+                // [3단계] WebView로 플레이어 페이지 접속
                 try {
-                    // "m3u8"을 포함하는 모든 URL을 감지 (st 주소도 포함)
                     val m3u8Interceptor = WebViewResolver(Regex("""m3u8"""))
                     val m3u8Response = app.get(
                         playerUrl,
@@ -204,11 +206,10 @@ class Anilife : MainAPI() {
                     var finalM3u8 = m3u8Response.url
                     println("$TAG [3단계] 스니핑된 원본 URL: $finalM3u8")
 
-                    // [v32.0 핵심] URL 재조립 (API 주소 -> 최종 영상 주소)
+                    // [v32.0 유지] URL 재조립 (API 주소 -> 최종 영상 주소)
                     if (finalM3u8.contains("/m3u8/st/")) {
                         println("$TAG [3단계] API 주소 감지됨. 재조립 수행...")
-                        // https://api.gcdn.app/m3u8/st/{DATA}  -->  https://api.gcdn.app/v1/manifest/b/{DATA}/playlist.m3u8
-                        finalM3u8 = finalM3u8.replace("/m3u8/st/", "/v1/manifest/b/") + "/master.m3u8"
+                        finalM3u8 = finalM3u8.replace("/m3u8/st/", "/v1/manifest/b/") + "/playlist.m3u8"
                         println("$TAG [3단계] 재조립된 최종 URL: $finalM3u8")
                     }
 
@@ -220,8 +221,16 @@ class Anilife : MainAPI() {
                                 url = finalM3u8,
                                 type = ExtractorLinkType.M3U8
                             ) {
-                                this.referer = playerUrl
-                                this.headers = mapOf("User-Agent" to mobileUserAgent)
+                                // [v33.0 수정] 403 Forbidden 해결을 위한 헤더 변경
+                                // 1. Referer를 메인 주소로 설정 (일부 CDN은 메인 도메인을 요구함)
+                                this.referer = "https://anilife.live/" 
+                                
+                                // 2. Origin 헤더 추가 (CORS 문제 방지)
+                                this.headers = mapOf(
+                                    "User-Agent" to mobileUserAgent,
+                                    "Origin" to "https://anilife.live"
+                                )
+                                
                                 this.quality = getQualityFromName("HD")
                             }
                         )
