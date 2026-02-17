@@ -8,9 +8,9 @@ import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 
 /**
- * Extractor v4.0
- * - [Fix] "플레이어 선택 페이지" 리다이렉트 Regex 완화
- * - function moveX() { location.href = ... } 패턴 전체 검색 후 유효 URL 선택
+ * Extractor v5.0
+ * - [Fix] 리다이렉트 URL 탐색 로직 강화
+ * - location.href 특정 패턴 대신, HTML 전체에서 'https://anilife.live/h/live' 링크 검색
  */
 class AnilifeExtractor {
     private val TAG = "[AnilifeExtractor]"
@@ -37,25 +37,31 @@ class AnilifeExtractor {
             // 1. 페이지 로드
             var doc = app.get(currentUrl, headers = headers).document
 
-            // 2. 플레이어 선택 페이지인지 확인 (자바스크립트 리다이렉트 찾기)
-            val scriptContent = doc.select("script").joinToString("\n") { it.data() }
+            // 2. 플레이어 선택 페이지인지 확인 (HTML 전체 검색)
+            val rawHtml = doc.html()
             
-            // Regex: location.href = "URL" (따옴표 종류 상관없이, URL 내용 관대하게)
-            val redirectMatches = Regex("""location\.href\s*=\s*["']([^"']+)["']""").findAll(scriptContent)
+            // [v5.0 수정] location.href 문법에 의존하지 않고, 실제 이동해야 할 URL 패턴을 직접 찾음
+            // 패턴: https://anilife.live/h/live... 로 시작하는 URL
+            val urlRegex = Regex("""https:\\/\\/anilife\.live\\/h\\/live[^"']+""")
+            val match = urlRegex.find(rawHtml)
             
-            // 발견된 모든 URL 중 플레이어 URL(h/live)이나 유효한 링크 탐색
             var targetUrl: String? = null
-            for (match in redirectMatches) {
-                val foundUrl = match.groupValues[1]
-                println("$TAG [Extract] Found potential redirect: $foundUrl")
-                
-                if (foundUrl.contains("h/live") || foundUrl.contains("player=")) {
-                    targetUrl = foundUrl
-                    break
-                }
+            
+            if (match != null) {
+                targetUrl = match.value
+                // 이스케이프된 슬래시(\/) 제거
+                targetUrl = targetUrl.replace("\\/", "/")
+                println("$TAG [Extract] Found Redirect URL (Regex): $targetUrl")
+            } else {
+                 // 혹시 모르니 기존 방식(script)으로도 한 번 더 체크
+                 val scriptMatch = Regex("""location\.href\s*=\s*["']([^"']+)["']""").find(rawHtml)
+                 if (scriptMatch != null) {
+                     targetUrl = scriptMatch.groupValues[1]
+                     println("$TAG [Extract] Found Redirect URL (Script): $targetUrl")
+                 }
             }
 
-            if (targetUrl != null) {
+            if (!targetUrl.isNullOrEmpty()) {
                 println("$TAG [Extract] Following redirect to: $targetUrl")
                 currentUrl = targetUrl
                 doc = app.get(currentUrl, headers = headers).document
@@ -71,14 +77,10 @@ class AnilifeExtractor {
                 println("$TAG [Extract] Found _aldata (Length: ${base64Data.length})")
 
                 try {
-                    // Base64 Decode
                     val decodedBytes = Base64.decode(base64Data, Base64.DEFAULT)
                     val jsonString = String(decodedBytes)
-                    // println("$TAG [Extract] Decoded JSON: $jsonString")
 
-                    // JSON Parsing
                     val data = parseJson<AlData>(jsonString)
-                    
                     var m3u8Url = data.vidUrl1080 ?: data.vidUrl720 ?: data.vidUrl480
                     
                     if (m3u8Url != null && m3u8Url != "none") {
@@ -103,9 +105,6 @@ class AnilifeExtractor {
                 }
             } else {
                 println("$TAG [Error] '_aldata' variable not found.")
-                // 디버깅: HTML 일부 출력 (너무 길면 자름)
-                // val snippet = doc.html().take(500)
-                // println("$TAG [Debug] Page Snippet: $snippet")
             }
 
         } catch (e: Exception) {
