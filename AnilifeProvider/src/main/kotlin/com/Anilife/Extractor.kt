@@ -9,7 +9,6 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import android.webkit.CookieManager
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.AcraApplication
@@ -30,10 +29,10 @@ import kotlin.concurrent.thread
 import kotlin.coroutines.resume
 
 /**
- * Anilife Proxy Extractor v68.0
- * - [Critical Fix] 캐싱된 키 데이터까지 확보하기 위해 'XHR/Fetch Wrapping' 방식 도입
- * - [Logic] 브라우저의 기본 통신 함수(XMLHttpRequest, fetch)를 오버라이딩하여 데이터 수신 시점을 후킹
- * - [Fix] 네트워크 탭에 안 찍히는(캐시된) 요청도 Application Layer에서 가로채기 가능
+ * Anilife Proxy Extractor v69.0
+ * - [Feature] 'Active Force Fetch': 미리 파싱된 키 주소를 웹뷰에 주입하여 JS fetch()로 강제 다운로드
+ * - [Fix] 플레이어 재생 여부와 상관없이 무조건 키를 확보하는 가장 확실한 방법
+ * - [Fix] 32바이트 키 대응 및 Sliding Window 검증 유지
  */
 class AnilifeProxyExtractor : ExtractorApi() {
     override val name = "AnilifeProxy"
@@ -71,6 +70,7 @@ class AnilifeProxyExtractor : ExtractorApi() {
         referer: String,
         ssid: String?,
         cookies: String,
+        directKeyUrl: String?,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         synchronized(this) { currentProxyServer?.stop(); currentProxyServer = null }
@@ -78,9 +78,9 @@ class AnilifeProxyExtractor : ExtractorApi() {
         println("[Anilife][Proxy] 1. 키 저장소 초기화")
         val sessionKeys = Collections.synchronizedSet(mutableSetOf<String>())
         
-        println("[Anilife][Proxy] 2. XHR/Fetch 래핑 후킹 시작 (캐시 무시)...")
-        // [v68.0] XHR Wrapping 방식 호출
-        runWebViewXHRHook(playerUrl, referer, sessionKeys)
+        println("[Anilife][Proxy] 2. JS 강제 다운로드 시작 (Target: $directKeyUrl)...")
+        // [v69.0] 키 URL이 있으면 즉시 fetch 시도
+        runWebViewForceFetch(playerUrl, referer, directKeyUrl, sessionKeys)
 
         val proxy = ProxyWebServer(sessionKeys).apply { 
             start()
@@ -143,62 +143,30 @@ class AnilifeProxyExtractor : ExtractorApi() {
         }
     }
 
-    // [v68.0 핵심] XHR/Fetch API 자체를 덮어쓰는 스크립트 주입
-    private suspend fun runWebViewXHRHook(
-        url: String, 
+    // [v69.0 핵심] 특정 URL을 JS로 강제 다운로드
+    private suspend fun runWebViewForceFetch(
+        pageUrl: String, 
         referer: String, 
+        targetKeyUrl: String?, 
         sessionKeys: MutableSet<String>
     ) = suspendCancellableCoroutine<Unit> { cont ->
         val handler = Handler(Looper.getMainLooper())
         
-        val xhrScript = """
-            (function() {
-                // 중복 주입 방지
-                if (window.xhrHookInjected) return;
-                window.xhrHookInjected = true;
-                console.log("CapturedKeyHex: [INIT] XHR Hook Injected");
-
-                // 1. Fetch Hook
-                const originalFetch = window.fetch;
-                window.fetch = async function(...args) {
-                    const response = await originalFetch(...args);
-                    try {
-                        const url = response.url;
-                        if (url && (url.includes('enc.bin') || url.includes('/key'))) {
-                            const clone = response.clone();
-                            clone.arrayBuffer().then(buffer => {
-                                let bytes = new Uint8Array(buffer);
-                                let hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
-                                console.log("CapturedKeyHex:" + hex);
-                            });
-                        }
-                    } catch(e) {}
-                    return response;
-                };
-
-                // 2. XMLHttpRequest Hook
-                const originalOpen = XMLHttpRequest.prototype.open;
-                XMLHttpRequest.prototype.open = function(method, url) {
-                    this._url = url;
-                    return originalOpen.apply(this, arguments);
-                };
-                const originalSend = XMLHttpRequest.prototype.send;
-                XMLHttpRequest.prototype.send = function() {
-                    this.addEventListener('load', function() {
-                        if (this._url && (typeof this._url === 'string') && (this._url.includes('enc.bin') || this._url.includes('/key'))) {
-                            try {
-                                if (this.responseType === 'arraybuffer' && this.response) {
-                                    let bytes = new Uint8Array(this.response);
-                                    let hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
-                                    console.log("CapturedKeyHex:" + hex);
-                                }
-                            } catch(e) {}
-                        }
-                    });
-                    return originalSend.apply(this, arguments);
-                };
+        // JS 스크립트: targetUrl이 있으면 즉시 fetch 수행
+        val script = if (targetKeyUrl != null) """
+            (async function() {
+                console.log("[JS] Force Fetch Start: $targetKeyUrl");
+                try {
+                    const response = await fetch("$targetKeyUrl", { referrerPolicy: "no-referrer" });
+                    const buffer = await response.arrayBuffer();
+                    const bytes = new Uint8Array(buffer);
+                    const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+                    console.log("CapturedKeyHex:" + hex);
+                } catch(e) {
+                    console.log("[JS] Fetch Failed: " + e.message);
+                }
             })();
-        """.trimIndent()
+        """.trimIndent() else ""
 
         handler.post {
             try {
@@ -209,7 +177,7 @@ class AnilifeProxyExtractor : ExtractorApi() {
                     javaScriptEnabled = true
                     domStorageEnabled = true
                     userAgentString = DESKTOP_UA
-                    mediaPlaybackRequiresUserGesture = false // 자동 재생 허용
+                    mediaPlaybackRequiresUserGesture = false
                 }
 
                 webView.webChromeClient = object : WebChromeClient() {
@@ -217,33 +185,29 @@ class AnilifeProxyExtractor : ExtractorApi() {
                         val msg = cm?.message() ?: ""
                         if (msg.contains("CapturedKeyHex:")) {
                             val key = msg.substringAfter("CapturedKeyHex:").trim()
-                            if (!key.startsWith("[INIT]") && sessionKeys.add(key)) {
-                                println("[Anilife][Hook] 캐시 무시 키 확보: $key")
-                            } else if (key.startsWith("[INIT]")) {
-                                println("[Anilife][Hook] 래핑 스크립트 작동 중")
-                            }
+                            if (sessionKeys.add(key)) println("[Anilife][Hook] JS 강제 키 확보 성공: $key")
+                        } else if (msg.contains("[JS]")) {
+                            println("[Anilife][JS] $msg")
                         }
                         return true
                     }
                 }
 
                 webView.webViewClient = object : WebViewClient() {
-                    // 페이지 로드 시작 시점에 XHR/Fetch 함수를 바꿔치기함
                     override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                         super.onPageStarted(view, url, favicon)
-                        view?.evaluateJavascript(xhrScript, null)
+                        // [v69.0] 시작하자마자 스크립트 투하
+                        if (targetKeyUrl != null) view?.evaluateJavascript(script, null)
                     }
 
                     override fun onPageFinished(view: WebView?, url: String?) {
                         super.onPageFinished(view, url)
-                        // 다시 주입 (Iframe 등 대비)
-                        view?.evaluateJavascript(xhrScript, null)
-                        // 10초 대기
+                        if (targetKeyUrl != null) view?.evaluateJavascript(script, null)
                         handler.postDelayed({ if (cont.isActive) { webView.destroy(); cont.resume(Unit) } }, 10000)
                     }
                 }
                 
-                webView.loadUrl(url, mapOf("Referer" to referer))
+                webView.loadUrl(pageUrl, mapOf("Referer" to referer))
             } catch (e: Exception) { if (cont.isActive) cont.resume(Unit) }
         }
     }
