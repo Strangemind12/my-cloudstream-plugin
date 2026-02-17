@@ -3,10 +3,13 @@ package com.anilife
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.webkit.ConsoleMessage
+import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.webkit.CookieManager
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.AcraApplication
@@ -27,9 +30,9 @@ import kotlin.concurrent.thread
 import kotlin.coroutines.resume
 
 /**
- * Anilife Proxy Extractor v61.0
- * - [Fix] thread 내에서 suspend 함수(app.get) 호출 시 runBlocking으로 감싸 빌드 에러 해결
- * - [Feature] WebViewClient.shouldInterceptRequest를 이용한 네트워크 레벨 키 후킹 구현
+ * Anilife Proxy Extractor v63.0
+ * - [Critical Fix] 32바이트 키 데이터에 대해 슬라이딩 윈도우(Sliding Window) 방식의 전수 조사 적용
+ * - [Logic] 32바이트 데이터에서 연속된 16바이트를 한 칸씩 밀어가며 모두 추출하여 복호화 시도
  */
 class AnilifeProxyExtractor : ExtractorApi() {
     override val name = "AnilifeProxy"
@@ -71,11 +74,10 @@ class AnilifeProxyExtractor : ExtractorApi() {
     ): Boolean {
         synchronized(this) { currentProxyServer?.stop(); currentProxyServer = null }
 
-        println("[Anilife][Proxy] 1. 세션 전용 키 저장소 초기화")
+        println("[Anilife][Proxy] 1. 키 저장소 초기화")
         val sessionKeys = Collections.synchronizedSet(mutableSetOf<String>())
         
         println("[Anilife][Proxy] 2. 웹뷰 네트워크 인터셉트 시작 (10초 대기)...")
-        // 네트워크 인터셉트 방식으로 키 수집 시도
         runWebViewNetworkHook(playerUrl, referer, ssid, cookies, sessionKeys)
 
         val proxy = ProxyWebServer(sessionKeys).apply { 
@@ -110,12 +112,10 @@ class AnilifeProxyExtractor : ExtractorApi() {
                         if (match != null) {
                             val absKey = baseUri.resolve(match.groupValues[1]).toString()
                             val encKey = java.net.URLEncoder.encode(absKey, "UTF-8")
-                            // 키 요청을 로컬 프록시로 변경
                             sb.append(trimmed.replace(match.groupValues[1], "http://127.0.0.1:${proxy.port}/key?url=$encKey")).append("\n")
                         } else sb.append(trimmed).append("\n")
                     }
                     !trimmed.startsWith("#") -> {
-                        // 세그먼트 요청을 로컬 프록시로 변경
                         val absSeg = baseUri.resolve(trimmed).toString()
                         proxy.setTestSegment(absSeg)
                         val encSeg = java.net.URLEncoder.encode(absSeg, "UTF-8")
@@ -128,20 +128,19 @@ class AnilifeProxyExtractor : ExtractorApi() {
             proxy.setPlaylist(sb.toString())
             val finalProxyUrl = "http://127.0.0.1:${proxy.port}/playlist.m3u8"
             
-            println("[Anilife][Proxy] 4. 프록시 링크 반환 완료: $finalProxyUrl")
+            println("[Anilife][Proxy] 4. 프록시 링크 생성: $finalProxyUrl")
             callback(newExtractorLink(name, name, finalProxyUrl, ExtractorLinkType.M3U8) {
-                this.referer = "" // 스크린샷 no-referrer 반영
+                this.referer = ""
                 this.headers = proxy.getCurrentHeaders()
             })
             return true
 
         } catch (e: Exception) {
-            println("[Anilife][Proxy] 에러 발생: ${e.message}")
+            println("[Anilife][Proxy] Error: ${e.message}")
             return false
         }
     }
 
-    // [v61.0 Fix] thread 내부 runBlocking 추가로 빌드 에러 해결
     private suspend fun runWebViewNetworkHook(
         url: String, 
         referer: String, 
@@ -151,6 +150,30 @@ class AnilifeProxyExtractor : ExtractorApi() {
     ) = suspendCancellableCoroutine<Unit> { cont ->
         val handler = Handler(Looper.getMainLooper())
         
+        // JS Hook: 32바이트 데이터도 적극적으로 수집
+        val hookScript = """
+            (function() {
+                if (window.crypto && window.crypto.subtle) {
+                    const oI = window.crypto.subtle.importKey;
+                    window.crypto.subtle.importKey = function(f, k, ...) {
+                        if (f === 'raw' && (k.byteLength === 16 || k.byteLength === 32 || k.length === 16 || k.length === 32)) {
+                            let hex = Array.from(new Uint8Array(k)).map(b => b.toString(16).padStart(2, '0')).join('');
+                            console.log("CapturedKeyHex:" + hex);
+                        }
+                        return oI.apply(this, arguments);
+                    };
+                }
+                const oS = Uint8Array.prototype.set;
+                Uint8Array.prototype.set = function(src, off) {
+                    if (src && (src.length === 16 || src.length === 32)) {
+                        let hex = Array.from(src).map(b => b.toString(16).padStart(2, '0')).join('');
+                        console.log("CapturedKeyHex:" + hex);
+                    }
+                    return oS.apply(this, arguments);
+                };
+            })();
+        """.trimIndent()
+
         handler.post {
             try {
                 val context: Context = (AcraApplication.context ?: app) as Context
@@ -159,14 +182,28 @@ class AnilifeProxyExtractor : ExtractorApi() {
                 webView.settings.domStorageEnabled = true
                 webView.settings.userAgentString = DESKTOP_UA
 
+                webView.webChromeClient = object : WebChromeClient() {
+                    override fun onConsoleMessage(cm: ConsoleMessage?): Boolean {
+                        val msg = cm?.message() ?: ""
+                        if (msg.contains("CapturedKeyHex:")) {
+                            val key = msg.substringAfter("CapturedKeyHex:")
+                            if (sessionKeys.add(key)) println("[Anilife][Hook] JS 키 발견: $key")
+                        }
+                        return true
+                    }
+                }
+
                 webView.webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(v: WebView?, u: String?) {
+                        v?.evaluateJavascript(hookScript, null)
+                        handler.postDelayed({ if (cont.isActive) { webView.destroy(); cont.resume(Unit) } }, 10000)
+                    }
+
                     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                         val reqUrl = request?.url.toString()
-                        // enc.bin 또는 key가 포함된 요청을 감지
                         if (reqUrl.contains("enc.bin") || reqUrl.contains("/key")) {
-                            println("[Anilife][Intercept] 키 요청 감지됨: $reqUrl")
+                            println("[Anilife][Intercept] 네트워크 키 요청: $reqUrl")
                             thread {
-                                // [중요] suspend 함수인 app.get 호출을 위해 runBlocking 사용
                                 runBlocking {
                                     try {
                                         val headers = mutableMapOf(
@@ -178,12 +215,13 @@ class AnilifeProxyExtractor : ExtractorApi() {
                                         
                                         val response = app.get(reqUrl, headers = headers)
                                         val bytes = response.body.bytes()
-                                        if (bytes.size == 16) {
+                                        // 32바이트 데이터도 허용하여 수집
+                                        if (bytes.size == 16 || bytes.size == 32) {
                                             val hex = bytes.joinToString("") { "%02x".format(it) }
-                                            if (sessionKeys.add(hex)) println("[Anilife][Intercept] 키 데이터 확보 성공: $hex")
+                                            if (sessionKeys.add(hex)) println("[Anilife][Intercept] 네트워크 키 확보: $hex")
                                         }
                                     } catch (e: Exception) {
-                                        println("[Anilife][Intercept] 키 요청 실패: ${e.message}")
+                                        println("[Anilife][Intercept] 실패: ${e.message}")
                                     }
                                 }
                             }
@@ -192,8 +230,6 @@ class AnilifeProxyExtractor : ExtractorApi() {
                     }
                 }
                 
-                // 10초 대기 후 종료
-                handler.postDelayed({ if (cont.isActive) { webView.destroy(); cont.resume(Unit) } }, 10000)
                 webView.loadUrl(url, mapOf("Referer" to referer))
             } catch (e: Exception) { if (cont.isActive) cont.resume(Unit) }
         }
@@ -255,20 +291,37 @@ class AnilifeProxyExtractor : ExtractorApi() {
             println("[Anilife][Verify] 키 검증 시도 (후보: ${sessionKeys.size}개)")
             try {
                 val data = app.get(url, headers = headers).body.bytes()
+                val chunk = data.take(1024).toByteArray()
+
                 sessionKeys.forEach { hex ->
-                    try {
-                        val key = hex.hexToByteArray()
-                        val cipher = Cipher.getInstance("AES/CBC/NoPadding")
-                        cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(ByteArray(16)))
-                        val dec = cipher.doFinal(data.take(1024).toByteArray())
-                        // MPEG-TS Sync Byte (0x47) 검증
-                        if (dec.size > 188 && dec[0] == 0x47.toByte() && dec[188] == 0x47.toByte()) {
-                            println("[Anilife][Verify] 검증 성공: $hex")
-                            return@runBlocking key
+                    val rawKey = hex.hexToByteArray()
+                    val candidates = mutableListOf<ByteArray>()
+                    
+                    // 1. 16바이트면 바로 추가
+                    if (rawKey.size == 16) {
+                        candidates.add(rawKey)
+                    }
+                    // 2. 32바이트면 슬라이딩 윈도우로 모든 16바이트 조합 생성 (0~16 인덱스 시작)
+                    else if (rawKey.size == 32) {
+                        for (i in 0..16) {
+                            candidates.add(rawKey.copyOfRange(i, i + 16))
                         }
-                    } catch (e: Exception) {}
+                    }
+
+                    for (key in candidates) {
+                        try {
+                            val cipher = Cipher.getInstance("AES/CBC/NoPadding")
+                            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(ByteArray(16)))
+                            val dec = cipher.doFinal(chunk)
+                            // MPEG-TS 동기화 바이트 확인
+                            if (dec.size > 188 && dec[0] == 0x47.toByte() && dec[188] == 0x47.toByte()) {
+                                println("[Anilife][Verify] 성공! 정답 키 찾음 (Offset 등): ${key.joinToString("") { "%02x".format(it) }}")
+                                return@runBlocking key
+                            }
+                        } catch (e: Exception) {}
+                    }
                 }
-            } catch (e: Exception) {}
+            } catch (e: Exception) { println("[Anilife][Verify] 검증 실패: ${e.message}") }
             null
         }
     }
