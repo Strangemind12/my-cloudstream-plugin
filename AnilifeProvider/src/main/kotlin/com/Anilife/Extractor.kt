@@ -29,10 +29,10 @@ import kotlin.concurrent.thread
 import kotlin.coroutines.resume
 
 /**
- * Anilife Proxy Extractor v73.0
- * - [Critical Fix] JS Fetch 실패 원인(CORS Credential) 수정: credentials: 'include' 옵션 추가
- * - [Logic] M3U8에서 추출한 키 URL을 웹뷰 내 JS가 '인증 정보를 포함하여' 강제로 다운로드
- * - [Fix] 32바이트 키 대응 및 Sliding Window 검증
+ * Anilife Proxy Extractor v74.0
+ * - [Critical Fix] 웹뷰 타임아웃 해결: 무거운 플레이어 페이지 대신 가벼운 'robots.txt'를 로드하여 즉시 JS 실행 유도
+ * - [Logic] Origin(https://anilife.live)은 유지하면서 로딩 속도를 최적화하여 JS Fetch 성공률 극대화
+ * - [Fix] 32바이트 키 슬라이딩 윈도우 검증 유지
  */
 class AnilifeProxyExtractor : ExtractorApi() {
     override val name = "AnilifeProxy"
@@ -78,13 +78,14 @@ class AnilifeProxyExtractor : ExtractorApi() {
         println("[Anilife][Proxy] 1. 프록시 서버 초기화")
         val sessionKeys = Collections.synchronizedSet(mutableSetOf<String>())
 
-        // [v73.0] JS 강제 다운로드 (Credential 포함) 시도
+        // [v74.0] 키 URL이 있을 때만 Active Fetch 시도 (가벼운 페이지 로드)
         if (directKeyUrl != null) {
-            println("[Anilife][Proxy] 2. JS 강제 다운로드 시작 (Target: $directKeyUrl)...")
-            runWebViewCredentialFetch(playerUrl, referer, directKeyUrl, sessionKeys)
+            println("[Anilife][Proxy] 2. Fast JS Fetch 시작 (Target: $directKeyUrl)...")
+            // playerUrl 대신 가벼운 페이지 사용
+            runWebViewFastFetch(referer, directKeyUrl, sessionKeys)
         } else {
-            println("[Anilife][Proxy] 2. 키 URL 없음. Passive Hook만 작동.")
-            runWebViewCredentialFetch(playerUrl, referer, null, sessionKeys)
+            println("[Anilife][Proxy] 2. 키 URL 없음. Passive Hook 대기.")
+            runWebViewFastFetch(referer, null, sessionKeys)
         }
 
         val proxy = ProxyWebServer(sessionKeys).apply { 
@@ -148,19 +149,18 @@ class AnilifeProxyExtractor : ExtractorApi() {
         }
     }
 
-    // [v73.0 핵심] 쿠키(Credentials)를 포함한 JS Fetch 실행
-    private suspend fun runWebViewCredentialFetch(
-        pageUrl: String, 
+    // [v74.0] 무거운 페이지 대신 가벼운 페이지(robots.txt)를 로드하여 JS 실행 속도 향상
+    private suspend fun runWebViewFastFetch(
         referer: String, 
         targetKeyUrl: String?, 
         sessionKeys: MutableSet<String>
     ) = suspendCancellableCoroutine<Unit> { cont ->
         val handler = Handler(Looper.getMainLooper())
         
-        // JS 스크립트
+        // JS 스크립트 (Fetch with Credentials)
         val script = StringBuilder()
         
-        // 1. Passive Hook (기존 유지)
+        // Passive Hook
         script.append("""
             (function() {
                 if (window.crypto && window.crypto.subtle) {
@@ -176,11 +176,11 @@ class AnilifeProxyExtractor : ExtractorApi() {
             })();
         """.trimIndent())
 
-        // 2. Active Fetch (credentials: include 필수!)
+        // Active Fetch
         if (targetKeyUrl != null) {
             script.append("""
                 ; (async function() {
-                    console.log("[JS] Fetching Key with Credentials: $targetKeyUrl");
+                    console.log("[JS] Fast Fetching: $targetKeyUrl");
                     try {
                         const response = await fetch("$targetKeyUrl", { 
                             referrerPolicy: "no-referrer",
@@ -218,7 +218,7 @@ class AnilifeProxyExtractor : ExtractorApi() {
                         val msg = cm?.message() ?: ""
                         if (msg.contains("CapturedKeyHex:")) {
                             val key = msg.substringAfter("CapturedKeyHex:").trim()
-                            if (sessionKeys.add(key)) println("[Anilife][Hook] JS 키 확보 성공: $key")
+                            if (sessionKeys.add(key)) println("[Anilife][Hook] 키 확보 성공: $key")
                         } else if (msg.contains("[JS]")) {
                             println("[Anilife][JS] $msg")
                         }
@@ -235,12 +235,15 @@ class AnilifeProxyExtractor : ExtractorApi() {
                     override fun onPageFinished(view: WebView?, url: String?) {
                         super.onPageFinished(view, url)
                         view?.evaluateJavascript(script.toString(), null)
-                        // 10초 대기
-                        handler.postDelayed({ if (cont.isActive) { webView.destroy(); cont.resume(Unit) } }, 10000)
+                        handler.postDelayed({ if (cont.isActive) { webView.destroy(); cont.resume(Unit) } }, 5000) // 5초 후 종료 (가벼운 페이지라 충분)
                     }
                 }
                 
-                webView.loadUrl(pageUrl, mapOf("Referer" to referer))
+                // [v74.0] 중요: 도메인은 같지만 가벼운 페이지 로드
+                // anilife.live 도메인의 쿠키를 사용하기 위해 같은 도메인 내의 리소스 로드
+                val lightPage = "https://anilife.live/robots.txt" 
+                println("[Anilife][Proxy] 가벼운 페이지 로드: $lightPage")
+                webView.loadUrl(lightPage, mapOf("Referer" to referer))
             } catch (e: Exception) { if (cont.isActive) cont.resume(Unit) }
         }
     }
@@ -304,12 +307,6 @@ class AnilifeProxyExtractor : ExtractorApi() {
         private fun verify(): ByteArray? = runBlocking {
             val url = testSegment ?: return@runBlocking null
             println("[Anilife][Verify] 키 검증 시도 (후보: ${sessionKeys.size}개)")
-            
-            if (sessionKeys.isEmpty()) {
-                println("[Anilife][Verify] 실패: 후보 키 없음.")
-                return@runBlocking null
-            }
-
             try {
                 val data = app.get(url, headers = headers).body.bytes()
                 val chunk = data.take(1024).toByteArray()
