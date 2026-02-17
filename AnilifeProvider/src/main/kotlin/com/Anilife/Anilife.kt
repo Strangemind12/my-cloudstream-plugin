@@ -4,16 +4,15 @@ import android.util.Base64
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 
 /**
- * Anilife Provider v7.1
- * - [Fix] WebViewResolver 'referer' 파라미터 에러 수정 (headers 맵으로 전달)
- * - [Fix] 에피소드 정렬 최적화 (Float 정렬 + 로그 제거)
- * - [Fix] 링크 추출 로직 유지 (HTML 파싱 -> WebView 실행)
+ * Anilife Provider v8.0
+ * - [Refactor] Anilife.kt와 Extractor.kt 분리 (사용자 요청)
+ * - [Fix] WebViewResolver 빌드 에러 수정 (Extractor.kt에서 처리)
+ * - [Performance] 에피소드 정렬 최적화 유지 (로그 제거)
  */
 class Anilife : MainAPI() {
     override var mainUrl = "https://anilife.live"
@@ -123,7 +122,7 @@ class Anilife : MainAPI() {
         val description = doc.selectFirst(".synp .entry-content")?.text()?.trim()
         val tags = doc.select(".genxed a, .taged a").map { it.text() }
 
-        // [v7.0] 렉 방지를 위해 로그 제거 후 Float 정렬 수행
+        // 대량 에피소드 파싱 (로그 제거로 최적화)
         val rawEpisodes = doc.select(".eplister > ul > li > a").mapNotNull { element ->
             val href = fixUrl(element.attr("href"))
             val numText = element.selectFirst(".epl-num")?.text()?.trim() ?: ""
@@ -133,8 +132,10 @@ class Anilife : MainAPI() {
             TempEpisode(href, fullName, floatNum)
         }
 
+        // 1. Float 오름차순 정렬 (1145.5화 위치 보정)
         val sortedEpisodes = rawEpisodes.sortedBy { it.floatNum }
 
+        // 2. 정수 ID 재할당 (앱 내 정렬 보장)
         val finalEpisodes = sortedEpisodes.mapIndexed { index, temp ->
             newEpisode(temp.url) {
                 this.name = temp.fullName
@@ -159,59 +160,11 @@ class Anilife : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // 1. URL 정리 (포스터 파라미터 제거)
         val cleanData = if (data.contains("poster=")) data.substringBefore("?poster=") else data
         println("$TAG [LoadLinks] Start: $cleanData")
-
-        try {
-            // 2. Provider 페이지 로드 (HTML 텍스트 가져오기)
-            val response = app.get(cleanData, headers = commonHeaders)
-            val html = response.text
-
-            // 3. 실제 플레이어 주소 파싱
-            // 자바스크립트 내의 "https://anilife.live/h/live?p=...&player=..." 패턴 추출
-            val regex = Regex("""https://anilife\.live/h/live\?p=[^"']+(?:&player=[^"']+)*""")
-            val match = regex.find(html)
-            val playerUrl = match?.value
-
-            if (playerUrl != null) {
-                println("$TAG [LoadLinks] Found Player URL: $playerUrl")
-                
-                // 4. 추출한 플레이어 주소로 WebViewResolver 실행
-                // [수정] referer 파라미터 제거 -> headers 맵에 포함
-                val webViewInterceptor = WebViewResolver(
-                    Regex("""\.m3u8"""),
-                    userAgent = commonHeaders["User-Agent"],
-                    headers = mapOf("Referer" to "https://anilife.live/") // 수정된 부분
-                )
-                
-                val webViewResponse = app.get(playerUrl, headers = commonHeaders, interceptor = webViewInterceptor)
-                val sniffedUrl = webViewResponse.url
-                
-                println("$TAG [WebView] Sniffed URL: $sniffedUrl")
-
-                if (sniffedUrl.contains(".m3u8")) {
-                     callback.invoke(
-                        newExtractorLink(
-                            source = name,
-                            name = name,
-                            url = sniffedUrl,
-                            type = ExtractorLinkType.M3U8
-                        ) {
-                            this.referer = "https://anilife.live/"
-                            this.quality = getQualityFromName("HD")
-                        }
-                    )
-                    return true
-                }
-            } else {
-                println("$TAG [LoadLinks] Failed to find player URL in HTML.")
-            }
-        } catch (e: Exception) {
-            println("$TAG [LoadLinks] Error: ${e.message}")
-            e.printStackTrace()
-        }
-
-        return false
+        
+        // 분리된 Extractor 호출
+        val extractor = AnilifeExtractor()
+        return extractor.extract(cleanData, callback)
     }
 }
