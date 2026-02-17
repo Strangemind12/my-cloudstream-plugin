@@ -4,16 +4,11 @@ import android.util.Base64
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 
-/**
- * Anilife Provider v8.0
- * - [Refactor] Anilife.kt와 Extractor.kt 분리 (사용자 요청)
- * - [Fix] WebViewResolver 빌드 에러 수정 (Extractor.kt에서 처리)
- * - [Performance] 에피소드 정렬 최적화 유지 (로그 제거)
- */
 class Anilife : MainAPI() {
     override var mainUrl = "https://anilife.live"
     override var name = "Anilife"
@@ -107,7 +102,6 @@ class Anilife : MainAPI() {
             } catch (e: Exception) { url }
         } else { url }
 
-        println("$TAG [Load] URL: $cleanUrl")
         val doc = app.get(cleanUrl, headers = commonHeaders).document
         val title = doc.selectFirst(".entry-title")?.text()?.trim() ?: "Unknown"
 
@@ -122,7 +116,7 @@ class Anilife : MainAPI() {
         val description = doc.selectFirst(".synp .entry-content")?.text()?.trim()
         val tags = doc.select(".genxed a, .taged a").map { it.text() }
 
-        // 대량 에피소드 파싱 (로그 제거로 최적화)
+        // [정렬 로직] Float 변환 -> 오름차순 정렬 -> ID 재부여
         val rawEpisodes = doc.select(".eplister > ul > li > a").mapNotNull { element ->
             val href = fixUrl(element.attr("href"))
             val numText = element.selectFirst(".epl-num")?.text()?.trim() ?: ""
@@ -132,18 +126,14 @@ class Anilife : MainAPI() {
             TempEpisode(href, fullName, floatNum)
         }
 
-        // 1. Float 오름차순 정렬 (1145.5화 위치 보정)
         val sortedEpisodes = rawEpisodes.sortedBy { it.floatNum }
 
-        // 2. 정수 ID 재할당 (앱 내 정렬 보장)
         val finalEpisodes = sortedEpisodes.mapIndexed { index, temp ->
             newEpisode(temp.url) {
                 this.name = temp.fullName
                 this.episode = index + 1
             }
         }.reversed()
-
-        println("$TAG [Load] Loaded ${finalEpisodes.size} episodes.")
 
         return newAnimeLoadResponse(title, cleanUrl, TvType.Anime) {
             this.posterUrl = htmlPoster
@@ -163,8 +153,49 @@ class Anilife : MainAPI() {
         val cleanData = if (data.contains("poster=")) data.substringBefore("?poster=") else data
         println("$TAG [LoadLinks] Start: $cleanData")
         
-        // 분리된 Extractor 호출
+        // 1. Extractor에게 플레이어 URL 추출 요청 (단순 파싱)
         val extractor = AnilifeExtractor()
-        return extractor.extract(cleanData, callback)
+        val playerUrl = extractor.fetchPlayerUrl(cleanData)
+
+        if (playerUrl != null) {
+            println("$TAG [LoadLinks] Found Player URL: $playerUrl")
+            
+            // 2. 여기서 WebViewResolver 실행 (빌드 에러 안 남)
+            try {
+                // headers는 app.get에 전달, 생성자엔 Regex만 전달
+                val webViewInterceptor = WebViewResolver(
+                    Regex("""\.m3u8""")
+                )
+                
+                val response = app.get(
+                    playerUrl,
+                    headers = commonHeaders, // 헤더 필수
+                    interceptor = webViewInterceptor
+                )
+                
+                val sniffedUrl = response.url
+                println("$TAG [WebView] Sniffed: $sniffedUrl")
+
+                if (sniffedUrl.contains(".m3u8")) {
+                     callback.invoke(
+                        newExtractorLink(
+                            source = name,
+                            name = name,
+                            url = sniffedUrl,
+                            type = ExtractorLinkType.M3U8
+                        ) {
+                            this.referer = "https://anilife.live/"
+                            this.quality = getQualityFromName("HD")
+                        }
+                    )
+                    return true
+                }
+            } catch (e: Exception) {
+                println("$TAG [WebView] Error: ${e.message}")
+            }
+        } else {
+             println("$TAG [LoadLinks] Failed to extract player URL")
+        }
+        return false
     }
 }
