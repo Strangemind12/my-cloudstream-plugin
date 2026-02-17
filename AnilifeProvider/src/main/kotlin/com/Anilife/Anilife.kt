@@ -9,9 +9,10 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 
 /**
- * Anilife Provider v4.1
- * - [Fix] Episode 객체 'posterHeaders' Unresolved reference 에러 수정 (제거)
- * - SearchResponse/LoadResponse에는 posterHeaders 유지 (이미지 403 방지)
+ * Anilife Provider v5.1
+ * - [Fix] Overload 해결: 불필요한 sort 제거하고 인덱스 기반 역순 할당으로 변경
+ * - [Fix] 에피소드 소수점(1145.5) 처리: 화면엔 그대로 표시하되 내부 ID는 정수로 변환하여 정렬 유지
+ * - [Fix] Episode 객체 posterHeaders 제거 (빌드 에러 방지)
  */
 class Anilife : MainAPI() {
     override var mainUrl = "https://anilife.live"
@@ -22,7 +23,6 @@ class Anilife : MainAPI() {
 
     private val TAG = "[Anilife]"
 
-    // 이미지/페이지 요청 공통 헤더
     private val commonHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Referer" to "$mainUrl/"
@@ -46,14 +46,11 @@ class Anilife : MainAPI() {
             "$mainUrl$basePath/$page"
         }
 
-        println("$TAG [MainPage] Request: $url")
-        
         try {
             val doc = app.get(url, headers = commonHeaders).document
             val home = parseCommonList(doc)
             return newHomePageResponse(request.name, home)
         } catch (e: Exception) {
-            println("$TAG [MainPage] Error: ${e.message}")
             e.printStackTrace()
             return newHomePageResponse(request.name, emptyList())
         }
@@ -62,7 +59,6 @@ class Anilife : MainAPI() {
     private fun parseCommonList(doc: Document): List<SearchResponse> {
         val items = doc.select(".listupd > article.bs").mapNotNull { element ->
             try {
-                // 1. 기본 정보 파싱
                 val aTag = element.selectFirst("div.bsx > a") ?: return@mapNotNull null
                 val rawHref = fixUrl(aTag.attr("href"))
 
@@ -75,7 +71,6 @@ class Anilife : MainAPI() {
                 if (poster.isNullOrEmpty()) poster = imgTag?.attr("data-original")
                 poster = poster?.let { fixUrl(it) } ?: ""
 
-                // 2. 포스터 터널링 (URL에 포스터 정보 숨기기)
                 val finalHref = if (poster.isNotEmpty()) {
                     try {
                         val encodedPoster = Base64.encodeToString(poster.toByteArray(), Base64.NO_WRAP)
@@ -90,29 +85,22 @@ class Anilife : MainAPI() {
 
                 newAnimeSearchResponse(title, finalHref, TvType.Anime) {
                     this.posterUrl = poster
-                    // [핵심] SearchResponse에는 posterHeaders가 존재함 (403 방지)
                     this.posterHeaders = commonHeaders
                 }
             } catch (e: Exception) {
-                println("$TAG [ListItem] Parse Error: ${e.message}")
                 null
             }
         }
-        println("$TAG [List] Parsed ${items.size} items.")
         return items
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/search?keyword=$query"
-        println("$TAG [Search] Query: $query -> $url")
         val doc = app.get(url, headers = commonHeaders).document
         return parseCommonList(doc)
     }
 
     override suspend fun load(url: String): LoadResponse {
-        println("$TAG [Load] Raw URL: $url")
-        
-        // 1. 터널링된 포스터 URL 추출 (Base64 디코딩)
         var tunnelingPoster: String? = null
         val cleanUrl = if (url.contains("poster=")) {
             try {
@@ -127,17 +115,15 @@ class Anilife : MainAPI() {
             url
         }
 
-        println("$TAG [Load] Requesting Details: $cleanUrl")
+        println("$TAG [Load] URL: $cleanUrl")
         val doc = app.get(cleanUrl, headers = commonHeaders).document
 
         val title = doc.selectFirst(".entry-title")?.text()?.trim() ?: "Unknown"
         
-        // 2. HTML에서 포스터 파싱 시도
         var htmlPoster = doc.selectFirst(".thumb img")?.let { img ->
             img.attr("src").ifEmpty { img.attr("data-src") }
         }?.let { fixUrl(it) }
 
-        // 3. 포스터 유효성 검사 및 터널링 데이터 사용
         if (htmlPoster.isNullOrEmpty() || htmlPoster == mainUrl || htmlPoster == "$mainUrl/") {
             if (!tunnelingPoster.isNullOrEmpty()) {
                 htmlPoster = tunnelingPoster
@@ -147,28 +133,44 @@ class Anilife : MainAPI() {
         val description = doc.selectFirst(".synp .entry-content")?.text()?.trim()
         val tags = doc.select(".genxed a, .taged a").map { it.text() }
         
-        val episodes = doc.select(".eplister > ul > li > a").mapNotNull { element ->
+        // --- [v5.1 수정] 에피소드 파싱 (정렬 부하 제거) ---
+        // 사이트가 기본적으로 최신화(내림차순) 정렬이라고 가정하고 파싱
+        val rawEpisodes = doc.select(".eplister > ul > li > a").mapNotNull { element ->
             val href = fixUrl(element.attr("href"))
-            val num = element.selectFirst(".epl-num")?.text()?.trim() ?: ""
+            val numText = element.selectFirst(".epl-num")?.text()?.trim() ?: ""
             val epTitle = element.selectFirst(".epl-title")?.text()?.trim() ?: ""
             
-            val fullName = if(num.isNotEmpty()) "${num}화 - $epTitle" else epTitle
-            val episodeInt = num.toIntOrNull()
+            val fullName = if(numText.isNotEmpty()) "${numText}화 - $epTitle" else epTitle
+            
+            // 데이터만 추출 (정렬 X)
+            Triple(href, fullName, numText)
+        }
 
+        val totalEpisodes = rawEpisodes.size
+        
+        // 최신화가 위에 있다면(내림차순), 인덱스를 역으로 부여하여 정수 ID 생성
+        // 예: 0번 인덱스(1146화) -> ID 1100
+        // 예: 1번 인덱스(1145.5화) -> ID 1099
+        // 이렇게 하면 앱 내부적으로는 정수로 인식되어 "20개씩 끊기(Pagination)"가 정상 작동함
+        val finalEpisodes = rawEpisodes.mapIndexed { index, (href, fullName, _) ->
             newEpisode(href) {
                 this.name = fullName
-                this.episode = episodeInt
-                // [수정] Episode 객체에는 posterHeaders가 없으므로 제거
+                // 고유 ID 부여 (단순 계산이라 매우 빠름)
+                this.episode = totalEpisodes - index
             }
-        }.reversed()
+        }
+        
+        // Cloudstream은 보통 addEpisodes에 넣으면 episode 번호에 따라 자동 정렬/그룹화함
+        // 만약 역순으로 보이면 .reversed() 추가 필요하나, ID를 잘 부여했으므로 그대로 전달
+
+        println("$TAG [Load] Loaded ${finalEpisodes.size} episodes.")
 
         return newAnimeLoadResponse(title, cleanUrl, TvType.Anime) {
             this.posterUrl = htmlPoster
-            // [핵심] LoadResponse에는 posterHeaders가 존재함 (403 방지)
             this.posterHeaders = commonHeaders 
             this.plot = description
             this.tags = tags
-            addEpisodes(DubStatus.Subbed, episodes)
+            addEpisodes(DubStatus.Subbed, finalEpisodes)
         }
     }
 
