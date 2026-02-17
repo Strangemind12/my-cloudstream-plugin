@@ -10,10 +10,10 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 
 /**
- * Anilife Provider v7.0
- * - [Fix] 링크 추출 로직 변경: Provider 페이지 HTML에서 'https://anilife.live/h/live...' URL을 직접 파싱 후 WebView 실행
- * - [Fix] 에피소드 정렬 최적화: Float 정렬 + 로그 제거 (렉 방지 및 1145.5화 정렬 지원)
- * - [Fix] 빌드 에러 방지 (posterHeaders 제거)
+ * Anilife Provider v7.1
+ * - [Fix] WebViewResolver 'referer' 파라미터 에러 수정 (headers 맵으로 전달)
+ * - [Fix] 에피소드 정렬 최적화 (Float 정렬 + 로그 제거)
+ * - [Fix] 링크 추출 로직 유지 (HTML 파싱 -> WebView 실행)
  */
 class Anilife : MainAPI() {
     override var mainUrl = "https://anilife.live"
@@ -170,7 +170,6 @@ class Anilife : MainAPI() {
 
             // 3. 실제 플레이어 주소 파싱
             // 자바스크립트 내의 "https://anilife.live/h/live?p=...&player=..." 패턴 추출
-            // 예: location.href = "https://anilife.live/h/live?p=...&player=jawcloud";
             val regex = Regex("""https://anilife\.live/h/live\?p=[^"']+(?:&player=[^"']+)*""")
             val match = regex.find(html)
             val playerUrl = match?.value
@@ -179,11 +178,11 @@ class Anilife : MainAPI() {
                 println("$TAG [LoadLinks] Found Player URL: $playerUrl")
                 
                 // 4. 추출한 플레이어 주소로 WebViewResolver 실행
-                // 이 주소로 접속해야 실제 비디오 리소스를 불러옵니다.
+                // [수정] referer 파라미터 제거 -> headers 맵에 포함
                 val webViewInterceptor = WebViewResolver(
                     Regex("""\.m3u8"""),
                     userAgent = commonHeaders["User-Agent"],
-                    referer = "https://anilife.live/"
+                    headers = mapOf("Referer" to "https://anilife.live/") // 수정된 부분
                 )
                 
                 val webViewResponse = app.get(playerUrl, headers = commonHeaders, interceptor = webViewInterceptor)
