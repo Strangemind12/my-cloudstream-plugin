@@ -9,9 +9,9 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 
 /**
- * Anilife Provider v4.0
- * - [Fix] 이미지 HTTP 403 에러 해결: posterHeaders 추가
- * - [Fix] 포스터 터널링 및 파싱 로직 유지
+ * Anilife Provider v4.1
+ * - [Fix] Episode 객체 'posterHeaders' Unresolved reference 에러 수정 (제거)
+ * - SearchResponse/LoadResponse에는 posterHeaders 유지 (이미지 403 방지)
  */
 class Anilife : MainAPI() {
     override var mainUrl = "https://anilife.live"
@@ -90,7 +90,7 @@ class Anilife : MainAPI() {
 
                 newAnimeSearchResponse(title, finalHref, TvType.Anime) {
                     this.posterUrl = poster
-                    // [핵심] 포스터 로딩 시 403 에러 방지 헤더 설정
+                    // [핵심] SearchResponse에는 posterHeaders가 존재함 (403 방지)
                     this.posterHeaders = commonHeaders
                 }
             } catch (e: Exception) {
@@ -158,14 +158,14 @@ class Anilife : MainAPI() {
             newEpisode(href) {
                 this.name = fullName
                 this.episode = episodeInt
-                // [핵심] 에피소드 썸네일에도 헤더 적용 (필요 시)
-                this.posterHeaders = commonHeaders
+                // [수정] Episode 객체에는 posterHeaders가 없으므로 제거
             }
         }.reversed()
 
         return newAnimeLoadResponse(title, cleanUrl, TvType.Anime) {
             this.posterUrl = htmlPoster
-            this.posterHeaders = commonHeaders // [핵심] 상세 페이지 포스터 헤더
+            // [핵심] LoadResponse에는 posterHeaders가 존재함 (403 방지)
+            this.posterHeaders = commonHeaders 
             this.plot = description
             this.tags = tags
             addEpisodes(DubStatus.Subbed, episodes)
