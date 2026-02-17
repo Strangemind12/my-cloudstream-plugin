@@ -9,6 +9,12 @@ import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 
+/**
+ * Anilife Provider v11.0
+ * - [Rollback] 에피소드 정렬 로직을 v4.1 방식으로 원복 (렉/오버로드 해결)
+ * - [Fix] 복잡한 정렬(sortedBy) 제거 -> HTML 순서 그대로 파싱 (가장 빠름)
+ * - [Fix] 영상 재생을 위한 WebViewResolver 로직은 유지
+ */
 class Anilife : MainAPI() {
     override var mainUrl = "https://anilife.live"
     override var name = "Anilife"
@@ -85,12 +91,6 @@ class Anilife : MainAPI() {
         return parseCommonList(doc)
     }
 
-    data class TempEpisode(
-        val url: String,
-        val fullName: String,
-        val floatNum: Float
-    )
-
     override suspend fun load(url: String): LoadResponse {
         var tunnelingPoster: String? = null
         val cleanUrl = if (url.contains("poster=")) {
@@ -116,31 +116,30 @@ class Anilife : MainAPI() {
         val description = doc.selectFirst(".synp .entry-content")?.text()?.trim()
         val tags = doc.select(".genxed a, .taged a").map { it.text() }
 
-        // [정렬 로직] Float 변환 -> 오름차순 정렬 -> ID 재부여
-        val rawEpisodes = doc.select(".eplister > ul > li > a").mapNotNull { element ->
+        // [v11.0 롤백] v4.1 방식: 단순 파싱 (정렬 X, 실수 변환 X)
+        // 리스트에 있는 순서 그대로 가져오므로 연산 비용이 '0'에 가깝습니다.
+        val episodes = doc.select(".eplister > ul > li > a").mapNotNull { element ->
             val href = fixUrl(element.attr("href"))
             val numText = element.selectFirst(".epl-num")?.text()?.trim() ?: ""
             val epTitle = element.selectFirst(".epl-title")?.text()?.trim() ?: ""
+            
             val fullName = if (numText.isNotEmpty()) "${numText}화 - $epTitle" else epTitle
-            val floatNum = numText.toFloatOrNull() ?: 0f
-            TempEpisode(href, fullName, floatNum)
-        }
+            
+            // 정수 파싱만 시도하고, 소수점(1145.5) 등은 null로 처리하여 앱이 기본값(리스트 순서 등)을 쓰게 둠
+            val epNum = numText.toIntOrNull()
 
-        val sortedEpisodes = rawEpisodes.sortedBy { it.floatNum }
-
-        val finalEpisodes = sortedEpisodes.mapIndexed { index, temp ->
-            newEpisode(temp.url) {
-                this.name = temp.fullName
-                this.episode = index + 1
+            newEpisode(href) {
+                this.name = fullName
+                this.episode = epNum
             }
-        }.reversed()
+        }.reversed() // 최신화가 위에 있다면 역순으로 뒤집어 1화부터 나오게 함
 
         return newAnimeLoadResponse(title, cleanUrl, TvType.Anime) {
             this.posterUrl = htmlPoster
             this.posterHeaders = commonHeaders
             this.plot = description
             this.tags = tags
-            addEpisodes(DubStatus.Subbed, finalEpisodes)
+            addEpisodes(DubStatus.Subbed, episodes)
         }
     }
 
@@ -151,31 +150,26 @@ class Anilife : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val cleanData = if (data.contains("poster=")) data.substringBefore("?poster=") else data
-        println("$TAG [LoadLinks] Start: $cleanData")
         
-        // 1. Extractor에게 플레이어 URL 추출 요청 (단순 파싱)
+        // 1. Extractor에게 플레이어 URL 추출 요청
         val extractor = AnilifeExtractor()
         val playerUrl = extractor.fetchPlayerUrl(cleanData)
 
         if (playerUrl != null) {
-            println("$TAG [LoadLinks] Found Player URL: $playerUrl")
-            
-            // 2. 여기서 WebViewResolver 실행 (빌드 에러 안 남)
+            // 2. MainAPI에서 WebViewResolver 실행 (영상 재생 보장)
             try {
-                // headers는 app.get에 전달, 생성자엔 Regex만 전달
                 val webViewInterceptor = WebViewResolver(
                     Regex("""\.m3u8""")
                 )
                 
                 val response = app.get(
                     playerUrl,
-                    headers = commonHeaders, // 헤더 필수
+                    headers = commonHeaders,
                     interceptor = webViewInterceptor
                 )
                 
                 val sniffedUrl = response.url
-                println("$TAG [WebView] Sniffed: $sniffedUrl")
-
+                
                 if (sniffedUrl.contains(".m3u8")) {
                      callback.invoke(
                         newExtractorLink(
@@ -191,10 +185,8 @@ class Anilife : MainAPI() {
                     return true
                 }
             } catch (e: Exception) {
-                println("$TAG [WebView] Error: ${e.message}")
+                e.printStackTrace()
             }
-        } else {
-             println("$TAG [LoadLinks] Failed to extract player URL")
         }
         return false
     }
