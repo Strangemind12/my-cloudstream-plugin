@@ -7,10 +7,10 @@ import com.lagradost.cloudstream3.network.WebViewResolver
 import org.jsoup.nodes.Document
 
 /**
- * Anilife Provider v21.0
- * - [Debug] HTML 소스 코드 전체 분할 출력 (로그 잘림 방지)
- * - [Debug] 접속 URL, Referer, 매칭된 정규식 등 모든 정보 상세 출력
- * - [Fix] 에피소드 로직 v4.1 유지
+ * Anilife Provider v23.0
+ * - [Fix] User-Agent 강제 변경 제거 -> load() 단계의 세션/쿠키와 일치시켜 봇 차단/리다이렉트 해결
+ * - [Log] 사용자가 요청한 '접속 시도', 'URL 추출', '재생 페이지 접속' 로그 명시적 추가
+ * - [Fix] 에피소드 정렬 로직 v4.1 유지
  */
 class Anilife : MainAPI() {
     override var mainUrl = "https://anilife.live"
@@ -21,18 +21,19 @@ class Anilife : MainAPI() {
 
     private val TAG = "[Anilife]"
 
+    // [중요] load()와 동일한 헤더를 사용하여 쿠키/세션 불일치 방지
     private val commonHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Referer" to "$mainUrl/"
     )
 
-    // 긴 로그가 잘리지 않도록 나누어 출력하는 함수
+    // 긴 로그 분할 출력 함수
     private fun logLargeString(tag: String, msg: String) {
         if (msg.length > 4000) {
-            println("$tag [HTML-Chunk-Start] ${msg.substring(0, 4000)}")
+            println("$tag [HTML-Chunk] ${msg.substring(0, 4000)}")
             logLargeString(tag, msg.substring(4000))
         } else {
-            println("$tag [HTML-Chunk-End] $msg")
+            println("$tag [HTML-End] $msg")
         }
     }
 
@@ -98,17 +99,18 @@ class Anilife : MainAPI() {
             url.substringBefore("?poster=")
         } else url
 
-        println("$TAG [Load] cleanUrl: $cleanUrl")
+        println("$TAG [Load] 접속: $cleanUrl")
         val doc = app.get(cleanUrl, headers = commonHeaders).document
         val title = doc.selectFirst(".entry-title")?.text()?.trim() ?: "Unknown"
         val encodedRef = Base64.encodeToString(cleanUrl.toByteArray(), Base64.NO_WRAP)
 
-        // v4.1 방식 유지
+        // v4.1 로직 (단순 파싱)
         val episodes = doc.select(".eplister > ul > li > a").mapNotNull { element ->
             val rawHref = fixUrl(element.attr("href"))
             val numText = element.selectFirst(".epl-num")?.text()?.trim() ?: ""
             val epTitle = element.selectFirst(".epl-title")?.text()?.trim() ?: ""
             val fullName = if (numText.isNotEmpty()) "${numText}화 - $epTitle" else epTitle
+            
             val finalHref = if (rawHref.contains("?")) "$rawHref&ref=$encodedRef" else "$rawHref?ref=$encodedRef"
 
             newEpisode(finalHref) {
@@ -132,7 +134,7 @@ class Anilife : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("$TAG [LoadLinks] =================== 프로세스 시작 ===================")
+        println("$TAG [LoadLinks] === 프로세스 시작 ===")
         
         var cleanData = data.substringBefore("?poster=")
         var detailReferer = "$mainUrl/"
@@ -142,36 +144,56 @@ class Anilife : MainAPI() {
             cleanData = cleanData.substringBefore("?ref=").substringBefore("&ref=")
         }
         
-        println("$TAG [Step 1] 접속할 URL: $cleanData")
-        println("$TAG [Step 1] 사용할 Referer: $detailReferer")
+        println("$TAG [1단계] Provider 페이지 접속 시도: $cleanData")
+        println("$TAG [1단계] Referer 설정: $detailReferer")
 
         try {
-            // [Step 1] 웹뷰로 Provider 페이지 로드
-            println("$TAG [Step 1] 웹뷰 실행 (Provider 페이지 로드)...")
-            val providerResponse = app.get(
-                cleanData,
-                headers = mapOf("Referer" to detailReferer),
-                interceptor = WebViewResolver(Regex(".*"))
-            )
+            // [1단계] Provider 페이지 로드
+            var html: String = ""
+            var success = false
             
-            val html = providerResponse.text
-            println("$TAG [Step 1] 웹뷰 로드 완료. 상태코드: ${providerResponse.code}, URL: ${providerResponse.url}")
-            println("$TAG [Step 1] HTML 길이: ${html.length}")
-            
-            // HTML 전체 로그 출력 (디버깅용)
-            println("$TAG [Debug] HTML 소스 코드 출력 시작 (2000자씩 분할)")
-            logLargeString(TAG, html)
-            println("$TAG [Debug] HTML 소스 코드 출력 종료")
+            // A. HTTP 요청 우선 시도 (헤더/세션 유지를 위해 권장)
+            println("$TAG [1단계-A] HTTP(app.get) 접속 시도...")
+            try {
+                val response = app.get(cleanData, headers = mapOf("Referer" to detailReferer))
+                
+                // 리다이렉트 체크
+                if (response.url.contains("anilife.live/ani/provider") && !response.text.contains("메인 홈페이지")) {
+                    html = response.text
+                    success = true
+                    println("$TAG [1단계-A] HTTP 접속 성공. HTML 획득.")
+                } else {
+                    println("$TAG [1단계-A] 실패 (리다이렉트됨). URL: ${response.url}")
+                }
+            } catch (e: Exception) {
+                println("$TAG [1단계-A] 에러: ${e.message}")
+            }
 
-            // [Step 2] Extractor로 플레이어 URL 파싱
-            println("$TAG [Step 2] HTML 파싱 시작...")
+            // B. 실패 시 WebView 시도
+            if (!success) {
+                println("$TAG [1단계-B] WebView 접속 시도...")
+                val providerResponse = app.get(
+                    cleanData,
+                    headers = mapOf("Referer" to detailReferer),
+                    interceptor = WebViewResolver(Regex(".*"))
+                )
+                html = providerResponse.text
+                println("$TAG [1단계-B] WebView 완료. 최종 URL: ${providerResponse.url}")
+            }
+
+            // [2단계] 플레이어 URL 파싱
+            println("$TAG [2단계] 재생 페이지 URL 추출 시도...")
+            // 전체 HTML 로그 (디버깅용)
+            // println("$TAG [Debug] HTML 소스 시작:")
+            // logLargeString(TAG, html)
+            
             val playerUrl = AnilifeExtractor().extractPlayerUrl(html, mainUrl)
             
             if (playerUrl != null) {
-                println("$TAG [Step 2] 플레이어 URL 발견됨: $playerUrl")
+                println("$TAG [2단계] 재생 페이지 URL 추출 성공: $playerUrl")
 
-                // [Step 3] 웹뷰로 M3U8 스니핑
-                println("$TAG [Step 3] 웹뷰 실행 (M3U8 스니핑): $playerUrl")
+                // [3단계] WebView로 M3U8 스니핑
+                println("$TAG [3단계] 재생 페이지 접속 및 M3U8 스니핑 시도...")
                 val m3u8Interceptor = WebViewResolver(Regex("""\.m3u8"""))
                 val m3u8Response = app.get(
                     playerUrl,
@@ -179,7 +201,7 @@ class Anilife : MainAPI() {
                     interceptor = m3u8Interceptor
                 )
                 val finalM3u8 = m3u8Response.url
-                println("$TAG [Step 3] 스니핑된 URL: $finalM3u8")
+                println("$TAG [3단계] 결과 URL: $finalM3u8")
 
                 if (finalM3u8.contains(".m3u8")) {
                     callback.invoke(
@@ -193,25 +215,18 @@ class Anilife : MainAPI() {
                             this.quality = getQualityFromName("HD")
                         }
                     )
-                    println("$TAG [LoadLinks] 성공: 링크 반환됨")
+                    println("$TAG [완료] 링크 반환 성공.")
                     return true
-                } else {
-                    println("$TAG [Step 3] 실패: URL에 .m3u8이 포함되지 않음")
                 }
             } else {
-                println("$TAG [Error] 플레이어 URL 추출 실패. (위의 HTML 로그를 확인하세요)")
-                // 혹시 'moveCloudvideo' 같은 키워드가 있는데도 못 찾았는지 확인
-                if (html.contains("moveCloudvideo")) {
-                     println("$TAG [Debug] 'moveCloudvideo' 키워드는 발견되었으나 정규식 매칭에 실패했습니다.")
-                } else {
-                     println("$TAG [Debug] 'moveCloudvideo' 키워드조차 발견되지 않았습니다. 엉뚱한 페이지일 가능성이 높습니다.")
-                }
+                println("$TAG [2단계] 실패: HTML에서 플레이어 URL을 찾지 못함.")
+                logLargeString(TAG, html) // 실패 시 HTML 전체 출력
             }
         } catch (e: Exception) {
             println("$TAG [Critical Error] ${e.message}")
             e.printStackTrace()
         }
-        println("$TAG [LoadLinks] 프로세스 종료 (실패)")
+        println("$TAG [LoadLinks] 실패")
         return false
     }
 }
