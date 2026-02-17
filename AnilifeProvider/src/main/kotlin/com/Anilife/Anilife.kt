@@ -1,5 +1,6 @@
 package com.anilife
 
+import android.util.Base64
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
@@ -8,10 +9,10 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 
 /**
- * Anilife Provider v2.1
- * - 포스터 파싱 로직 개선 (src 우선, fallback 처리)
- * - 제목 중복 출력 수정 (.tt vs h2)
- * - 헤더(User-Agent) 추가
+ * Anilife Provider v3.0
+ * - 포스터 터널링 구현 (목록 -> 상세 페이지로 포스터 URL 전달)
+ * - 상세 페이지 포스터 파싱 로직 강화
+ * - Base64 인코딩/디코딩 적용
  */
 class Anilife : MainAPI() {
     override var mainUrl = "https://anilife.live"
@@ -22,7 +23,6 @@ class Anilife : MainAPI() {
 
     private val TAG = "[Anilife]"
 
-    // 차단 방지용 공통 헤더
     private val commonHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Referer" to "$mainUrl/"
@@ -62,35 +62,34 @@ class Anilife : MainAPI() {
     private fun parseCommonList(doc: Document): List<SearchResponse> {
         val items = doc.select(".listupd > article.bs").mapNotNull { element ->
             try {
-                // 1. 링크 파싱
+                // 1. 기본 정보 파싱
                 val aTag = element.selectFirst("div.bsx > a") ?: return@mapNotNull null
-                val href = fixUrl(aTag.attr("href"))
+                val rawHref = fixUrl(aTag.attr("href"))
 
-                // 2. 제목 파싱 (중복 방지)
-                // 구조: <div class="tt"> 텍스트 <h2 itemprop="headline"> 제목 </h2> </div>
-                // h2가 있으면 h2의 텍스트만 가져오고, 없으면 .tt 전체 텍스트 사용
                 val titleElement = element.selectFirst(".tt h2") ?: element.selectFirst(".tt")
                 val title = titleElement?.text()?.trim() ?: "Unknown"
 
-                // 3. 포스터 파싱 (v2.1 개선)
-                // 구조: <div class="limit"> ... <img src="..."> </div>
                 val imgTag = element.selectFirst("img")
                 var poster = imgTag?.attr("src")
-                
-                // src가 비어있을 경우를 대비해 다른 속성 확인
-                if (poster.isNullOrEmpty()) {
-                    poster = imgTag?.attr("data-src")
-                }
-                if (poster.isNullOrEmpty()) {
-                    poster = imgTag?.attr("data-original")
-                }
-                
+                if (poster.isNullOrEmpty()) poster = imgTag?.attr("data-src")
+                if (poster.isNullOrEmpty()) poster = imgTag?.attr("data-original")
                 poster = poster?.let { fixUrl(it) } ?: ""
 
-                // 디버깅 로그 (필요시 주석 해제)
-                // println("$TAG [Item] Title: $title | Poster: $poster")
+                // 2. 포스터 터널링 (URL에 포스터 정보 숨기기)
+                // 상세 페이지에서 포스터를 못 불러올 경우를 대비해, 여기서 찾은 포스터 URL을 Base64로 인코딩해서 넘김
+                val finalHref = if (poster.isNotEmpty()) {
+                    try {
+                        val encodedPoster = Base64.encodeToString(poster.toByteArray(), Base64.NO_WRAP)
+                        if (rawHref.contains("?")) "$rawHref&poster=$encodedPoster" 
+                        else "$rawHref?poster=$encodedPoster"
+                    } catch (e: Exception) {
+                        rawHref
+                    }
+                } else {
+                    rawHref
+                }
 
-                newAnimeSearchResponse(title, href, TvType.Anime) {
+                newAnimeSearchResponse(title, finalHref, TvType.Anime) {
                     this.posterUrl = poster
                 }
             } catch (e: Exception) {
@@ -110,21 +109,51 @@ class Anilife : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        println("$TAG [Load] Details URL: $url")
-        val doc = app.get(url, headers = commonHeaders).document
+        println("$TAG [Load] Raw URL: $url")
+        
+        // 1. 터널링된 포스터 URL 추출 (Base64 디코딩)
+        var tunnelingPoster: String? = null
+        val cleanUrl = if (url.contains("poster=")) {
+            try {
+                val posterParam = url.substringAfter("poster=")
+                // 파라미터가 더 있다면(&) 제거
+                val encodedPoster = if (posterParam.contains("&")) posterParam.substringBefore("&") else posterParam
+                
+                tunnelingPoster = String(Base64.decode(encodedPoster, Base64.NO_WRAP))
+                println("$TAG [Load] Found tunneling poster: $tunnelingPoster")
+                
+                // 실제 요청할 URL은 파라미터 제거
+                url.substringBefore("?poster=")
+            } catch (e: Exception) {
+                println("$TAG [Load] Tunneling decode failed: ${e.message}")
+                url
+            }
+        } else {
+            url
+        }
+
+        println("$TAG [Load] Requesting Details: $cleanUrl")
+        val doc = app.get(cleanUrl, headers = commonHeaders).document
 
         val title = doc.selectFirst(".entry-title")?.text()?.trim() ?: "Unknown"
         
-        // 상세 페이지 포스터 파싱
-        val poster = doc.selectFirst(".thumb img")?.let { img ->
+        // 2. HTML에서 포스터 파싱 시도 (제공된 소스 기준 .thumb img)
+        var htmlPoster = doc.selectFirst(".thumb img")?.let { img ->
             img.attr("src").ifEmpty { img.attr("data-src") }
         }?.let { fixUrl(it) }
+
+        // 3. 포스터 유효성 검사 및 터널링 데이터 사용
+        // HTML 포스터가 없거나, 메인 URL과 같거나(잘못된 로드), 아이콘/로고 등인 경우
+        if (htmlPoster.isNullOrEmpty() || htmlPoster == mainUrl || htmlPoster == "$mainUrl/") {
+            println("$TAG [Load] HTML poster invalid ($htmlPoster). Using tunneling poster.")
+            if (!tunnelingPoster.isNullOrEmpty()) {
+                htmlPoster = tunnelingPoster
+            }
+        }
 
         val description = doc.selectFirst(".synp .entry-content")?.text()?.trim()
         val tags = doc.select(".genxed a, .taged a").map { it.text() }
         
-        println("$TAG [Load] Title: $title")
-
         // 에피소드 파싱
         val episodes = doc.select(".eplister > ul > li > a").mapNotNull { element ->
             val href = fixUrl(element.attr("href"))
@@ -140,10 +169,8 @@ class Anilife : MainAPI() {
             }
         }.reversed()
 
-        println("$TAG [Load] Episodes found: ${episodes.size}")
-
-        return newAnimeLoadResponse(title, url, TvType.Anime) {
-            this.posterUrl = poster
+        return newAnimeLoadResponse(title, cleanUrl, TvType.Anime) {
+            this.posterUrl = htmlPoster
             this.plot = description
             this.tags = tags
             addEpisodes(DubStatus.Subbed, episodes)
@@ -156,8 +183,11 @@ class Anilife : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("$TAG [LoadLinks] Start: $data")
+        // loadLinks로 넘어오는 data에도 ?poster=... 가 붙어있을 수 있으므로 제거
+        val cleanData = if (data.contains("poster=")) data.substringBefore("?poster=") else data
+        
+        println("$TAG [LoadLinks] Start: $cleanData")
         val extractor = AnilifeExtractor()
-        return extractor.extract(data, callback)
+        return extractor.extract(cleanData, callback)
     }
 }
