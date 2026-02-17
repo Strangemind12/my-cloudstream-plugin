@@ -27,9 +27,9 @@ import kotlin.concurrent.thread
 import kotlin.coroutines.resume
 
 /**
- * Anilife Proxy Extractor v60.0
- * - [Feature] 'shouldInterceptRequest'를 이용한 네트워크 레벨 키 후킹 구현
- * - [Logic] 웹뷰가 enc.bin을 요청할 때 이를 가로채어 데이터를 수집하고 로컬 프록시로 전달
+ * Anilife Proxy Extractor v61.0
+ * - [Fix] thread 내에서 suspend 함수(app.get) 호출 시 runBlocking으로 감싸 빌드 에러 해결
+ * - [Feature] WebViewClient.shouldInterceptRequest를 이용한 네트워크 레벨 키 후킹 구현
  */
 class AnilifeProxyExtractor : ExtractorApi() {
     override val name = "AnilifeProxy"
@@ -71,11 +71,11 @@ class AnilifeProxyExtractor : ExtractorApi() {
     ): Boolean {
         synchronized(this) { currentProxyServer?.stop(); currentProxyServer = null }
 
-        println("[Anilife][Proxy] 1. 세션 전용 키 저장소 생성")
+        println("[Anilife][Proxy] 1. 세션 전용 키 저장소 초기화")
         val sessionKeys = Collections.synchronizedSet(mutableSetOf<String>())
         
-        println("[Anilife][Proxy] 2. 웹뷰 네트워크 인터셉트 시작 (10초)...")
-        // [v60.0] 네트워크 인터셉트 방식으로 키 수집
+        println("[Anilife][Proxy] 2. 웹뷰 네트워크 인터셉트 시작 (10초 대기)...")
+        // 네트워크 인터셉트 방식으로 키 수집 시도
         runWebViewNetworkHook(playerUrl, referer, ssid, cookies, sessionKeys)
 
         val proxy = ProxyWebServer(sessionKeys).apply { 
@@ -103,16 +103,19 @@ class AnilifeProxyExtractor : ExtractorApi() {
             content.lines().forEach { line ->
                 val trimmed = line.trim()
                 if (trimmed.isEmpty()) return@forEach
+                
                 when {
                     trimmed.startsWith("#EXT-X-KEY") -> {
                         val match = Regex("""URI="([^"]+)"""").find(trimmed)
                         if (match != null) {
                             val absKey = baseUri.resolve(match.groupValues[1]).toString()
                             val encKey = java.net.URLEncoder.encode(absKey, "UTF-8")
+                            // 키 요청을 로컬 프록시로 변경
                             sb.append(trimmed.replace(match.groupValues[1], "http://127.0.0.1:${proxy.port}/key?url=$encKey")).append("\n")
                         } else sb.append(trimmed).append("\n")
                     }
                     !trimmed.startsWith("#") -> {
+                        // 세그먼트 요청을 로컬 프록시로 변경
                         val absSeg = baseUri.resolve(trimmed).toString()
                         proxy.setTestSegment(absSeg)
                         val encSeg = java.net.URLEncoder.encode(absSeg, "UTF-8")
@@ -125,20 +128,20 @@ class AnilifeProxyExtractor : ExtractorApi() {
             proxy.setPlaylist(sb.toString())
             val finalProxyUrl = "http://127.0.0.1:${proxy.port}/playlist.m3u8"
             
-            println("[Anilife][Proxy] 4. 프록시 링크 반환: $finalProxyUrl")
+            println("[Anilife][Proxy] 4. 프록시 링크 반환 완료: $finalProxyUrl")
             callback(newExtractorLink(name, name, finalProxyUrl, ExtractorLinkType.M3U8) {
-                this.referer = ""
+                this.referer = "" // 스크린샷 no-referrer 반영
                 this.headers = proxy.getCurrentHeaders()
             })
             return true
 
         } catch (e: Exception) {
-            println("[Anilife][Proxy] Error: ${e.message}")
+            println("[Anilife][Proxy] 에러 발생: ${e.message}")
             return false
         }
     }
 
-    // [v60.0 핵심] 네트워크 인터셉트 로직
+    // [v61.0 Fix] thread 내부 runBlocking 추가로 빌드 에러 해결
     private suspend fun runWebViewNetworkHook(
         url: String, 
         referer: String, 
@@ -159,26 +162,29 @@ class AnilifeProxyExtractor : ExtractorApi() {
                 webView.webViewClient = object : WebViewClient() {
                     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                         val reqUrl = request?.url.toString()
-                        // enc.bin 또는 key가 포함된 요청 감지
+                        // enc.bin 또는 key가 포함된 요청을 감지
                         if (reqUrl.contains("enc.bin") || reqUrl.contains("/key")) {
-                            println("[Anilife][Intercept] 키 요청 감지: $reqUrl")
+                            println("[Anilife][Intercept] 키 요청 감지됨: $reqUrl")
                             thread {
-                                try {
-                                    val headers = mutableMapOf(
-                                        "User-Agent" to DESKTOP_UA,
-                                        "Referer" to referer,
-                                        "Cookie" to cookies
-                                    )
-                                    if (!ssid.isNullOrBlank()) headers["x-user-ssid"] = ssid
-                                    
-                                    val response = app.get(reqUrl, headers = headers)
-                                    val bytes = response.body.bytes()
-                                    if (bytes.size == 16) {
-                                        val hex = bytes.joinToString("") { "%02x".format(it) }
-                                        if (sessionKeys.add(hex)) println("[Anilife][Intercept] 키 확보 성공: $hex")
+                                // [중요] suspend 함수인 app.get 호출을 위해 runBlocking 사용
+                                runBlocking {
+                                    try {
+                                        val headers = mutableMapOf(
+                                            "User-Agent" to DESKTOP_UA,
+                                            "Referer" to referer,
+                                            "Cookie" to cookies
+                                        )
+                                        if (!ssid.isNullOrBlank()) headers["x-user-ssid"] = ssid
+                                        
+                                        val response = app.get(reqUrl, headers = headers)
+                                        val bytes = response.body.bytes()
+                                        if (bytes.size == 16) {
+                                            val hex = bytes.joinToString("") { "%02x".format(it) }
+                                            if (sessionKeys.add(hex)) println("[Anilife][Intercept] 키 데이터 확보 성공: $hex")
+                                        }
+                                    } catch (e: Exception) {
+                                        println("[Anilife][Intercept] 키 요청 실패: ${e.message}")
                                     }
-                                } catch (e: Exception) {
-                                    println("[Anilife][Intercept] 실패: ${e.message}")
                                 }
                             }
                         }
@@ -186,7 +192,7 @@ class AnilifeProxyExtractor : ExtractorApi() {
                     }
                 }
                 
-                // 10초 동안 네트워크 감시 후 종료
+                // 10초 대기 후 종료
                 handler.postDelayed({ if (cont.isActive) { webView.destroy(); cont.resume(Unit) } }, 10000)
                 webView.loadUrl(url, mapOf("Referer" to referer))
             } catch (e: Exception) { if (cont.isActive) cont.resume(Unit) }
@@ -247,11 +253,6 @@ class AnilifeProxyExtractor : ExtractorApi() {
         private fun verify(): ByteArray? = runBlocking {
             val url = testSegment ?: return@runBlocking null
             println("[Anilife][Verify] 키 검증 시도 (후보: ${sessionKeys.size}개)")
-            // 수집된 키가 없으면 직접 요청 시도 (fallback)
-            if (sessionKeys.isEmpty()) {
-                println("[Anilife][Verify] 수집된 키 없음. 프록시 내부에서 직접 키 요청 시도...")
-                // 여기에 로컬 프록시가 직접 키 URL을 호출하는 로직 추가 가능
-            }
             try {
                 val data = app.get(url, headers = headers).body.bytes()
                 sessionKeys.forEach { hex ->
@@ -260,8 +261,9 @@ class AnilifeProxyExtractor : ExtractorApi() {
                         val cipher = Cipher.getInstance("AES/CBC/NoPadding")
                         cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(ByteArray(16)))
                         val dec = cipher.doFinal(data.take(1024).toByteArray())
+                        // MPEG-TS Sync Byte (0x47) 검증
                         if (dec.size > 188 && dec[0] == 0x47.toByte() && dec[188] == 0x47.toByte()) {
-                            println("[Anilife][Verify] 성공: $hex")
+                            println("[Anilife][Verify] 검증 성공: $hex")
                             return@runBlocking key
                         }
                     } catch (e: Exception) {}
