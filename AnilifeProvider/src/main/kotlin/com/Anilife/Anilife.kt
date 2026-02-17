@@ -7,9 +7,9 @@ import com.lagradost.cloudstream3.network.WebViewResolver
 import org.jsoup.nodes.Document
 
 /**
- * Anilife Provider v31.0
- * - [Critical Fix] 3단계 스니핑 타겟을 '중간 API 주소'에서 '최종 영상 주소(playlist.m3u8)'로 변경
- * -> 사용자가 브라우저에서 확인한 최종 주소 패턴을 기다리도록 수정하여 리다이렉트 문제 해결
+ * Anilife Provider v32.0
+ * - [Feature] 'm3u8/st' API 주소를 감지하여 'v1/manifest/b/.../playlist.m3u8' 형태로 직접 변환(재조립)
+ * - [Fix] 리다이렉트를 기다리다 발생하는 Timeout 문제 해결
  * - [Fix] v30.0의 웹뷰 통합 로직 유지
  */
 class Anilife : MainAPI() {
@@ -102,7 +102,6 @@ class Anilife : MainAPI() {
 
         println("$TAG [Load] 접속 시도: $cleanUrl")
         
-        // 리다이렉트된 최종 URL 획득
         val response = app.get(cleanUrl, headers = commonHeaders)
         val doc = response.document
         val finalUrl = response.url
@@ -117,8 +116,6 @@ class Anilife : MainAPI() {
             val numText = element.selectFirst(".epl-num")?.text()?.trim() ?: ""
             val epTitle = element.selectFirst(".epl-title")?.text()?.trim() ?: ""
             val fullName = if (numText.isNotEmpty()) "${numText}화 - $epTitle" else epTitle
-            
-            // ref 파라미터 추가
             val finalHref = if (rawHref.contains("?")) "$rawHref&ref=$encodedRef" else "$rawHref?ref=$encodedRef"
 
             newEpisode(finalHref) {
@@ -142,7 +139,7 @@ class Anilife : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("$TAG [LoadLinks] === 프로세스 시작 (v31.0) ===")
+        println("$TAG [LoadLinks] === 프로세스 시작 (v32.0) ===")
         
         var cleanData = data.substringBefore("?poster=")
         var detailReferer = "$mainUrl/"
@@ -190,12 +187,12 @@ class Anilife : MainAPI() {
             
             if (playerUrl != null) {
                 println("$TAG [2단계] 추출 성공: $playerUrl")
-                println("$TAG [3단계] 최종 playlist.m3u8 대기 중...")
+                println("$TAG [3단계] M3U8 API 스니핑 및 재조립 시도...")
 
-                // [3단계] WebView로 플레이어 페이지 접속 -> "playlist.m3u8"이 나올 때까지 대기
+                // [3단계] WebView로 플레이어 페이지 접속 -> 'm3u8' 키워드 감지
                 try {
-                    // [중요] 정규식을 "playlist.m3u8"로 구체화하여 중간 API 주소 무시
-                    val m3u8Interceptor = WebViewResolver(Regex("""playlist\.m3u8"""))
+                    // "m3u8"을 포함하는 모든 URL을 감지 (st 주소도 포함)
+                    val m3u8Interceptor = WebViewResolver(Regex("""m3u8"""))
                     val m3u8Response = app.get(
                         playerUrl,
                         headers = mapOf(
@@ -204,10 +201,18 @@ class Anilife : MainAPI() {
                         ),
                         interceptor = m3u8Interceptor
                     )
-                    val finalM3u8 = m3u8Response.url
-                    println("$TAG [3단계] 최종 결과 URL: $finalM3u8")
+                    var finalM3u8 = m3u8Response.url
+                    println("$TAG [3단계] 스니핑된 원본 URL: $finalM3u8")
 
-                    if (finalM3u8.contains("playlist.m3u8")) {
+                    // [v32.0 핵심] URL 재조립 (API 주소 -> 최종 영상 주소)
+                    if (finalM3u8.contains("/m3u8/st/")) {
+                        println("$TAG [3단계] API 주소 감지됨. 재조립 수행...")
+                        // https://api.gcdn.app/m3u8/st/{DATA}  -->  https://api.gcdn.app/v1/manifest/b/{DATA}/playlist.m3u8
+                        finalM3u8 = finalM3u8.replace("/m3u8/st/", "/v1/manifest/b/") + "/master.m3u8"
+                        println("$TAG [3단계] 재조립된 최종 URL: $finalM3u8")
+                    }
+
+                    if (finalM3u8.contains("m3u8")) {
                         callback.invoke(
                             newExtractorLink(
                                 source = name,
@@ -223,7 +228,7 @@ class Anilife : MainAPI() {
                         println("$TAG [완료] 링크 반환 성공.")
                         return true
                     } else {
-                        println("$TAG [3단계] 실패: 스니핑된 주소가 playlist.m3u8이 아닙니다.")
+                        println("$TAG [3단계] 실패: 유효한 m3u8 주소를 만들지 못했습니다.")
                     }
                 } catch (e: Exception) {
                     println("$TAG [3단계] WebView 에러: ${e.message}")
