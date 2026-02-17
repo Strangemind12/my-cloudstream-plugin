@@ -8,10 +8,9 @@ import com.lagradost.cloudstream3.network.WebViewResolver
 import org.jsoup.nodes.Document
 
 /**
- * Anilife Provider v61.0
- * - [Fix] Extractor.kt 빌드 에러(Suspension function call) 수정에 따른 버전 동기화
- * - [Feature] 메인 페이지(7개 카테고리), 포스터 터널링, 플롯/장르 파싱 로직 포함
- * - [Feature] 네트워크 인터셉트 방식의 키 후킹 및 로컬 프록시 재생 엔진 통합
+ * Anilife Provider v63.0
+ * - [Sync] Extractor.kt의 슬라이딩 윈도우 키 검증 로직 업데이트 반영
+ * - [Maintain] v4.1 메타데이터 및 v57.0 프록시 통합 로직 유지
  */
 class Anilife : MainAPI() {
     override var mainUrl = "https://anilife.live"
@@ -38,7 +37,6 @@ class Anilife : MainAPI() {
         }
     }
 
-    // 메인 페이지 카테고리 구성
     override val mainPage = mainPageOf(
         "/top20" to "실시간 TOP 20",
         "/vodtype/categorize/TV/1" to "TV 애니메이션",
@@ -57,7 +55,7 @@ class Anilife : MainAPI() {
         return try {
             val doc = app.get(url, headers = commonHeaders).document
             val home = parseCommonList(doc)
-            println("$TAG [MainPage] 파싱 완료: ${home.size}개 항목")
+            println("$TAG [MainPage] 파싱 완료: ${home.size}개")
             newHomePageResponse(request.name, home)
         } catch (e: Exception) {
             println("$TAG [MainPage] 에러: ${e.message}")
@@ -70,19 +68,14 @@ class Anilife : MainAPI() {
             try {
                 val aTag = element.selectFirst("div.bsx > a") ?: return@mapNotNull null
                 val rawHref = fixUrl(aTag.attr("href"))
-                // 제목 중복 방지
                 val title = (element.selectFirst(".tt h2") ?: element.selectFirst(".tt"))?.text()?.trim() ?: "Unknown"
-                
                 val imgTag = element.selectFirst("img")
                 var poster = imgTag?.attr("src") ?: imgTag?.attr("data-src") ?: ""
                 poster = fixUrl(poster)
-
-                // 포스터 터널링 (상세페이지 전달용)
                 val finalHref = if (poster.isNotEmpty()) {
                     val encoded = Base64.encodeToString(poster.toByteArray(), Base64.NO_WRAP)
                     if (rawHref.contains("?")) "$rawHref&poster=$encoded" else "$rawHref?poster=$encoded"
                 } else rawHref
-
                 newAnimeSearchResponse(title, finalHref, TvType.Anime) {
                     this.posterUrl = poster
                     this.posterHeaders = commonHeaders
@@ -99,7 +92,6 @@ class Anilife : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         println("$TAG [Load] 분석 시작: $url")
-        
         var tunnelingPoster: String? = null
         val cleanUrl = if (url.contains("poster=")) {
             val posterParam = url.substringAfter("poster=")
@@ -122,7 +114,6 @@ class Anilife : MainAPI() {
             val epTitle = element.selectFirst(".epl-title")?.text()?.trim() ?: ""
             val fullName = if (numText.isNotEmpty()) "${numText}화 - $epTitle" else epTitle
             val finalHref = if (rawHref.contains("?")) "$rawHref&ref=$encodedRef" else "$rawHref?ref=$encodedRef"
-
             newEpisode(finalHref) {
                 this.name = fullName
                 this.episode = numText.toIntOrNull()
@@ -144,7 +135,7 @@ class Anilife : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("$TAG [LoadLinks] =================== v61.0 시작 ===================")
+        println("$TAG [LoadLinks] =================== v63.0 시작 ===================")
         
         var cleanData = data.substringBefore("?poster=")
         var detailReferer = "$mainUrl/"
@@ -157,19 +148,16 @@ class Anilife : MainAPI() {
         }
 
         try {
-            // [1단계] 플레이어 페이지 로드
-            println("$TAG [Step 1] 웹뷰 로드 중: $cleanData")
+            println("$TAG [Step 1] 웹뷰 로드: $cleanData")
             val webResponse = app.get(
                 cleanData, 
                 headers = mapOf("Referer" to detailReferer, "User-Agent" to pcUserAgent), 
                 interceptor = WebViewResolver(Regex(".*"))
             )
 
-            // [2단계] 플레이어 URL 파싱
             val playerUrl = AnilifeProxyExtractor().extractPlayerUrl(webResponse.text, mainUrl) ?: return false
-            println("$TAG [Step 2] 플레이어 주소 획득: $playerUrl")
+            println("$TAG [Step 2] 플레이어 주소: $playerUrl")
 
-            // [3단계] API 스니핑
             println("$TAG [Step 3] API 주소 탐색...")
             val gcdnInterceptor = WebViewResolver(Regex(""".*api\.gcdn\.app.*"""))
             val gcdnResponse = app.get(
@@ -180,7 +168,6 @@ class Anilife : MainAPI() {
             val sniffedUrl = gcdnResponse.url
             println("$TAG [Step 3] 가로챈 URL: $sniffedUrl")
 
-            // [4단계] 쿠키 및 보안 정보 추출
             val finalCookies = CookieManager.getInstance().getCookie("https://anilife.live") ?: ""
             var xUserSsid: String? = null
             var finalM3u8: String? = null
@@ -198,7 +185,6 @@ class Anilife : MainAPI() {
                 finalM3u8 = sniffedUrl
             }
 
-            // [5단계] 네트워크 인터셉트 엔진 가동 (Referer 포함)
             if (finalM3u8 != null) {
                 println("$TAG [Step 5] 키 후킹 엔진 시작: $finalM3u8")
                 return AnilifeProxyExtractor().extractWithProxy(
