@@ -7,10 +7,10 @@ import com.lagradost.cloudstream3.network.WebViewResolver
 import org.jsoup.nodes.Document
 
 /**
- * Anilife Provider v29.0
- * - [Feature] M3U8 링크 추출 후, 플레이어에게 넘기기 전에 내용을 직접 다운로드하여 '#EXTM3U' 헤더 유무 검증
- * - [Debug] 검증 실패 시(차단됨) 서버가 반환한 실제 내용(HTML 등)을 로그에 출력하여 원인 규명
- * - [Fix] v28.0의 로직(완전 웹뷰, 모바일 UA, 리다이렉트 추적) 계승
+ * Anilife Provider v31.0
+ * - [Critical Fix] 3단계 스니핑 타겟을 '중간 API 주소'에서 '최종 영상 주소(playlist.m3u8)'로 변경
+ * -> 사용자가 브라우저에서 확인한 최종 주소 패턴을 기다리도록 수정하여 리다이렉트 문제 해결
+ * - [Fix] v30.0의 웹뷰 통합 로직 유지
  */
 class Anilife : MainAPI() {
     override var mainUrl = "https://anilife.live"
@@ -142,7 +142,7 @@ class Anilife : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("$TAG [LoadLinks] === 프로세스 시작 (v29.0) ===")
+        println("$TAG [LoadLinks] === 프로세스 시작 (v31.0) ===")
         
         var cleanData = data.substringBefore("?poster=")
         var detailReferer = "$mainUrl/"
@@ -190,11 +190,12 @@ class Anilife : MainAPI() {
             
             if (playerUrl != null) {
                 println("$TAG [2단계] 추출 성공: $playerUrl")
-                println("$TAG [3단계] M3U8 스니핑 시도...")
+                println("$TAG [3단계] 최종 playlist.m3u8 대기 중...")
 
-                // [3단계] WebView로 플레이어 페이지 접속 -> M3U8 낚아채기
+                // [3단계] WebView로 플레이어 페이지 접속 -> "playlist.m3u8"이 나올 때까지 대기
                 try {
-                    val m3u8Interceptor = WebViewResolver(Regex("""m3u8"""))
+                    // [중요] 정규식을 "playlist.m3u8"로 구체화하여 중간 API 주소 무시
+                    val m3u8Interceptor = WebViewResolver(Regex("""playlist\.m3u8"""))
                     val m3u8Response = app.get(
                         playerUrl,
                         headers = mapOf(
@@ -204,53 +205,32 @@ class Anilife : MainAPI() {
                         interceptor = m3u8Interceptor
                     )
                     val finalM3u8 = m3u8Response.url
-                    println("$TAG [3단계] 스니핑 URL: $finalM3u8")
+                    println("$TAG [3단계] 최종 결과 URL: $finalM3u8")
 
-                    if (finalM3u8.contains("m3u8")) {
-                        // [v29.0 추가] 4단계: M3U8 헤더 검증
-                        println("$TAG [4단계] M3U8 내용 검증 시도...")
-                        
-                        val checkResponse = app.get(
-                            finalM3u8,
-                            headers = mapOf(
-                                "User-Agent" to mobileUserAgent,
-                                "Referer" to playerUrl // 플레이어 URL을 Referer로 사용
-                            )
+                    if (finalM3u8.contains("playlist.m3u8")) {
+                        callback.invoke(
+                            newExtractorLink(
+                                source = name,
+                                name = name,
+                                url = finalM3u8,
+                                type = ExtractorLinkType.M3U8
+                            ) {
+                                this.referer = playerUrl
+                                this.headers = mapOf("User-Agent" to mobileUserAgent)
+                                this.quality = getQualityFromName("HD")
+                            }
                         )
-                        
-                        val content = checkResponse.text.trim()
-                        
-                        if (content.startsWith("#EXTM3U")) {
-                            println("$TAG [4단계] 검증 성공! 유효한 M3U8 파일입니다.")
-                            
-                            callback.invoke(
-                                newExtractorLink(
-                                    source = name,
-                                    name = name,
-                                    url = finalM3u8,
-                                    type = ExtractorLinkType.M3U8
-                                ) {
-                                    this.referer = playerUrl
-                                    this.headers = mapOf("User-Agent" to mobileUserAgent)
-                                    this.quality = getQualityFromName("HD")
-                                }
-                            )
-                            println("$TAG [완료] 링크 반환 성공.")
-                            return true
-                        } else {
-                            println("$TAG [4단계] 검증 실패: 내용이 #EXTM3U로 시작하지 않습니다.")
-                            println("$TAG [Debug] 응답 내용(앞부분): ${content.take(500)}")
-                            // 필요시 전체 내용 출력
-                            // logLargeString(TAG, content)
-                        }
+                        println("$TAG [완료] 링크 반환 성공.")
+                        return true
                     } else {
-                        println("$TAG [3단계] 실패: 스니핑된 주소에 m3u8이 없습니다.")
+                        println("$TAG [3단계] 실패: 스니핑된 주소가 playlist.m3u8이 아닙니다.")
                     }
                 } catch (e: Exception) {
-                    println("$TAG [3단계/4단계] 에러: ${e.message}")
+                    println("$TAG [3단계] WebView 에러: ${e.message}")
                 }
             } else {
                 println("$TAG [2단계] 실패: HTML에서 플레이어 주소를 찾지 못했습니다.")
+                logLargeString(TAG, html)
             }
         } catch (e: Exception) {
             println("$TAG [Critical Error] ${e.message}")
