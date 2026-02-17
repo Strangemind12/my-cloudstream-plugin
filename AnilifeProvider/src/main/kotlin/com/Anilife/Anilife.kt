@@ -7,10 +7,10 @@ import com.lagradost.cloudstream3.network.WebViewResolver
 import org.jsoup.nodes.Document
 
 /**
- * Anilife Provider v36.0
- * - [Feature] 최종 링크 접속 실패 시, 서버가 반환한 HTML 소스 코드 전체를 로그에 출력 (원인 분석용)
- * - [Fix] 4단계 검증 과정을 WebView로 수행하여 403 Forbidden 페이지의 내용까지 확실하게 캡처
- * - [Fix] v35.0의 헤더(PC UA, Referer) 동기화 로직 유지
+ * Anilife Provider v37.0
+ * - [Fix] URL 재조립 시 이중 슬래시(//) 방지 및 '/1080/playlist.m3u8' 패턴 적용
+ * - [Debug] 서버 응답 로그가 잘리지 않도록 전체 출력 로직 개선
+ * - [Fix] v35.0의 PC User-Agent 및 헤더 설정 유지
  */
 class Anilife : MainAPI() {
     override var mainUrl = "https://anilife.live"
@@ -21,7 +21,7 @@ class Anilife : MainAPI() {
 
     private val TAG = "[Anilife]"
 
-    // PC User-Agent (Chrome 144)
+    // PC User-Agent (성공한 브라우저 헤더 기준)
     private val pcUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
 
     private val commonHeaders = mapOf(
@@ -29,12 +29,13 @@ class Anilife : MainAPI() {
         "Referer" to "$mainUrl/"
     )
 
-    private fun logLargeString(tag: String, msg: String) {
+    // 로그가 4000자를 넘어도 모두 출력되도록 재귀 호출
+    private fun logFullContent(tag: String, msg: String) {
         if (msg.length > 4000) {
-            println("$tag [HTML-Chunk] ${msg.substring(0, 4000)}")
-            logLargeString(tag, msg.substring(4000))
+            println("$tag [Log-Part] ${msg.substring(0, 4000)}")
+            logFullContent(tag, msg.substring(4000))
         } else {
-            println("$tag [HTML-End] $msg")
+            println("$tag [Log-End] $msg")
         }
     }
 
@@ -102,6 +103,7 @@ class Anilife : MainAPI() {
 
         println("$TAG [Load] 접속 시도: $cleanUrl")
         
+        // 리다이렉트된 최종 URL 획득
         val response = app.get(cleanUrl, headers = commonHeaders)
         val doc = response.document
         val finalUrl = response.url
@@ -116,6 +118,8 @@ class Anilife : MainAPI() {
             val numText = element.selectFirst(".epl-num")?.text()?.trim() ?: ""
             val epTitle = element.selectFirst(".epl-title")?.text()?.trim() ?: ""
             val fullName = if (numText.isNotEmpty()) "${numText}화 - $epTitle" else epTitle
+            
+            // ref 파라미터 추가
             val finalHref = if (rawHref.contains("?")) "$rawHref&ref=$encodedRef" else "$rawHref?ref=$encodedRef"
 
             newEpisode(finalHref) {
@@ -139,7 +143,7 @@ class Anilife : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("$TAG [LoadLinks] === 프로세스 시작 (v36.0) ===")
+        println("$TAG [LoadLinks] === 프로세스 시작 (v37.0) ===")
         
         var cleanData = data.substringBefore("?poster=")
         var detailReferer = "$mainUrl/"
@@ -160,6 +164,7 @@ class Anilife : MainAPI() {
         try {
             // [1단계] WebView로 Provider 페이지 접속
             println("$TAG [1단계] WebView 접속 시도 (PC UA)...")
+            
             val webResponse = app.get(
                 cleanData, 
                 headers = mapOf("Referer" to detailReferer, "User-Agent" to pcUserAgent), 
@@ -199,17 +204,27 @@ class Anilife : MainAPI() {
                     var finalM3u8 = m3u8Response.url
                     println("$TAG [3단계] 스니핑된 원본 URL: $finalM3u8")
 
-                    // URL 재조립 (API 주소 -> 최종 영상 주소)
+                    // [v37.0 수정] URL 재조립 정교화 (이중 슬래시 방지 및 1080 추가)
                     if (finalM3u8.contains("/m3u8/st/")) {
                         println("$TAG [3단계] API 주소 감지됨. 재조립 수행...")
-                        finalM3u8 = finalM3u8.replace("/m3u8/st/", "/v1/manifest/b/") + "/playlist.m3u8"
+                        
+                        // 1. 기본 API 경로 변경
+                        var tempUrl = finalM3u8.replace("/m3u8/st/", "/v1/manifest/b/")
+                        
+                        // 2. 뒤쪽 슬래시 제거 (이중 슬래시 방지)
+                        if (tempUrl.endsWith("/")) {
+                            tempUrl = tempUrl.substring(0, tempUrl.length - 1)
+                        }
+                        
+                        // 3. 브라우저 로그 기반 경로(/1080/playlist.m3u8) 추가
+                        finalM3u8 = "$tempUrl/1080/playlist.m3u8"
+                        
                         println("$TAG [3단계] 재조립된 최종 URL: $finalM3u8")
                     }
 
                     if (finalM3u8.contains("m3u8")) {
-                        // [v36.0 추가] 4단계: 최종 링크 사전 검증 (에러 원인 파악용)
-                        // WebView를 다시 사용하여 403 페이지 내용까지 긁어옴
-                        println("$TAG [4단계] 최종 링크 접속 테스트 및 내용 확인 중...")
+                        // [v37.0 수정] 4단계: 최종 링크 사전 검증 및 전체 로그 출력
+                        println("$TAG [4단계] 최종 링크 접속 테스트...")
                         val checkResponse = app.get(
                             finalM3u8,
                             headers = mapOf(
@@ -218,11 +233,11 @@ class Anilife : MainAPI() {
                                 "Origin" to "https://anilife.live",
                                 "Accept" to "*/*"
                             ),
-                            interceptor = WebViewResolver(Regex(".*")) // 모든 내용 로드
+                            interceptor = WebViewResolver(Regex(".*"))
                         )
                         
                         val content = checkResponse.text
-                        println("$TAG [4단계] 검증 완료. URL: ${checkResponse.url}")
+                        println("$TAG [4단계] 검증 완료. 상태 코드: ${checkResponse.code}")
                         
                         if (content.contains("#EXTM3U")) {
                             println("$TAG [4단계] 검증 성공! 유효한 M3U8 파일입니다.")
@@ -246,7 +261,7 @@ class Anilife : MainAPI() {
                         } else {
                             println("$TAG [4단계] 검증 실패! 내용은 M3U8이 아닙니다.")
                             println("$TAG [Debug] ================= 서버 응답 내용 (Start) =================")
-                            logLargeString(TAG, content)
+                            logFullContent(TAG, content)
                             println("$TAG [Debug] ================= 서버 응답 내용 (End) ===================")
                         }
                     } else {
