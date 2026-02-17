@@ -10,10 +10,10 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 
 /**
- * Anilife Provider v13.0
- * - [Fix] 정규식 대폭 완화: 도메인 유무 관계없이 '/h/live?p=' 패턴 검색
- * - [Debug] 실패 시 HTML 원본 로그 출력 (원인 분석용)
- * - [Fix] 에피소드 정렬: v11.0 방식(단순 파싱) 유지
+ * Anilife Provider v14.0
+ * - [Fix] Referer 차단 우회: 상세 페이지 URL을 에피소드 링크에 'ref' 파라미터로 전달 -> 요청 시 헤더에 적용
+ * - [Fix] 서버가 Provider 페이지 요청 시 'Detail Page' Referer가 없으면 메인으로 리다이렉트시키는 문제 해결
+ * - [Keep] 에피소드 정렬 로직 동결 (v11.0 방식)
  */
 class Anilife : MainAPI() {
     override var mainUrl = "https://anilife.live"
@@ -74,6 +74,7 @@ class Anilife : MainAPI() {
                 if (poster.isNullOrEmpty()) poster = imgTag?.attr("data-original")
                 poster = poster?.let { fixUrl(it) } ?: ""
 
+                // 포스터 터널링 (목록 -> 상세)
                 val finalHref = if (poster.isNotEmpty()) {
                     try {
                         val encodedPoster = Base64.encodeToString(poster.toByteArray(), Base64.NO_WRAP)
@@ -99,6 +100,7 @@ class Anilife : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
+        // URL에서 포스터 등 파라미터 분리
         var tunnelingPoster: String? = null
         val cleanUrl = if (url.contains("poster=")) {
             try {
@@ -125,15 +127,24 @@ class Anilife : MainAPI() {
         val description = doc.selectFirst(".synp .entry-content")?.text()?.trim()
         val tags = doc.select(".genxed a, .taged a").map { it.text() }
 
-        // v11.0 방식 유지 (렉 없음)
+        // [v14.0 핵심] 현재 상세 페이지 URL을 Base64로 인코딩하여 Referer로 사용
+        // 이 값이 없으면 Provider 페이지 접속 시 메인으로 튕김
+        val encodedReferer = try {
+            Base64.encodeToString(cleanUrl.toByteArray(), Base64.NO_WRAP)
+        } catch (e: Exception) { "" }
+
+        // v11.0 방식 (렉 없는 단순 파싱)
         val episodes = doc.select(".eplister > ul > li > a").mapNotNull { element ->
-            val href = fixUrl(element.attr("href"))
+            val rawHref = fixUrl(element.attr("href"))
             val numText = element.selectFirst(".epl-num")?.text()?.trim() ?: ""
             val epTitle = element.selectFirst(".epl-title")?.text()?.trim() ?: ""
             val fullName = if (numText.isNotEmpty()) "${numText}화 - $epTitle" else epTitle
             val epNum = numText.toIntOrNull()
 
-            newEpisode(href) {
+            // href에 referer 파라미터 추가
+            val finalHref = if (rawHref.contains("?")) "$rawHref&ref=$encodedReferer" else "$rawHref?ref=$encodedReferer"
+
+            newEpisode(finalHref) {
                 this.name = fullName
                 this.episode = epNum
             }
@@ -154,31 +165,62 @@ class Anilife : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // 1. URL 정리
-        val cleanData = if (data.contains("poster=")) data.substringBefore("?poster=") else data
-        println("$TAG [LoadLinks] Start: $cleanData")
+        println("$TAG [LoadLinks] Start Data: $data")
+
+        // 1. 파라미터 파싱 (poster, ref)
+        var cleanData = data
+        var refererUrl = "$mainUrl/" // 기본 Referer
+
+        // poster 파라미터 제거
+        if (cleanData.contains("poster=")) {
+            cleanData = cleanData.substringBefore("?poster=")
+        }
+        
+        // [v14.0 핵심] ref 파라미터 추출 및 적용
+        if (cleanData.contains("ref=")) {
+            try {
+                val refParam = cleanData.substringAfter("ref=")
+                val encodedRef = if (refParam.contains("&")) refParam.substringBefore("&") else refParam
+                val decodedRef = String(Base64.decode(encodedRef, Base64.NO_WRAP))
+                
+                if (decodedRef.startsWith("http")) {
+                    refererUrl = decodedRef
+                    println("$TAG [LoadLinks] Extracted Referer: $refererUrl")
+                }
+                
+                // URL에서 ref 파라미터 제거
+                cleanData = if (cleanData.contains("?ref=")) cleanData.substringBefore("?ref=") 
+                            else cleanData.substringBefore("&ref=")
+            } catch (e: Exception) {
+                println("$TAG [LoadLinks] Referer decode failed: ${e.message}")
+            }
+        }
+
+        println("$TAG [LoadLinks] Target URL: $cleanData")
 
         try {
-            // 2. Provider 페이지 로드
-            println("$TAG [LoadLinks] Fetching Provider Page...")
-            val response = app.get(cleanData, headers = commonHeaders)
+            // 2. Provider 페이지 로드 (올바른 Referer 사용)
+            val requestHeaders = commonHeaders.toMutableMap()
+            requestHeaders["Referer"] = refererUrl // 상세 페이지 주소를 Referer로 설정
+
+            println("$TAG [LoadLinks] Fetching Provider Page with Referer: $refererUrl")
+            val response = app.get(cleanData, headers = requestHeaders)
             val html = response.text
             
-            println("$TAG [LoadLinks] HTML Fetched (Length: ${html.length})")
+            // HTML 검증 (메인 페이지로 튕겼는지 확인)
+            if (html.contains("메인 홈페이지") || html.length > 35000) { // 메인 페이지는 보통 용량이 큼
+                 // println("$TAG [Debug] Warning: HTML might be Main Page. Dump: ${html.take(300)}")
+            }
 
-            // 3. 실제 플레이어 주소 파싱 (정규식 대폭 완화)
-            // 도메인이 있든 없든, 따옴표 안에 /h/live?p=... 패턴이 있으면 잡습니다.
-            // 예: "https://anilife.live/h/live?p=..." 또는 "/h/live?p=..."
+            // 3. 실제 플레이어 주소 파싱
             val regex = Regex("""["']([^"']*\/?h\/live\?p=[^"']+)["']""")
             val match = regex.find(html)
             var playerUrl = match?.groupValues?.get(1)
 
             if (playerUrl != null) {
-                // 상대 경로일 경우 도메인 추가
                 if (!playerUrl.startsWith("http")) {
                     playerUrl = if (playerUrl.startsWith("/")) "$mainUrl$playerUrl" else "$mainUrl/$playerUrl"
                 }
-                // 이스케이프 문자 제거 (혹시 자바스크립트 내부에 \/ 로 되어있을 경우)
                 playerUrl = playerUrl.replace("\\/", "/")
 
                 println("$TAG [LoadLinks] Found Player URL: $playerUrl")
@@ -212,13 +254,11 @@ class Anilife : MainAPI() {
                     )
                     println("$TAG [LoadLinks] Success! Link returned.")
                     return true
-                } else {
-                    println("$TAG [WebView] Failed. URL does not contain .m3u8")
                 }
             } else {
                 println("$TAG [LoadLinks] Failed to find player URL in HTML.")
-                // [중요] 디버깅을 위해 HTML 앞부분 1000자를 출력합니다. 로그캣 확인 필수.
-                println("$TAG [Debug] HTML Dump (Start): ${html.take(1000)}")
+                // 디버깅: 실패 시 HTML 앞부분 확인
+                println("$TAG [Debug] HTML Dump (Start): ${html.take(500)}")
             }
         } catch (e: Exception) {
             println("$TAG [LoadLinks] Critical Error: ${e.message}")
