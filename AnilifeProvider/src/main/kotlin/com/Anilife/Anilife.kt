@@ -8,9 +8,9 @@ import com.lagradost.cloudstream3.network.WebViewResolver
 import org.jsoup.nodes.Document
 
 /**
- * Anilife Provider v66.0
- * - [Feature] 'Active Fetch' 도입: 웹뷰 내 JS가 M3U8을 분석하여 키를 강제로 다운로드하는 로직 추가
- * - [Fix] 키 수집 0개 문제 해결을 위한 하이브리드(Passive+Active) 후킹 엔진 적용
+ * Anilife Provider v68.0
+ * - [Feature] XHR/Fetch 래핑 방식의 키 후킹 적용 (캐시 무시)
+ * - [Maintain] v4.1 메타데이터 및 프록시 연동 유지
  */
 class Anilife : MainAPI() {
     override var mainUrl = "https://anilife.live"
@@ -26,16 +26,6 @@ class Anilife : MainAPI() {
         "User-Agent" to pcUserAgent,
         "Referer" to "$mainUrl/"
     )
-
-    private fun logFullContent(tag: String, prefix: String, msg: String) {
-        val maxLogSize = 4000
-        if (msg.length > maxLogSize) {
-            println("$tag $prefix [Part] ${msg.substring(0, maxLogSize)}")
-            logFullContent(tag, prefix, msg.substring(maxLogSize))
-        } else {
-            println("$tag $prefix [End] $msg")
-        }
-    }
 
     override val mainPage = mainPageOf(
         "/top20" to "실시간 TOP 20",
@@ -90,7 +80,6 @@ class Anilife : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        println("$TAG [Load] 시작: $url")
         var tunnelingPoster: String? = null
         val cleanUrl = if (url.contains("poster=")) {
             val posterParam = url.substringAfter("poster=")
@@ -134,7 +123,7 @@ class Anilife : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("$TAG [LoadLinks] =================== v66.0 시작 ===================")
+        println("$TAG [LoadLinks] =================== v68.0 시작 ===================")
         
         var cleanData = data.substringBefore("?poster=")
         var detailReferer = "$mainUrl/"
@@ -147,7 +136,6 @@ class Anilife : MainAPI() {
         }
 
         try {
-            println("$TAG [Step 1] 웹뷰 로드: $cleanData")
             val webResponse = app.get(
                 cleanData, 
                 headers = mapOf("Referer" to detailReferer, "User-Agent" to pcUserAgent), 
@@ -155,9 +143,8 @@ class Anilife : MainAPI() {
             )
 
             val playerUrl = AnilifeProxyExtractor().extractPlayerUrl(webResponse.text, mainUrl) ?: return false
-            println("$TAG [Step 2] 플레이어 주소: $playerUrl")
+            println("$TAG [Step 2] 플레이어: $playerUrl")
 
-            println("$TAG [Step 3] API 주소 탐색...")
             val gcdnInterceptor = WebViewResolver(Regex(""".*api\.gcdn\.app.*"""))
             val gcdnResponse = app.get(
                 playerUrl,
@@ -165,14 +152,13 @@ class Anilife : MainAPI() {
                 interceptor = gcdnInterceptor
             )
             val sniffedUrl = gcdnResponse.url
-            println("$TAG [Step 3] 가로챈 URL: $sniffedUrl")
+            println("$TAG [Step 3] API: $sniffedUrl")
 
             val finalCookies = CookieManager.getInstance().getCookie("https://anilife.live") ?: ""
             var xUserSsid: String? = null
             var finalM3u8: String? = null
 
             if (sniffedUrl.contains("/m3u8/st/")) {
-                println("$TAG [Step 4] API 응답 파싱...")
                 val apiResponse = app.get(
                     sniffedUrl,
                     headers = mapOf("User-Agent" to pcUserAgent, "Referer" to "https://anilife.live/", "Cookie" to finalCookies)
@@ -185,8 +171,7 @@ class Anilife : MainAPI() {
             }
 
             if (finalM3u8 != null) {
-                println("$TAG [Step 5] 하이브리드 키 후킹(Passive+Active) 엔진 시작")
-                // [v66.0] m3u8Url을 인자로 전달하여 Active Fetch 수행
+                // [v68.0] XHR 래핑 방식 호출
                 return AnilifeProxyExtractor().extractWithProxy(
                     m3u8Url = finalM3u8,
                     playerUrl = playerUrl,
