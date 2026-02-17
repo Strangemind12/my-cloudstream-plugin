@@ -1,12 +1,11 @@
 package com.linkkf
 
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.utils.* // 요청하신 임포트 추가
+import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.network.WebViewResolver
 import org.jsoup.nodes.Element
 
 class Linkkf : MainAPI() {
-    // v1.14: 자막(Sub) / 더빙(Dub) 분리 구현 (StreamPlayAnime 참고)
     override var mainUrl = "https://linkkf.tv"
     override var name = "Linkkf"
     override val hasMainPage = true
@@ -39,8 +38,6 @@ class Linkkf : MainAPI() {
             val baseUrl = if(request.data.endsWith("/")) request.data else "${request.data}/"
             "$mainUrl${baseUrl}page/$page/"
         }
-
-        println("[Linkkf] getMainPage 요청: $url")
         
         try {
             val doc = app.get(url, headers = commonHeaders).document
@@ -56,9 +53,7 @@ class Linkkf : MainAPI() {
                 ),
                 hasNext = list.isNotEmpty()
             )
-
         } catch (e: Exception) {
-            e.printStackTrace()
             return newHomePageResponse(request.name, emptyList())
         }
     }
@@ -91,16 +86,14 @@ class Linkkf : MainAPI() {
             }
             
             val tags = doc.select(".detail-info-desc a[href*='/class/']").map { it.text().trim() }
-            val year = doc.selectFirst("a[href*='/year/']")?.text()?.trim()?.toIntOrNull()
+            val yearStr = doc.selectFirst("a[href*='/year/']")?.text()?.trim()
+            val year: Int? = yearStr?.toIntOrNull()
 
-            // --- [v1.14] 자막/더빙 에피소드 분리 로직 시작 ---
             val subEpisodes = mutableListOf<Episode>()
             val dubEpisodes = mutableListOf<Episode>()
 
-            // 탭 요소 확인 (자막/더빙 탭)
             val tabs = doc.select(".playlist-tab-box .tab-item")
 
-            // 에피소드 파싱 헬퍼 함수
             fun parseEpisodes(selector: String): List<Episode> {
                 return doc.select(selector).mapNotNull { aTag ->
                     val href = aTag.attr("href")
@@ -111,13 +104,13 @@ class Linkkf : MainAPI() {
                             this.episode = name.filter { it.isDigit() }.toIntOrNull()
                         }
                     } else null
-                }.reversed() // 최신화가 위에 있다면 역순 정렬 필요
+                }.reversed()
             }
 
             if (tabs.isNotEmpty()) {
                 tabs.forEach { tab ->
                     val tabText = tab.text().lowercase()
-                    val targetId = tab.attr("data-target") // 예: #ewave-playlist-1
+                    val targetId = tab.attr("data-target")
 
                     if (targetId.isNotEmpty()) {
                         val episodes = parseEpisodes("$targetId .episodelist a")
@@ -125,17 +118,14 @@ class Linkkf : MainAPI() {
                         if (tabText.contains("dub") || tabText.contains("더빙")) {
                             dubEpisodes.addAll(episodes)
                         } else {
-                            // "자막", "sub" 또는 기본값
                             subEpisodes.addAll(episodes)
                         }
                     }
                 }
             } else {
-                // 탭이 없는 경우 기본 리스트 파싱 (전부 자막으로 간주하거나 기본 처리)
                 subEpisodes.addAll(parseEpisodes(".episode-box .episodelist a"))
             }
 
-            // newAnimeLoadResponse 사용하여 Dub/Sub 분리 등록
             return newAnimeLoadResponse(title, url, TvType.Anime) {
                 this.posterUrl = poster
                 this.plot = description
@@ -161,22 +151,19 @@ class Linkkf : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val fullUrl = if (data.startsWith("http")) data else "$mainUrl$data"
-        println("[Linkkf] loadLinks 진입: $fullUrl")
         
         val result = LinkkfExtractor().extract(fullUrl, "$mainUrl/") ?: return false
 
         if (result.subtitleUrl.isNotEmpty()) {
-            subtitleCallback.invoke(SubtitleFile("Korean", result.subtitleUrl))
+            subtitleCallback.invoke(newSubtitleFile("Korean", result.subtitleUrl))
         }
 
-        // 구형 플레이어 대응 Referer 설정
         val playerPageUrl = result.m3u8Url
         val targetReferer = if (result.needsWebView) playerPageUrl else "$mainUrl/"
 
         var finalM3u8Url = result.m3u8Url
 
         if (result.needsWebView) {
-            println("[Linkkf] 구형 플레이어(Unified). WebViewResolver 사용. (Referer 예정: $targetReferer)")
             try {
                 val response = app.get(
                     result.m3u8Url, 
@@ -184,9 +171,7 @@ class Linkkf : MainAPI() {
                     interceptor = WebViewResolver(Regex("""\.m3u8"""))
                 )
                 finalM3u8Url = response.url
-                println("[Linkkf] WebView 스니핑 성공: $finalM3u8Url")
             } catch (e: Exception) {
-                println("[Linkkf] WebViewResolver 에러: ${e.message}")
                 return false
             }
         }
