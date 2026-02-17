@@ -8,9 +8,9 @@ import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 
 /**
- * Extractor v5.0
- * - [Fix] 리다이렉트 URL 탐색 로직 강화 (영상 링크 찾기 실패 해결)
- * - HTML 전체에서 'https://anilife.live/h/live' 패턴을 직접 검색
+ * Extractor v5.1
+ * - [Fix] 영상 링크 찾기 실패 해결
+ * - 특정 변수명(location.href) 대신, URL 패턴(p=...&player=...) 자체를 검색하여 신뢰도 향상
  */
 class AnilifeExtractor {
     private val TAG = "[AnilifeExtractor]"
@@ -40,25 +40,26 @@ class AnilifeExtractor {
             // 2. 플레이어 선택 페이지인지 확인 (HTML 전체 검색)
             val rawHtml = doc.html()
             
-            // [v5.0 핵심] 변수명(location.href)에 의존하지 않고, 실제 이동해야 할 URL 패턴을 직접 찾음
-            // 패턴: https://anilife.live/h/live... 로 시작하는 URL
-            val urlRegex = Regex("""https:\\/\\/anilife\.live\\/h\\/live[^"']+""")
-            val match = urlRegex.find(rawHtml)
+            // [v5.1 수정] URL 패턴을 더 유연하게 검색
+            // 예: h/live?p=...&player=... 형태를 찾음 (따옴표나 공백 무시)
+            // p 파라미터값과 player 파라미터값을 캡처
+            val regex = Regex("""h\/live\?p=([a-zA-Z0-9\-]+)&player=([a-zA-Z0-9]+)""")
+            val match = regex.find(rawHtml)
             
             var targetUrl: String? = null
             
             if (match != null) {
-                targetUrl = match.value
-                // 이스케이프된 슬래시(\/) 제거
-                targetUrl = targetUrl.replace("\\/", "/")
-                println("$TAG [Extract] Found Redirect URL (Regex): $targetUrl")
+                // 전체 매칭된 문자열 사용 (예: h/live?p=...&player=...)
+                val relativeUrl = match.value
+                targetUrl = "https://anilife.live/$relativeUrl"
+                println("$TAG [Extract] Found Redirect URL (Pattern): $targetUrl")
             } else {
-                 // 혹시 모르니 기존 방식(script)으로도 한 번 더 체크
-                 val scriptMatch = Regex("""location\.href\s*=\s*["']([^"']+)["']""").find(rawHtml)
-                 if (scriptMatch != null) {
-                     targetUrl = scriptMatch.groupValues[1]
-                     println("$TAG [Extract] Found Redirect URL (Script): $targetUrl")
-                 }
+                // 백업: location.href 검색
+                val scriptMatch = Regex("""location\.href\s*=\s*["']([^"']+)["']""").find(rawHtml)
+                if (scriptMatch != null) {
+                    targetUrl = scriptMatch.groupValues[1]
+                    println("$TAG [Extract] Found Redirect URL (Script): $targetUrl")
+                }
             }
 
             if (!targetUrl.isNullOrEmpty()) {
@@ -66,7 +67,7 @@ class AnilifeExtractor {
                 currentUrl = targetUrl
                 doc = app.get(currentUrl, headers = headers).document
             } else {
-                println("$TAG [Extract] No specific player redirect found. Checking current page for _aldata.")
+                println("$TAG [Extract] No redirect found. Checking for _aldata directly.")
             }
 
             // 3. 최종 재생 페이지에서 _aldata 추출
