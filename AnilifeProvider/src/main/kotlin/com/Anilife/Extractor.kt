@@ -9,7 +9,6 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import android.webkit.CookieManager
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.AcraApplication
@@ -30,10 +29,10 @@ import kotlin.concurrent.thread
 import kotlin.coroutines.resume
 
 /**
- * Anilife Proxy Extractor v65.0
- * - [Critical Fix] JS 후킹 스크립트 주입 시점을 onPageStarted로 변경하여 키 생성 전 가로채기 보장
- * - [Logic] JS Hook(메모리) + Network Hook(트래픽) 이중 감시 체제 구축
- * - [Fix] 32바이트 키 대응 및 슬라이딩 윈도우 검증 로직 유지
+ * Anilife Proxy Extractor v66.0
+ * - [Feature] 'Active Fetch': onPageStarted 시점에 JS를 주입하여 M3U8과 Key를 강제로 fetch()
+ * - [Fix] 32바이트 키에 대한 Sliding Window 전수 조사 유지
+ * - [Fix] 웹뷰 미디어 제스처 요구 해제 (자동 재생/로딩 유도)
  */
 class AnilifeProxyExtractor : ExtractorApi() {
     override val name = "AnilifeProxy"
@@ -78,9 +77,9 @@ class AnilifeProxyExtractor : ExtractorApi() {
         println("[Anilife][Proxy] 1. 키 저장소 초기화")
         val sessionKeys = Collections.synchronizedSet(mutableSetOf<String>())
         
-        println("[Anilife][Proxy] 2. 웹뷰 가동 (onPageStarted 후킹 적용)...")
-        // [v65.0] onPageStarted 시점에서 후킹
-        runWebViewHybridHook(playerUrl, referer, ssid, cookies, sessionKeys)
+        println("[Anilife][Proxy] 2. 하이브리드(Active+Passive) 후킹 시작...")
+        // [v66.0] m3u8Url 전달
+        runWebViewHybridHook(playerUrl, m3u8Url, referer, ssid, cookies, sessionKeys)
 
         val proxy = ProxyWebServer(sessionKeys).apply { 
             start()
@@ -144,7 +143,8 @@ class AnilifeProxyExtractor : ExtractorApi() {
     }
 
     private suspend fun runWebViewHybridHook(
-        url: String, 
+        url: String,
+        m3u8Url: String, 
         referer: String, 
         ssid: String?, 
         cookies: String, 
@@ -152,14 +152,10 @@ class AnilifeProxyExtractor : ExtractorApi() {
     ) = suspendCancellableCoroutine<Unit> { cont ->
         val handler = Handler(Looper.getMainLooper())
         
-        // [v65.0] JS Hook Script
+        // [v66.0] Active Fetch Script: M3U8을 직접 다운로드하고 파싱하여 키를 가져옴
         val hookScript = """
-            (function() {
-                // 이미 주입되었는지 확인 (중복 실행 방지)
-                if (window.hookInjected) return;
-                window.hookInjected = true;
-                console.log("CapturedKeyHex: [INIT] Hook Injected at " + new Date().getTime());
-
+            (async function() {
+                // 1. Passive Hook (기존 로직)
                 if (window.crypto && window.crypto.subtle) {
                     const oI = window.crypto.subtle.importKey;
                     window.crypto.subtle.importKey = function(f, k, ...) {
@@ -178,6 +174,33 @@ class AnilifeProxyExtractor : ExtractorApi() {
                     }
                     return oS.apply(this, arguments);
                 };
+
+                // 2. Active Fetch (강제 키 추출)
+                try {
+                    console.log("[JS] Fetching M3U8: $m3u8Url");
+                    // no-referrer 정책 준수
+                    const response = await fetch("$m3u8Url", { referrerPolicy: "no-referrer" });
+                    const text = await response.text();
+                    
+                    // 정규식으로 URI="..." 추출
+                    const match = text.match(/URI="([^"]+)"/);
+                    if (match && match[1]) {
+                        let keyUrl = match[1];
+                        // 상대 주소 처리
+                        if (!keyUrl.startsWith('http')) {
+                            keyUrl = new URL(keyUrl, "$m3u8Url").href;
+                        }
+                        console.log("[JS] Key URL Found: " + keyUrl);
+                        
+                        const keyResp = await fetch(keyUrl, { referrerPolicy: "no-referrer" });
+                        const keyBuf = await keyResp.arrayBuffer();
+                        const bytes = new Uint8Array(keyBuf);
+                        const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+                        console.log("CapturedKeyHex:" + hex); // 결과 전송
+                    }
+                } catch(e) {
+                    console.log("[JS] Active fetch failed: " + e.message);
+                }
             })();
         """.trimIndent()
 
@@ -185,68 +208,38 @@ class AnilifeProxyExtractor : ExtractorApi() {
             try {
                 val context: Context = (AcraApplication.context ?: app) as Context
                 val webView = WebView(context)
-                webView.settings.javaScriptEnabled = true
-                webView.settings.domStorageEnabled = true
-                webView.settings.userAgentString = DESKTOP_UA
+                
+                // [v66.0] 자동 재생 및 제스처 무시 설정
+                webView.settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    userAgentString = DESKTOP_UA
+                    mediaPlaybackRequiresUserGesture = false // 중요!
+                }
 
                 webView.webChromeClient = object : WebChromeClient() {
                     override fun onConsoleMessage(cm: ConsoleMessage?): Boolean {
                         val msg = cm?.message() ?: ""
                         if (msg.contains("CapturedKeyHex:")) {
-                            val key = msg.substringAfter("CapturedKeyHex:").trim()
-                            if (!key.startsWith("[INIT]") && sessionKeys.add(key)) {
-                                println("[Anilife][Hook] JS 키 발견: $key")
-                            } else if (key.startsWith("[INIT]")) {
-                                println("[Anilife][Hook] 스크립트 주입 확인됨.")
-                            }
+                            val key = msg.substringAfter("CapturedKeyHex:")
+                            if (sessionKeys.add(key)) println("[Anilife][Hook] 키 확보 성공: $key")
                         }
                         return true
                     }
                 }
 
                 webView.webViewClient = object : WebViewClient() {
-                    // [v65.0 핵심] 페이지 로드 시작 시점에 스크립트 주입
                     override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                         super.onPageStarted(view, url, favicon)
+                        // [v66.0] onPageStarted 즉시 주입
                         view?.evaluateJavascript(hookScript, null)
                     }
 
                     override fun onPageFinished(view: WebView?, url: String?) {
                         super.onPageFinished(view, url)
-                        // 혹시 모르니 완료 후에도 재주입 시도
+                        // 혹시 모르니 다시 주입
                         view?.evaluateJavascript(hookScript, null)
-                        // 10초 후 종료
                         handler.postDelayed({ if (cont.isActive) { webView.destroy(); cont.resume(Unit) } }, 10000)
-                    }
-
-                    // 네트워크 요청 인터셉트 (이중 안전장치)
-                    override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
-                        val reqUrl = request?.url.toString()
-                        if (reqUrl.contains("enc.bin") || reqUrl.contains("/key")) {
-                            println("[Anilife][Intercept] 네트워크 키 요청 감지: $reqUrl")
-                            thread {
-                                runBlocking {
-                                    try {
-                                        val headers = mutableMapOf(
-                                            "User-Agent" to DESKTOP_UA,
-                                            "Referer" to referer,
-                                            "Cookie" to cookies
-                                        )
-                                        if (!ssid.isNullOrBlank()) headers["x-user-ssid"] = ssid
-                                        
-                                        val response = app.get(reqUrl, headers = headers)
-                                        val bytes = response.body.bytes()
-                                        if (bytes.size == 16 || bytes.size == 32) {
-                                            val hex = bytes.joinToString("") { "%02x".format(it) }
-                                            if (sessionKeys.add(hex)) println("[Anilife][Intercept] 네트워크 키 확보: $hex")
-                                        }
-                                    } catch (e: Exception) {
-                                        println("[Anilife][Intercept] 실패: ${e.message}")
-                                    }
-                                }
-                            }
-                        }
-                        return super.shouldInterceptRequest(view, request)
                     }
                 }
                 
@@ -320,7 +313,7 @@ class AnilifeProxyExtractor : ExtractorApi() {
                     if (rawKey.size == 16) {
                         candidates.add(rawKey)
                     } else if (rawKey.size == 32) {
-                        // [v65.0] 슬라이딩 윈도우 (32바이트 중 16바이트 추출)
+                        // [v66.0] 32바이트 Sliding Window 검증 유지
                         for (i in 0..16) {
                             candidates.add(rawKey.copyOfRange(i, i + 16))
                         }
@@ -332,13 +325,13 @@ class AnilifeProxyExtractor : ExtractorApi() {
                             cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(ByteArray(16)))
                             val dec = cipher.doFinal(chunk)
                             if (dec.size > 188 && dec[0] == 0x47.toByte() && dec[188] == 0x47.toByte()) {
-                                println("[Anilife][Verify] 성공! 정답 키 찾음: ${key.joinToString("") { "%02x".format(it) }}")
+                                println("[Anilife][Verify] 검증 성공: ${key.joinToString("") { "%02x".format(it) }}")
                                 return@runBlocking key
                             }
                         } catch (e: Exception) {}
                     }
                 }
-            } catch (e: Exception) { println("[Anilife][Verify] 검증 실패: ${e.message}") }
+            } catch (e: Exception) { println("[Anilife][Verify] 실패: ${e.message}") }
             null
         }
     }
