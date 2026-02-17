@@ -8,9 +8,10 @@ import com.lagradost.cloudstream3.network.WebViewResolver
 import org.jsoup.nodes.Document
 
 /**
- * Anilife Provider v68.0
- * - [Feature] XHR/Fetch 래핑 방식의 키 후킹 적용 (캐시 무시)
- * - [Maintain] v4.1 메타데이터 및 프록시 연동 유지
+ * Anilife Provider v69.0
+ * - [Critical Fix] 키 수집 0개 해결: M3U8에서 추출한 키 주소를 Extractor에 전달하여 'JS 강제 다운로드' 수행
+ * - [Logic] 감시(Passive)가 아닌 명령(Active) 방식으로 변경하여 플레이어 동작 여부와 무관하게 키 확보
+ * - [Maintain] v4.1 메타데이터 로직 완전 유지
  */
 class Anilife : MainAPI() {
     override var mainUrl = "https://anilife.live"
@@ -26,6 +27,16 @@ class Anilife : MainAPI() {
         "User-Agent" to pcUserAgent,
         "Referer" to "$mainUrl/"
     )
+
+    private fun logFullContent(tag: String, prefix: String, msg: String) {
+        val maxLogSize = 4000
+        if (msg.length > maxLogSize) {
+            println("$tag $prefix [Part] ${msg.substring(0, maxLogSize)}")
+            logFullContent(tag, prefix, msg.substring(maxLogSize))
+        } else {
+            println("$tag $prefix [End] $msg")
+        }
+    }
 
     override val mainPage = mainPageOf(
         "/top20" to "실시간 TOP 20",
@@ -123,7 +134,7 @@ class Anilife : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("$TAG [LoadLinks] =================== v68.0 시작 ===================")
+        println("$TAG [LoadLinks] =================== v69.0 시작 ===================")
         
         var cleanData = data.substringBefore("?poster=")
         var detailReferer = "$mainUrl/"
@@ -136,15 +147,18 @@ class Anilife : MainAPI() {
         }
 
         try {
+            // [1단계] 플레이어 페이지 로드
             val webResponse = app.get(
                 cleanData, 
                 headers = mapOf("Referer" to detailReferer, "User-Agent" to pcUserAgent), 
                 interceptor = WebViewResolver(Regex(".*"))
             )
 
+            // [2단계] 플레이어 주소 추출
             val playerUrl = AnilifeProxyExtractor().extractPlayerUrl(webResponse.text, mainUrl) ?: return false
-            println("$TAG [Step 2] 플레이어: $playerUrl")
+            println("$TAG [Step 2] 플레이어 주소: $playerUrl")
 
+            // [3단계] M3U8 API 스니핑
             val gcdnInterceptor = WebViewResolver(Regex(""".*api\.gcdn\.app.*"""))
             val gcdnResponse = app.get(
                 playerUrl,
@@ -152,11 +166,14 @@ class Anilife : MainAPI() {
                 interceptor = gcdnInterceptor
             )
             val sniffedUrl = gcdnResponse.url
-            println("$TAG [Step 3] API: $sniffedUrl")
+            println("$TAG [Step 3] 가로챈 URL: $sniffedUrl")
 
+            // [4단계] 쿠키 및 정보 추출
             val finalCookies = CookieManager.getInstance().getCookie("https://anilife.live") ?: ""
             var xUserSsid: String? = null
             var finalM3u8: String? = null
+            // [v69.0] 키 주소를 여기서 파싱
+            var targetKeyUrl: String? = null
 
             if (sniffedUrl.contains("/m3u8/st/")) {
                 val apiResponse = app.get(
@@ -165,19 +182,40 @@ class Anilife : MainAPI() {
                 )
                 xUserSsid = apiResponse.headers["x-user-ssid"] ?: apiResponse.headers["X-User-Ssid"]
                 val match = Regex("""https://api\.gcdn\.app/v1/manifest/[^"']+""").find(apiResponse.text)
-                if (match != null) finalM3u8 = match.value.replace("\\/", "/")
+                if (match != null) {
+                    finalM3u8 = match.value.replace("\\/", "/")
+                    
+                    // [v69.0 핵심] M3U8 내용을 미리 읽어 키 주소 추출
+                    try {
+                        val m3u8Content = app.get(finalM3u8!!, headers = mapOf("User-Agent" to pcUserAgent, "Referer" to "https://anilife.live/")).text
+                        val keyMatch = Regex("""URI="([^"]+)"""").find(m3u8Content)
+                        if (keyMatch != null) {
+                            var kUrl = keyMatch.groupValues[1]
+                            // 상대 주소 처리
+                            if (!kUrl.startsWith("http")) {
+                                // 간단한 상대 주소 처리 (필요시 URI resolve 사용)
+                                kUrl = if (kUrl.startsWith("/")) "https://api.gcdn.app$kUrl" 
+                                       else finalM3u8!!.substringBeforeLast("/") + "/" + kUrl
+                            }
+                            targetKeyUrl = kUrl
+                            println("$TAG [Step 4] 타겟 키 주소 확보: $targetKeyUrl")
+                        }
+                    } catch (e: Exception) { println("$TAG [Step 4] 키 주소 파싱 실패: ${e.message}") }
+                }
             } else {
                 finalM3u8 = sniffedUrl
             }
 
+            // [5단계] JS 강제 다운로드 엔진 가동
             if (finalM3u8 != null) {
-                // [v68.0] XHR 래핑 방식 호출
+                println("$TAG [Step 5] 키 강제 다운로드 엔진 시작")
                 return AnilifeProxyExtractor().extractWithProxy(
-                    m3u8Url = finalM3u8,
+                    m3u8Url = finalM3u8!!,
                     playerUrl = playerUrl,
                     referer = "https://anilife.live/",
                     ssid = xUserSsid,
                     cookies = finalCookies,
+                    directKeyUrl = targetKeyUrl, // 키 주소 전달
                     callback = callback
                 )
             }
