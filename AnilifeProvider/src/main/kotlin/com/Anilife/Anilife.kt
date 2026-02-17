@@ -9,10 +9,9 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 
 /**
- * Anilife Provider v5.0
- * - [Fix] 에피소드 소수점 정렬 구현 (실수형 파싱 -> 정렬 -> 정수형 재인덱싱)
- * - [Fix] Episode 객체 'posterHeaders' 제거 (빌드 에러 방지)
- * - [Fix] 1100개 이상의 에피소드를 한 번에 정렬하여 로드 (20개씩 끊김 없음)
+ * Anilife Provider v4.1
+ * - [Fix] Episode 객체 'posterHeaders' Unresolved reference 에러 수정 (제거)
+ * - SearchResponse/LoadResponse에는 posterHeaders 유지 (이미지 403 방지)
  */
 class Anilife : MainAPI() {
     override var mainUrl = "https://anilife.live"
@@ -76,7 +75,7 @@ class Anilife : MainAPI() {
                 if (poster.isNullOrEmpty()) poster = imgTag?.attr("data-original")
                 poster = poster?.let { fixUrl(it) } ?: ""
 
-                // 2. 포스터 터널링
+                // 2. 포스터 터널링 (URL에 포스터 정보 숨기기)
                 val finalHref = if (poster.isNotEmpty()) {
                     try {
                         val encodedPoster = Base64.encodeToString(poster.toByteArray(), Base64.NO_WRAP)
@@ -91,6 +90,7 @@ class Anilife : MainAPI() {
 
                 newAnimeSearchResponse(title, finalHref, TvType.Anime) {
                     this.posterUrl = poster
+                    // [핵심] SearchResponse에는 posterHeaders가 존재함 (403 방지)
                     this.posterHeaders = commonHeaders
                 }
             } catch (e: Exception) {
@@ -98,6 +98,7 @@ class Anilife : MainAPI() {
                 null
             }
         }
+        println("$TAG [List] Parsed ${items.size} items.")
         return items
     }
 
@@ -108,16 +109,10 @@ class Anilife : MainAPI() {
         return parseCommonList(doc)
     }
 
-    // 에피소드 정렬을 위한 임시 데이터 클래스
-    data class TempEpisode(
-        val url: String,
-        val fullName: String,
-        val floatNum: Float // 정렬 기준 (1145.5 등)
-    )
-
     override suspend fun load(url: String): LoadResponse {
         println("$TAG [Load] Raw URL: $url")
         
+        // 1. 터널링된 포스터 URL 추출 (Base64 디코딩)
         var tunnelingPoster: String? = null
         val cleanUrl = if (url.contains("poster=")) {
             try {
@@ -137,10 +132,12 @@ class Anilife : MainAPI() {
 
         val title = doc.selectFirst(".entry-title")?.text()?.trim() ?: "Unknown"
         
+        // 2. HTML에서 포스터 파싱 시도
         var htmlPoster = doc.selectFirst(".thumb img")?.let { img ->
             img.attr("src").ifEmpty { img.attr("data-src") }
         }?.let { fixUrl(it) }
 
+        // 3. 포스터 유효성 검사 및 터널링 데이터 사용
         if (htmlPoster.isNullOrEmpty() || htmlPoster == mainUrl || htmlPoster == "$mainUrl/") {
             if (!tunnelingPoster.isNullOrEmpty()) {
                 htmlPoster = tunnelingPoster
@@ -150,47 +147,28 @@ class Anilife : MainAPI() {
         val description = doc.selectFirst(".synp .entry-content")?.text()?.trim()
         val tags = doc.select(".genxed a, .taged a").map { it.text() }
         
-        // --- [v5.0 수정] 에피소드 파싱 및 정렬 로직 ---
-        val tempEpisodes = doc.select(".eplister > ul > li > a").mapNotNull { element ->
+        val episodes = doc.select(".eplister > ul > li > a").mapNotNull { element ->
             val href = fixUrl(element.attr("href"))
-            val numText = element.selectFirst(".epl-num")?.text()?.trim() ?: ""
+            val num = element.selectFirst(".epl-num")?.text()?.trim() ?: ""
             val epTitle = element.selectFirst(".epl-title")?.text()?.trim() ?: ""
             
-            // "1145.5화 - 제목" 형식으로 표시
-            val fullName = if(numText.isNotEmpty()) "${numText}화 - $epTitle" else epTitle
-            
-            // 소수점 포함 파싱 (1145.5 -> 1145.5f)
-            // 숫자가 없으면 0f 처리
-            val floatNum = numText.toFloatOrNull() ?: 0f
+            val fullName = if(num.isNotEmpty()) "${num}화 - $epTitle" else epTitle
+            val episodeInt = num.toIntOrNull()
 
-            TempEpisode(href, fullName, floatNum)
-        }
-
-        // 1. 실수 기준 오름차순 정렬 (1145.0 -> 1145.5 -> 1146.0)
-        val sortedTempEpisodes = tempEpisodes.sortedBy { it.floatNum }
-
-        // 2. 정렬된 순서대로 정수 인덱스 재할당 (Re-indexing)
-        // Cloudstream은 정수(Int) 에피소드 번호만 지원하므로,
-        // 실제 번호와 무관하게 정렬된 순서대로 1부터 번호를 부여하여 강제 정렬시킵니다.
-        val startEpisodeIndex = sortedTempEpisodes.firstOrNull()?.floatNum?.toInt() ?: 1
-        
-        val finalEpisodes = sortedTempEpisodes.mapIndexed { index, temp ->
-            newEpisode(temp.url) {
-                this.name = temp.fullName
-                // [핵심] 실제 번호(1145.5)와 상관없이 정렬된 순서대로 고유 정수 부여
-                // 예: 1145 -> ep:1145, 1145.5 -> ep:1146, 1146 -> ep:1147
-                this.episode = startEpisodeIndex + index
+            newEpisode(href) {
+                this.name = fullName
+                this.episode = episodeInt
+                // [수정] Episode 객체에는 posterHeaders가 없으므로 제거
             }
-        }.reversed() // 최신화가 위로 오도록 역순 정렬
-
-        println("$TAG [Load] Processed ${finalEpisodes.size} episodes with decimal sorting.")
+        }.reversed()
 
         return newAnimeLoadResponse(title, cleanUrl, TvType.Anime) {
             this.posterUrl = htmlPoster
+            // [핵심] LoadResponse에는 posterHeaders가 존재함 (403 방지)
             this.posterHeaders = commonHeaders 
             this.plot = description
             this.tags = tags
-            addEpisodes(DubStatus.Subbed, finalEpisodes)
+            addEpisodes(DubStatus.Subbed, episodes)
         }
     }
 
