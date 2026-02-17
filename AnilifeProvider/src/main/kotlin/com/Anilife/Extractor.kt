@@ -30,9 +30,10 @@ import kotlin.concurrent.thread
 import kotlin.coroutines.resume
 
 /**
- * Anilife Proxy Extractor v63.0
- * - [Critical Fix] 32바이트 키 데이터에 대해 슬라이딩 윈도우(Sliding Window) 방식의 전수 조사 적용
- * - [Logic] 32바이트 데이터에서 연속된 16바이트를 한 칸씩 밀어가며 모두 추출하여 복호화 시도
+ * Anilife Proxy Extractor v65.0
+ * - [Critical Fix] JS 후킹 스크립트 주입 시점을 onPageStarted로 변경하여 키 생성 전 가로채기 보장
+ * - [Logic] JS Hook(메모리) + Network Hook(트래픽) 이중 감시 체제 구축
+ * - [Fix] 32바이트 키 대응 및 슬라이딩 윈도우 검증 로직 유지
  */
 class AnilifeProxyExtractor : ExtractorApi() {
     override val name = "AnilifeProxy"
@@ -77,8 +78,9 @@ class AnilifeProxyExtractor : ExtractorApi() {
         println("[Anilife][Proxy] 1. 키 저장소 초기화")
         val sessionKeys = Collections.synchronizedSet(mutableSetOf<String>())
         
-        println("[Anilife][Proxy] 2. 웹뷰 네트워크 인터셉트 시작 (10초 대기)...")
-        runWebViewNetworkHook(playerUrl, referer, ssid, cookies, sessionKeys)
+        println("[Anilife][Proxy] 2. 웹뷰 가동 (onPageStarted 후킹 적용)...")
+        // [v65.0] onPageStarted 시점에서 후킹
+        runWebViewHybridHook(playerUrl, referer, ssid, cookies, sessionKeys)
 
         val proxy = ProxyWebServer(sessionKeys).apply { 
             start()
@@ -128,7 +130,7 @@ class AnilifeProxyExtractor : ExtractorApi() {
             proxy.setPlaylist(sb.toString())
             val finalProxyUrl = "http://127.0.0.1:${proxy.port}/playlist.m3u8"
             
-            println("[Anilife][Proxy] 4. 프록시 링크 생성: $finalProxyUrl")
+            println("[Anilife][Proxy] 4. 프록시 링크 반환: $finalProxyUrl")
             callback(newExtractorLink(name, name, finalProxyUrl, ExtractorLinkType.M3U8) {
                 this.referer = ""
                 this.headers = proxy.getCurrentHeaders()
@@ -141,7 +143,7 @@ class AnilifeProxyExtractor : ExtractorApi() {
         }
     }
 
-    private suspend fun runWebViewNetworkHook(
+    private suspend fun runWebViewHybridHook(
         url: String, 
         referer: String, 
         ssid: String?, 
@@ -150,9 +152,14 @@ class AnilifeProxyExtractor : ExtractorApi() {
     ) = suspendCancellableCoroutine<Unit> { cont ->
         val handler = Handler(Looper.getMainLooper())
         
-        // JS Hook: 32바이트 데이터도 적극적으로 수집
+        // [v65.0] JS Hook Script
         val hookScript = """
             (function() {
+                // 이미 주입되었는지 확인 (중복 실행 방지)
+                if (window.hookInjected) return;
+                window.hookInjected = true;
+                console.log("CapturedKeyHex: [INIT] Hook Injected at " + new Date().getTime());
+
                 if (window.crypto && window.crypto.subtle) {
                     const oI = window.crypto.subtle.importKey;
                     window.crypto.subtle.importKey = function(f, k, ...) {
@@ -186,23 +193,37 @@ class AnilifeProxyExtractor : ExtractorApi() {
                     override fun onConsoleMessage(cm: ConsoleMessage?): Boolean {
                         val msg = cm?.message() ?: ""
                         if (msg.contains("CapturedKeyHex:")) {
-                            val key = msg.substringAfter("CapturedKeyHex:")
-                            if (sessionKeys.add(key)) println("[Anilife][Hook] JS 키 발견: $key")
+                            val key = msg.substringAfter("CapturedKeyHex:").trim()
+                            if (!key.startsWith("[INIT]") && sessionKeys.add(key)) {
+                                println("[Anilife][Hook] JS 키 발견: $key")
+                            } else if (key.startsWith("[INIT]")) {
+                                println("[Anilife][Hook] 스크립트 주입 확인됨.")
+                            }
                         }
                         return true
                     }
                 }
 
                 webView.webViewClient = object : WebViewClient() {
-                    override fun onPageFinished(v: WebView?, u: String?) {
-                        v?.evaluateJavascript(hookScript, null)
+                    // [v65.0 핵심] 페이지 로드 시작 시점에 스크립트 주입
+                    override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                        super.onPageStarted(view, url, favicon)
+                        view?.evaluateJavascript(hookScript, null)
+                    }
+
+                    override fun onPageFinished(view: WebView?, url: String?) {
+                        super.onPageFinished(view, url)
+                        // 혹시 모르니 완료 후에도 재주입 시도
+                        view?.evaluateJavascript(hookScript, null)
+                        // 10초 후 종료
                         handler.postDelayed({ if (cont.isActive) { webView.destroy(); cont.resume(Unit) } }, 10000)
                     }
 
+                    // 네트워크 요청 인터셉트 (이중 안전장치)
                     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                         val reqUrl = request?.url.toString()
                         if (reqUrl.contains("enc.bin") || reqUrl.contains("/key")) {
-                            println("[Anilife][Intercept] 네트워크 키 요청: $reqUrl")
+                            println("[Anilife][Intercept] 네트워크 키 요청 감지: $reqUrl")
                             thread {
                                 runBlocking {
                                     try {
@@ -215,7 +236,6 @@ class AnilifeProxyExtractor : ExtractorApi() {
                                         
                                         val response = app.get(reqUrl, headers = headers)
                                         val bytes = response.body.bytes()
-                                        // 32바이트 데이터도 허용하여 수집
                                         if (bytes.size == 16 || bytes.size == 32) {
                                             val hex = bytes.joinToString("") { "%02x".format(it) }
                                             if (sessionKeys.add(hex)) println("[Anilife][Intercept] 네트워크 키 확보: $hex")
@@ -297,12 +317,10 @@ class AnilifeProxyExtractor : ExtractorApi() {
                     val rawKey = hex.hexToByteArray()
                     val candidates = mutableListOf<ByteArray>()
                     
-                    // 1. 16바이트면 바로 추가
                     if (rawKey.size == 16) {
                         candidates.add(rawKey)
-                    }
-                    // 2. 32바이트면 슬라이딩 윈도우로 모든 16바이트 조합 생성 (0~16 인덱스 시작)
-                    else if (rawKey.size == 32) {
+                    } else if (rawKey.size == 32) {
+                        // [v65.0] 슬라이딩 윈도우 (32바이트 중 16바이트 추출)
                         for (i in 0..16) {
                             candidates.add(rawKey.copyOfRange(i, i + 16))
                         }
@@ -313,9 +331,8 @@ class AnilifeProxyExtractor : ExtractorApi() {
                             val cipher = Cipher.getInstance("AES/CBC/NoPadding")
                             cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(ByteArray(16)))
                             val dec = cipher.doFinal(chunk)
-                            // MPEG-TS 동기화 바이트 확인
                             if (dec.size > 188 && dec[0] == 0x47.toByte() && dec[188] == 0x47.toByte()) {
-                                println("[Anilife][Verify] 성공! 정답 키 찾음 (Offset 등): ${key.joinToString("") { "%02x".format(it) }}")
+                                println("[Anilife][Verify] 성공! 정답 키 찾음: ${key.joinToString("") { "%02x".format(it) }}")
                                 return@runBlocking key
                             }
                         } catch (e: Exception) {}
