@@ -10,10 +10,10 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 
 /**
- * Anilife Provider v11.0
- * - [Rollback] 에피소드 정렬 로직을 v4.1 방식으로 원복 (렉/오버로드 해결)
- * - [Fix] 복잡한 정렬(sortedBy) 제거 -> HTML 순서 그대로 파싱 (가장 빠름)
- * - [Fix] 영상 재생을 위한 WebViewResolver 로직은 유지
+ * Anilife Provider v12.0
+ * - [Debug] 모든 주요 프로세스에 상세 println 로그 추가 (사용자 요청)
+ * - [Fix] 영상 링크 추출: MainAPI 내에서 HTML 파싱 -> WebViewResolver 실행 (가장 확실한 방법)
+ * - [Fix] 에피소드 정렬: v11.0 방식 유지 (단순 파싱, 렉 없음)
  */
 class Anilife : MainAPI() {
     override var mainUrl = "https://anilife.live"
@@ -47,11 +47,15 @@ class Anilife : MainAPI() {
             "$mainUrl$basePath/$page"
         }
 
+        println("$TAG [MainPage] Requesting: $url")
+        
         return try {
             val doc = app.get(url, headers = commonHeaders).document
             val home = parseCommonList(doc)
+            println("$TAG [MainPage] Success. Found ${home.size} items.")
             newHomePageResponse(request.name, home)
         } catch (e: Exception) {
+            println("$TAG [MainPage] Error: ${e.message}")
             e.printStackTrace()
             newHomePageResponse(request.name, emptyList())
         }
@@ -81,12 +85,16 @@ class Anilife : MainAPI() {
                     this.posterUrl = poster
                     this.posterHeaders = commonHeaders
                 }
-            } catch (e: Exception) { null }
+            } catch (e: Exception) { 
+                println("$TAG [List] Parse Error: ${e.message}")
+                null 
+            }
         }
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/search?keyword=$query"
+        println("$TAG [Search] Query: $query -> $url")
         val doc = app.get(url, headers = commonHeaders).document
         return parseCommonList(doc)
     }
@@ -102,6 +110,8 @@ class Anilife : MainAPI() {
             } catch (e: Exception) { url }
         } else { url }
 
+        println("$TAG [Load] cleanUrl: $cleanUrl")
+        
         val doc = app.get(cleanUrl, headers = commonHeaders).document
         val title = doc.selectFirst(".entry-title")?.text()?.trim() ?: "Unknown"
 
@@ -116,23 +126,21 @@ class Anilife : MainAPI() {
         val description = doc.selectFirst(".synp .entry-content")?.text()?.trim()
         val tags = doc.select(".genxed a, .taged a").map { it.text() }
 
-        // [v11.0 롤백] v4.1 방식: 단순 파싱 (정렬 X, 실수 변환 X)
-        // 리스트에 있는 순서 그대로 가져오므로 연산 비용이 '0'에 가깝습니다.
+        // v11.0 방식: 단순 파싱 (렉 없음)
         val episodes = doc.select(".eplister > ul > li > a").mapNotNull { element ->
             val href = fixUrl(element.attr("href"))
             val numText = element.selectFirst(".epl-num")?.text()?.trim() ?: ""
             val epTitle = element.selectFirst(".epl-title")?.text()?.trim() ?: ""
-            
             val fullName = if (numText.isNotEmpty()) "${numText}화 - $epTitle" else epTitle
-            
-            // 정수 파싱만 시도하고, 소수점(1145.5) 등은 null로 처리하여 앱이 기본값(리스트 순서 등)을 쓰게 둠
             val epNum = numText.toIntOrNull()
 
             newEpisode(href) {
                 this.name = fullName
                 this.episode = epNum
             }
-        }.reversed() // 최신화가 위에 있다면 역순으로 뒤집어 1화부터 나오게 함
+        }.reversed()
+
+        println("$TAG [Load] Loaded ${episodes.size} episodes")
 
         return newAnimeLoadResponse(title, cleanUrl, TvType.Anime) {
             this.posterUrl = htmlPoster
@@ -149,27 +157,40 @@ class Anilife : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        // 1. URL 정리
         val cleanData = if (data.contains("poster=")) data.substringBefore("?poster=") else data
-        
-        // 1. Extractor에게 플레이어 URL 추출 요청
-        val extractor = AnilifeExtractor()
-        val playerUrl = extractor.fetchPlayerUrl(cleanData)
+        println("$TAG [LoadLinks] Start: $cleanData")
 
-        if (playerUrl != null) {
-            // 2. MainAPI에서 WebViewResolver 실행 (영상 재생 보장)
-            try {
+        try {
+            // 2. Provider 페이지 로드
+            println("$TAG [LoadLinks] Fetching Provider Page...")
+            val response = app.get(cleanData, headers = commonHeaders)
+            val html = response.text
+            
+            // 3. 실제 플레이어 주소 파싱 (HTML 전체 검색)
+            // 패턴: https://anilife.live/h/live?p=...&player=...
+            val regex = Regex("""https://anilife\.live/h/live\?p=[^"']+(?:&player=[^"']+)*""")
+            val match = regex.find(html)
+            val playerUrl = match?.value
+
+            if (playerUrl != null) {
+                println("$TAG [LoadLinks] Found Player URL: $playerUrl")
+                println("$TAG [LoadLinks] Starting WebViewResolver...")
+
+                // 4. WebViewResolver 실행
                 val webViewInterceptor = WebViewResolver(
                     Regex("""\.m3u8""")
                 )
                 
-                val response = app.get(
+                val webViewResponse = app.get(
                     playerUrl,
                     headers = commonHeaders,
                     interceptor = webViewInterceptor
                 )
                 
-                val sniffedUrl = response.url
-                
+                val sniffedUrl = webViewResponse.url
+                println("$TAG [WebView] Sniffed URL: $sniffedUrl")
+
                 if (sniffedUrl.contains(".m3u8")) {
                      callback.invoke(
                         newExtractorLink(
@@ -182,12 +203,22 @@ class Anilife : MainAPI() {
                             this.quality = getQualityFromName("HD")
                         }
                     )
+                    println("$TAG [LoadLinks] Success! Link returned.")
                     return true
+                } else {
+                    println("$TAG [WebView] Failed. URL does not contain .m3u8")
                 }
-            } catch (e: Exception) {
-                e.printStackTrace()
+            } else {
+                println("$TAG [LoadLinks] Failed to find player URL in HTML.")
+                // 디버깅용: HTML 일부 출력 (너무 길면 자름)
+                // println("$TAG [Debug] HTML Snippet: ${html.take(500)}")
             }
+        } catch (e: Exception) {
+            println("$TAG [LoadLinks] Critical Error: ${e.message}")
+            e.printStackTrace()
         }
+
+        println("$TAG [LoadLinks] Returned False.")
         return false
     }
 }
