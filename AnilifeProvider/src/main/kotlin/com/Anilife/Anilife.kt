@@ -8,9 +8,9 @@ import com.lagradost.cloudstream3.network.WebViewResolver
 import org.jsoup.nodes.Document
 
 /**
- * Anilife Provider v63.0
- * - [Sync] Extractor.kt의 슬라이딩 윈도우 키 검증 로직 업데이트 반영
- * - [Maintain] v4.1 메타데이터 및 v57.0 프록시 통합 로직 유지
+ * Anilife Provider v65.0
+ * - [Constraint] v4.1 메타데이터(7개 카테고리, 포스터, 플롯) 완전 복구
+ * - [Fix] 키 후킹 시점을 onPageStarted로 변경한 v65.0 Extractor 사용
  */
 class Anilife : MainAPI() {
     override var mainUrl = "https://anilife.live"
@@ -26,16 +26,6 @@ class Anilife : MainAPI() {
         "User-Agent" to pcUserAgent,
         "Referer" to "$mainUrl/"
     )
-
-    private fun logFullContent(tag: String, prefix: String, msg: String) {
-        val maxLogSize = 4000
-        if (msg.length > maxLogSize) {
-            println("$tag $prefix [Part] ${msg.substring(0, maxLogSize)}")
-            logFullContent(tag, prefix, msg.substring(maxLogSize))
-        } else {
-            println("$tag $prefix [End] $msg")
-        }
-    }
 
     override val mainPage = mainPageOf(
         "/top20" to "실시간 TOP 20",
@@ -69,13 +59,16 @@ class Anilife : MainAPI() {
                 val aTag = element.selectFirst("div.bsx > a") ?: return@mapNotNull null
                 val rawHref = fixUrl(aTag.attr("href"))
                 val title = (element.selectFirst(".tt h2") ?: element.selectFirst(".tt"))?.text()?.trim() ?: "Unknown"
+                
                 val imgTag = element.selectFirst("img")
                 var poster = imgTag?.attr("src") ?: imgTag?.attr("data-src") ?: ""
                 poster = fixUrl(poster)
+
                 val finalHref = if (poster.isNotEmpty()) {
                     val encoded = Base64.encodeToString(poster.toByteArray(), Base64.NO_WRAP)
                     if (rawHref.contains("?")) "$rawHref&poster=$encoded" else "$rawHref?poster=$encoded"
                 } else rawHref
+
                 newAnimeSearchResponse(title, finalHref, TvType.Anime) {
                     this.posterUrl = poster
                     this.posterHeaders = commonHeaders
@@ -86,12 +79,12 @@ class Anilife : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/search?keyword=$query"
-        println("$TAG [Search] 쿼리: $url")
         return parseCommonList(app.get(url, headers = commonHeaders).document)
     }
 
     override suspend fun load(url: String): LoadResponse {
-        println("$TAG [Load] 분석 시작: $url")
+        println("$TAG [Load] 시작: $url")
+        
         var tunnelingPoster: String? = null
         val cleanUrl = if (url.contains("poster=")) {
             val posterParam = url.substringAfter("poster=")
@@ -114,6 +107,7 @@ class Anilife : MainAPI() {
             val epTitle = element.selectFirst(".epl-title")?.text()?.trim() ?: ""
             val fullName = if (numText.isNotEmpty()) "${numText}화 - $epTitle" else epTitle
             val finalHref = if (rawHref.contains("?")) "$rawHref&ref=$encodedRef" else "$rawHref?ref=$encodedRef"
+
             newEpisode(finalHref) {
                 this.name = fullName
                 this.episode = numText.toIntOrNull()
@@ -135,7 +129,7 @@ class Anilife : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("$TAG [LoadLinks] =================== v63.0 시작 ===================")
+        println("$TAG [LoadLinks] =================== v65.0 시작 ===================")
         
         var cleanData = data.substringBefore("?poster=")
         var detailReferer = "$mainUrl/"
@@ -173,7 +167,7 @@ class Anilife : MainAPI() {
             var finalM3u8: String? = null
 
             if (sniffedUrl.contains("/m3u8/st/")) {
-                println("$TAG [Step 4] API 응답 파싱 중...")
+                println("$TAG [Step 4] API 응답 파싱...")
                 val apiResponse = app.get(
                     sniffedUrl,
                     headers = mapOf("User-Agent" to pcUserAgent, "Referer" to "https://anilife.live/", "Cookie" to finalCookies)
@@ -198,11 +192,9 @@ class Anilife : MainAPI() {
             }
 
         } catch (e: Exception) {
-            println("$TAG [Error] 프로세스 중단: ${e.message}")
+            println("$TAG [Error] ${e.message}")
             e.printStackTrace()
         }
-        
-        println("$TAG [LoadLinks] 실패.")
         return false
     }
 }
