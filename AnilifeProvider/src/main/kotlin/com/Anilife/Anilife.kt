@@ -34,45 +34,70 @@ class Anilife : MainAPI() {
             "$mainUrl$basePath/$page"
         }
 
-        val doc = app.get(url).document
-        val home = parseCommonList(doc)
+        println("$TAG [MainPage] Request: $url")
         
-        return newHomePageResponse(request.name, home)
+        try {
+            val doc = app.get(url).document
+            val home = parseCommonList(doc)
+            return newHomePageResponse(request.name, home)
+        } catch (e: Exception) {
+            println("$TAG [MainPage] Error: ${e.message}")
+            e.printStackTrace()
+            return newHomePageResponse(request.name, emptyList())
+        }
     }
 
     private fun parseCommonList(doc: Document): List<SearchResponse> {
+        // .listupd > article.bs 구조
         val items = doc.select(".listupd > article.bs").mapNotNull { element ->
             try {
+                // 1. 링크 파싱
                 val aTag = element.selectFirst("div.bsx > a") ?: return@mapNotNull null
                 val href = fixUrl(aTag.attr("href"))
-                val title = element.selectFirst(".tt")?.text()?.trim() ?: return@mapNotNull null
-                val poster = element.selectFirst("img")?.attr("src") ?: ""
-                
-                // addSub 등 불필요한 장식 로직 제거
+
+                // 2. 제목 중복 수정 (.tt 안에 텍스트와 h2가 같이 있음)
+                // 우선 h2 태그의 텍스트를 가져오고, 없으면 .tt의 text를 가져옴
+                val titleElement = element.selectFirst(".tt h2") ?: element.selectFirst(".tt")
+                val title = titleElement?.text()?.trim() ?: "Unknown"
+
+                // 3. 포스터 파싱 (selectFirst("img")가 가끔 빗나갈 수 있으므로 구체화)
+                val imgTag = element.selectFirst(".limit img") ?: element.selectFirst("img")
+                val poster = imgTag?.attr("src")?.let { fixUrl(it) } ?: ""
+
+                // 디버깅: 포스터나 제목이 이상하면 로그 출력
+                // println("$TAG [ListItem] Title: $title | Poster: $poster | Link: $href")
+
                 newAnimeSearchResponse(title, href, TvType.Anime) {
                     this.posterUrl = poster
                 }
             } catch (e: Exception) {
+                println("$TAG [ListItem] Parse Error: ${e.message}")
                 null
             }
         }
+        println("$TAG [List] Parsed ${items.size} items.")
         return items
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/search?keyword=$query"
+        println("$TAG [Search] Query: $query -> $url")
         val doc = app.get(url).document
         return parseCommonList(doc)
     }
 
     override suspend fun load(url: String): LoadResponse {
+        println("$TAG [Load] Details URL: $url")
         val doc = app.get(url).document
 
         val title = doc.selectFirst(".entry-title")?.text()?.trim() ?: "Unknown"
-        val poster = doc.selectFirst(".thumb img")?.attr("src")
+        val poster = doc.selectFirst(".thumb img")?.attr("src")?.let { fixUrl(it) }
         val description = doc.selectFirst(".synp .entry-content")?.text()?.trim()
         val tags = doc.select(".genxed a, .taged a").map { it.text() }
         
+        println("$TAG [Load] Title: $title")
+
+        // 에피소드 파싱
         val episodes = doc.select(".eplister > ul > li > a").mapNotNull { element ->
             val href = fixUrl(element.attr("href"))
             val num = element.selectFirst(".epl-num")?.text()?.trim() ?: ""
@@ -86,6 +111,8 @@ class Anilife : MainAPI() {
                 this.episode = episodeInt
             }
         }.reversed()
+
+        println("$TAG [Load] Episodes found: ${episodes.size}")
 
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             this.posterUrl = poster
@@ -101,6 +128,7 @@ class Anilife : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        println("$TAG [LoadLinks] Start: $data")
         val extractor = AnilifeExtractor()
         return extractor.extract(data, callback)
     }
