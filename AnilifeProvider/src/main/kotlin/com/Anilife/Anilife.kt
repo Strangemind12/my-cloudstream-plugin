@@ -4,15 +4,16 @@ import android.util.Base64
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.network.WebViewResolver // [필수] 웹뷰 리졸버 사용
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 
 /**
- * Anilife Provider v5.1
- * - [Fix] Overload 해결: 불필요한 sort 제거하고 인덱스 기반 역순 할당으로 변경
- * - [Fix] 에피소드 소수점(1145.5) 처리: 화면엔 그대로 표시하되 내부 ID는 정수로 변환하여 정렬 유지
- * - [Fix] Episode 객체 posterHeaders 제거 (빌드 에러 방지)
+ * Anilife Provider v6.1
+ * - [Performance] 에피소드 처리 루프 내의 디버그 로그 전면 제거 (오버로드 방지)
+ * - [Fix] 에피소드 소수점 정렬: Float 변환 -> 오름차순 정렬 -> ID 재할당 (1145.5 위치 보정)
+ * - [Fix] 영상 링크: WebViewResolver를 사용하여 리다이렉트 및 m3u8 자동 추출
  */
 class Anilife : MainAPI() {
     override var mainUrl = "https://anilife.live"
@@ -46,24 +47,23 @@ class Anilife : MainAPI() {
             "$mainUrl$basePath/$page"
         }
 
-        try {
+        return try {
             val doc = app.get(url, headers = commonHeaders).document
             val home = parseCommonList(doc)
-            return newHomePageResponse(request.name, home)
+            newHomePageResponse(request.name, home)
         } catch (e: Exception) {
             e.printStackTrace()
-            return newHomePageResponse(request.name, emptyList())
+            newHomePageResponse(request.name, emptyList())
         }
     }
 
     private fun parseCommonList(doc: Document): List<SearchResponse> {
-        val items = doc.select(".listupd > article.bs").mapNotNull { element ->
+        // 목록 파싱은 개수가 적으므로 로그를 남겨도 되지만, 성능을 위해 최소화
+        return doc.select(".listupd > article.bs").mapNotNull { element ->
             try {
                 val aTag = element.selectFirst("div.bsx > a") ?: return@mapNotNull null
                 val rawHref = fixUrl(aTag.attr("href"))
-
-                val titleElement = element.selectFirst(".tt h2") ?: element.selectFirst(".tt")
-                val title = titleElement?.text()?.trim() ?: "Unknown"
+                val title = (element.selectFirst(".tt h2") ?: element.selectFirst(".tt"))?.text()?.trim() ?: "Unknown"
 
                 val imgTag = element.selectFirst("img")
                 var poster = imgTag?.attr("src")
@@ -74,24 +74,16 @@ class Anilife : MainAPI() {
                 val finalHref = if (poster.isNotEmpty()) {
                     try {
                         val encodedPoster = Base64.encodeToString(poster.toByteArray(), Base64.NO_WRAP)
-                        if (rawHref.contains("?")) "$rawHref&poster=$encodedPoster" 
-                        else "$rawHref?poster=$encodedPoster"
-                    } catch (e: Exception) {
-                        rawHref
-                    }
-                } else {
-                    rawHref
-                }
+                        if (rawHref.contains("?")) "$rawHref&poster=$encodedPoster" else "$rawHref?poster=$encodedPoster"
+                    } catch (e: Exception) { rawHref }
+                } else { rawHref }
 
                 newAnimeSearchResponse(title, finalHref, TvType.Anime) {
                     this.posterUrl = poster
                     this.posterHeaders = commonHeaders
                 }
-            } catch (e: Exception) {
-                null
-            }
+            } catch (e: Exception) { null }
         }
-        return items
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
@@ -99,6 +91,13 @@ class Anilife : MainAPI() {
         val doc = app.get(url, headers = commonHeaders).document
         return parseCommonList(doc)
     }
+
+    // 정렬을 위한 임시 데이터 클래스 (가볍게 유지)
+    data class TempEpisode(
+        val url: String,
+        val fullName: String,
+        val floatNum: Float
+    )
 
     override suspend fun load(url: String): LoadResponse {
         var tunnelingPoster: String? = null
@@ -108,66 +107,53 @@ class Anilife : MainAPI() {
                 val encodedPoster = if (posterParam.contains("&")) posterParam.substringBefore("&") else posterParam
                 tunnelingPoster = String(Base64.decode(encodedPoster, Base64.NO_WRAP))
                 url.substringBefore("?poster=")
-            } catch (e: Exception) {
-                url
-            }
-        } else {
-            url
-        }
+            } catch (e: Exception) { url }
+        } else { url }
 
-        println("$TAG [Load] URL: $cleanUrl")
+        println("$TAG [Load] URL: $cleanUrl") // 중요 로그 하나만 남김
         val doc = app.get(cleanUrl, headers = commonHeaders).document
-
         val title = doc.selectFirst(".entry-title")?.text()?.trim() ?: "Unknown"
-        
+
         var htmlPoster = doc.selectFirst(".thumb img")?.let { img ->
             img.attr("src").ifEmpty { img.attr("data-src") }
         }?.let { fixUrl(it) }
 
         if (htmlPoster.isNullOrEmpty() || htmlPoster == mainUrl || htmlPoster == "$mainUrl/") {
-            if (!tunnelingPoster.isNullOrEmpty()) {
-                htmlPoster = tunnelingPoster
-            }
+            if (!tunnelingPoster.isNullOrEmpty()) htmlPoster = tunnelingPoster
         }
 
         val description = doc.selectFirst(".synp .entry-content")?.text()?.trim()
         val tags = doc.select(".genxed a, .taged a").map { it.text() }
-        
-        // --- [v5.1 수정] 에피소드 파싱 (정렬 부하 제거) ---
-        // 사이트가 기본적으로 최신화(내림차순) 정렬이라고 가정하고 파싱
+
+        // [v6.1 최적화] 대량의 에피소드 파싱 시 로그 절대 금지
         val rawEpisodes = doc.select(".eplister > ul > li > a").mapNotNull { element ->
             val href = fixUrl(element.attr("href"))
             val numText = element.selectFirst(".epl-num")?.text()?.trim() ?: ""
             val epTitle = element.selectFirst(".epl-title")?.text()?.trim() ?: ""
+            val fullName = if (numText.isNotEmpty()) "${numText}화 - $epTitle" else epTitle
+            // 정렬 키 추출 (실패 시 0 처리)
+            val floatNum = numText.toFloatOrNull() ?: 0f
             
-            val fullName = if(numText.isNotEmpty()) "${numText}화 - $epTitle" else epTitle
-            
-            // 데이터만 추출 (정렬 X)
-            Triple(href, fullName, numText)
+            TempEpisode(href, fullName, floatNum)
         }
 
-        val totalEpisodes = rawEpisodes.size
-        
-        // 최신화가 위에 있다면(내림차순), 인덱스를 역으로 부여하여 정수 ID 생성
-        // 예: 0번 인덱스(1146화) -> ID 1100
-        // 예: 1번 인덱스(1145.5화) -> ID 1099
-        // 이렇게 하면 앱 내부적으로는 정수로 인식되어 "20개씩 끊기(Pagination)"가 정상 작동함
-        val finalEpisodes = rawEpisodes.mapIndexed { index, (href, fullName, _) ->
-            newEpisode(href) {
-                this.name = fullName
-                // 고유 ID 부여 (단순 계산이라 매우 빠름)
-                this.episode = totalEpisodes - index
+        // 1. 메모리 상에서 빠르게 정렬 (오름차순: 1화 -> 1145화 -> 1145.5화 -> 1146화)
+        // 코틀린의 sort는 매우 빠르므로 1000개 정도는 순식간에 처리됨 (로그만 안 찍으면 됨)
+        val sortedEpisodes = rawEpisodes.sortedBy { it.floatNum }
+
+        // 2. 정수 ID 순차 부여 (앱이 ID 순서대로 정렬하도록 유도)
+        val finalEpisodes = sortedEpisodes.mapIndexed { index, temp ->
+            newEpisode(temp.url) {
+                this.name = temp.fullName
+                this.episode = index + 1
             }
-        }
-        
-        // Cloudstream은 보통 addEpisodes에 넣으면 episode 번호에 따라 자동 정렬/그룹화함
-        // 만약 역순으로 보이면 .reversed() 추가 필요하나, ID를 잘 부여했으므로 그대로 전달
+        }.reversed() // 최신화가 상단에 오도록 반전
 
         println("$TAG [Load] Loaded ${finalEpisodes.size} episodes.")
 
         return newAnimeLoadResponse(title, cleanUrl, TvType.Anime) {
             this.posterUrl = htmlPoster
-            this.posterHeaders = commonHeaders 
+            this.posterHeaders = commonHeaders
             this.plot = description
             this.tags = tags
             addEpisodes(DubStatus.Subbed, finalEpisodes)
@@ -180,9 +166,46 @@ class Anilife : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        // 포스터 파라미터 제거
         val cleanData = if (data.contains("poster=")) data.substringBefore("?poster=") else data
         println("$TAG [LoadLinks] Start: $cleanData")
-        val extractor = AnilifeExtractor()
-        return extractor.extract(cleanData, callback)
+
+        try {
+            // [v6.1 수정] WebViewResolver를 메인으로 사용
+            // 자동으로 리다이렉트(js)를 수행하고 .m3u8 요청을 감지합니다.
+            // Anilife 구조: Provider URL -> (JS Redirect) -> Player URL -> .m3u8
+            val webViewInterceptor = WebViewResolver(
+                Regex("""\.m3u8"""), // .m3u8 요청을 감지
+                userAgent = commonHeaders["User-Agent"],
+                referer = "https://anilife.live/"
+            )
+            
+            // WebViewResolver를 interceptor로 사용하여 요청
+            val response = app.get(cleanData, headers = commonHeaders, interceptor = webViewInterceptor)
+            val interceptedUrl = response.url
+            
+            println("$TAG [WebView] Sniffed URL: $interceptedUrl")
+
+            if (interceptedUrl.contains(".m3u8")) {
+                 callback.invoke(
+                    newExtractorLink(
+                        source = name,
+                        name = name,
+                        url = interceptedUrl,
+                        type = ExtractorLinkType.M3U8
+                    ) {
+                        this.referer = "https://anilife.live/"
+                        this.quality = getQualityFromName("HD")
+                    }
+                )
+                return true
+            } else {
+                println("$TAG [WebView] Failed to sniff m3u8. URL: $interceptedUrl")
+            }
+        } catch (e: Exception) {
+            println("$TAG [WebView] Error: ${e.message}")
+        }
+
+        return false
     }
 }
