@@ -9,8 +9,8 @@ import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 
 /**
  * Extractor v5.0
- * - [Fix] 리다이렉트 URL 탐색 로직 강화
- * - location.href 특정 패턴 대신, HTML 전체에서 'https://anilife.live/h/live' 링크 검색
+ * - [Fix] 리다이렉트 URL 탐색 로직 강화 (영상 링크 찾기 실패 해결)
+ * - HTML 전체에서 'https://anilife.live/h/live' 패턴을 직접 검색
  */
 class AnilifeExtractor {
     private val TAG = "[AnilifeExtractor]"
@@ -40,7 +40,7 @@ class AnilifeExtractor {
             // 2. 플레이어 선택 페이지인지 확인 (HTML 전체 검색)
             val rawHtml = doc.html()
             
-            // [v5.0 수정] location.href 문법에 의존하지 않고, 실제 이동해야 할 URL 패턴을 직접 찾음
+            // [v5.0 핵심] 변수명(location.href)에 의존하지 않고, 실제 이동해야 할 URL 패턴을 직접 찾음
             // 패턴: https://anilife.live/h/live... 로 시작하는 URL
             val urlRegex = Regex("""https:\\/\\/anilife\.live\\/h\\/live[^"']+""")
             val match = urlRegex.find(rawHtml)
