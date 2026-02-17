@@ -7,10 +7,10 @@ import com.lagradost.cloudstream3.network.WebViewResolver
 import org.jsoup.nodes.Document
 
 /**
- * Anilife Provider v37.0
- * - [Fix] URL 재조립 시 이중 슬래시(//) 방지 및 '/1080/playlist.m3u8' 패턴 적용
- * - [Debug] 서버 응답 로그가 잘리지 않도록 전체 출력 로직 개선
- * - [Fix] v35.0의 PC User-Agent 및 헤더 설정 유지
+ * Anilife Provider v38.0
+ * - [Critical Fix] URL 재조립 로직 폐기 -> 서버가 생성하는 토큰이 달라지므로 추측 불가능함.
+ * - [Solution] 'm3u8/st' 링크로 직접 HTTP 요청을 보내 리다이렉트된 최종 'manifest' 주소를 받아오도록 수정.
+ * - [Fix] PC User-Agent 및 메인 도메인 Referer를 사용하여 403 차단 우회.
  */
 class Anilife : MainAPI() {
     override var mainUrl = "https://anilife.live"
@@ -21,7 +21,7 @@ class Anilife : MainAPI() {
 
     private val TAG = "[Anilife]"
 
-    // PC User-Agent (성공한 브라우저 헤더 기준)
+    // PC User-Agent (Chrome 144 - 사용자 성공 로그 기반)
     private val pcUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
 
     private val commonHeaders = mapOf(
@@ -29,13 +29,12 @@ class Anilife : MainAPI() {
         "Referer" to "$mainUrl/"
     )
 
-    // 로그가 4000자를 넘어도 모두 출력되도록 재귀 호출
-    private fun logFullContent(tag: String, msg: String) {
+    private fun logLargeString(tag: String, msg: String) {
         if (msg.length > 4000) {
-            println("$tag [Log-Part] ${msg.substring(0, 4000)}")
-            logFullContent(tag, msg.substring(4000))
+            println("$tag [Chunk] ${msg.substring(0, 4000)}")
+            logLargeString(tag, msg.substring(4000))
         } else {
-            println("$tag [Log-End] $msg")
+            println("$tag [End] $msg")
         }
     }
 
@@ -103,7 +102,6 @@ class Anilife : MainAPI() {
 
         println("$TAG [Load] 접속 시도: $cleanUrl")
         
-        // 리다이렉트된 최종 URL 획득
         val response = app.get(cleanUrl, headers = commonHeaders)
         val doc = response.document
         val finalUrl = response.url
@@ -118,8 +116,6 @@ class Anilife : MainAPI() {
             val numText = element.selectFirst(".epl-num")?.text()?.trim() ?: ""
             val epTitle = element.selectFirst(".epl-title")?.text()?.trim() ?: ""
             val fullName = if (numText.isNotEmpty()) "${numText}화 - $epTitle" else epTitle
-            
-            // ref 파라미터 추가
             val finalHref = if (rawHref.contains("?")) "$rawHref&ref=$encodedRef" else "$rawHref?ref=$encodedRef"
 
             newEpisode(finalHref) {
@@ -143,7 +139,7 @@ class Anilife : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("$TAG [LoadLinks] === 프로세스 시작 (v37.0) ===")
+        println("$TAG [LoadLinks] === 프로세스 시작 (v38.0) ===")
         
         var cleanData = data.substringBefore("?poster=")
         var detailReferer = "$mainUrl/"
@@ -188,9 +184,9 @@ class Anilife : MainAPI() {
             
             if (playerUrl != null) {
                 println("$TAG [2단계] 추출 성공: $playerUrl")
-                println("$TAG [3단계] M3U8 API 스니핑 및 재조립 시도...")
+                println("$TAG [3단계] M3U8 API 주소 스니핑 시도...")
 
-                // [3단계] WebView로 플레이어 페이지 접속
+                // [3단계] WebView로 플레이어 페이지 접속 -> API 주소 획득
                 try {
                     val m3u8Interceptor = WebViewResolver(Regex("""m3u8"""))
                     val m3u8Response = app.get(
@@ -201,46 +197,28 @@ class Anilife : MainAPI() {
                         ),
                         interceptor = m3u8Interceptor
                     )
-                    var finalM3u8 = m3u8Response.url
-                    println("$TAG [3단계] 스니핑된 원본 URL: $finalM3u8")
+                    val sniffedUrl = m3u8Response.url
+                    println("$TAG [3단계] 스니핑된 URL: $sniffedUrl")
 
-                    // [v37.0 수정] URL 재조립 정교화 (이중 슬래시 방지 및 1080 추가)
-                    if (finalM3u8.contains("/m3u8/st/")) {
-                        println("$TAG [3단계] API 주소 감지됨. 재조립 수행...")
+                    // [v38.0 핵심] 스니핑된 주소(st)로 접속하여 리다이렉트된 최종 주소(manifest)를 받아옴
+                    if (sniffedUrl.contains("m3u8")) {
+                        println("$TAG [3단계-B] 최종 주소 획득(리다이렉트 추적) 시도...")
                         
-                        // 1. 기본 API 경로 변경
-                        var tempUrl = finalM3u8.replace("/m3u8/st/", "/v1/manifest/b/")
-                        
-                        // 2. 뒤쪽 슬래시 제거 (이중 슬래시 방지)
-                        if (tempUrl.endsWith("/")) {
-                            tempUrl = tempUrl.substring(0, tempUrl.length - 1)
-                        }
-                        
-                        // 3. 브라우저 로그 기반 경로(/1080/playlist.m3u8) 추가
-                        finalM3u8 = "$tempUrl/1080/playlist.m3u8"
-                        
-                        println("$TAG [3단계] 재조립된 최종 URL: $finalM3u8")
-                    }
-
-                    if (finalM3u8.contains("m3u8")) {
-                        // [v37.0 수정] 4단계: 최종 링크 사전 검증 및 전체 로그 출력
-                        println("$TAG [4단계] 최종 링크 접속 테스트...")
-                        val checkResponse = app.get(
-                            finalM3u8,
+                        val finalResponse = app.get(
+                            sniffedUrl,
                             headers = mapOf(
                                 "User-Agent" to pcUserAgent,
-                                "Referer" to "https://anilife.live/",
-                                "Origin" to "https://anilife.live",
-                                "Accept" to "*/*"
+                                "Referer" to "https://anilife.live/" // 메인 도메인 Referer 필수
                             ),
-                            interceptor = WebViewResolver(Regex(".*"))
+                            allowRedirects = true // 리다이렉트 자동 수행
                         )
                         
-                        val content = checkResponse.text
-                        println("$TAG [4단계] 검증 완료. 상태 코드: ${checkResponse.code}")
-                        
-                        if (content.contains("#EXTM3U")) {
-                            println("$TAG [4단계] 검증 성공! 유효한 M3U8 파일입니다.")
+                        val finalM3u8 = finalResponse.url
+                        println("$TAG [3단계-B] 최종 주소 획득 성공: $finalM3u8")
+                        println("$TAG [3단계-B] 상태 코드: ${finalResponse.code}")
+
+                        // 만약 최종 주소가 M3U8이라면 재생
+                        if (finalM3u8.contains("m3u8") && finalResponse.code == 200) {
                             callback.invoke(
                                 newExtractorLink(
                                     source = name,
@@ -248,10 +226,12 @@ class Anilife : MainAPI() {
                                     url = finalM3u8,
                                     type = ExtractorLinkType.M3U8
                                 ) {
+                                    // 재생 시에도 성공했던 헤더 그대로 사용
                                     this.referer = "https://anilife.live/"
                                     this.headers = mapOf(
                                         "User-Agent" to pcUserAgent,
-                                        "Origin" to "https://anilife.live"
+                                        "Origin" to "https://anilife.live",
+                                        "Accept" to "*/*"
                                     )
                                     this.quality = getQualityFromName("HD")
                                 }
@@ -259,16 +239,14 @@ class Anilife : MainAPI() {
                             println("$TAG [완료] 링크 반환 성공.")
                             return true
                         } else {
-                            println("$TAG [4단계] 검증 실패! 내용은 M3U8이 아닙니다.")
-                            println("$TAG [Debug] ================= 서버 응답 내용 (Start) =================")
-                            logFullContent(TAG, content)
-                            println("$TAG [Debug] ================= 서버 응답 내용 (End) ===================")
+                            println("$TAG [3단계-B] 실패: 최종 주소가 m3u8이 아니거나 200 OK가 아님.")
+                            logLargeString(TAG, finalResponse.text)
                         }
                     } else {
-                        println("$TAG [3단계] 실패: 유효한 m3u8 주소를 만들지 못했습니다.")
+                        println("$TAG [3단계] 실패: 스니핑된 주소에 m3u8이 없습니다.")
                     }
                 } catch (e: Exception) {
-                    println("$TAG [3단계/4단계] 에러: ${e.message}")
+                    println("$TAG [3단계] WebView 에러: ${e.message}")
                     e.printStackTrace()
                 }
             } else {
