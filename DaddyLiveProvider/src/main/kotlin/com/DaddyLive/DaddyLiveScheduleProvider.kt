@@ -34,7 +34,7 @@ import java.util.TimeZone
 
 class DaddyLiveScheduleProvider : MainAPI() {
     override var mainUrl = "https://dlhd.link"
-    override var name = "DaddyLive Schedule"
+    override var name = "DaddyLive"
     override val supportedTypes = setOf(TvType.Live)
     override var lang = "un"
     override val hasMainPage = true
