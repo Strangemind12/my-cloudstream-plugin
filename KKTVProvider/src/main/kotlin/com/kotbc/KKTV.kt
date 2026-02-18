@@ -1,4 +1,4 @@
-// v5.1 - 빌드 에러 수정 (headers.putAll -> headers = ...)
+// v7.0 - DaddyLive 스타일 파싱 적용 (페이지 소스 분석 -> 링크 추출)
 package com.KingkongTv
 
 import android.net.Uri
@@ -15,13 +15,8 @@ class KingkongTv : MainAPI() {
     override var lang = "ko"
     override val supportedTypes = setOf(TvType.Live)
 
-    // 카테고리 매핑
-    private val categoryMap = mapOf(
-        "cate_1" to "축구", "cate_2" to "농구", "cate_3" to "배구",
-        "cate_4" to "야구", "cate_5" to "하키", "cate_6" to "럭비",
-        "cate_7" to "LoL", "cate_8" to "e스포츠", "cate_9" to "일반/HD",
-        "cate_10" to "UFC", "cate_11" to "테니스"
-    )
+    // DaddyLive에서 사용된 User-Agent 참고
+    private val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
 
     override val mainPage = mainPageOf(
         "/live/sportstv" to "실시간 스포츠 중계",
@@ -29,24 +24,20 @@ class KingkongTv : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = "$mainUrl${request.data}"
-        println("DEBUG [KingkongTv] v5.1: 메인 페이지 요청 - URL: $url")
         
         try {
             val mainDoc = app.get(url).document
             val iframeElement = mainDoc.selectFirst("iframe#broadcastFrame")
             var iframeSrc = iframeElement?.attr("src")
 
+            // Iframe이 없거나 비어있으면 기본값 사용 (제공된 파일 기반)
             if (iframeSrc.isNullOrBlank()) {
-                println("DEBUG [KingkongTv] v5.1: iframe#broadcastFrame 없음. 기본값 사용.")
                 iframeSrc = "https://kktv.speed10-1.com/kktv/index.php?tg=1ch&ca=0"
             }
 
             val realUrl = fixUrl(url, iframeSrc!!)
-            println("DEBUG [KingkongTv] v5.1: Iframe 내부 진입 - URL: $realUrl")
-
             val contentDoc = app.get(realUrl, referer = url).document
             val rows = contentDoc.select("div.sports_on_list table tbody tr")
-            println("DEBUG [KingkongTv] v5.1: 파싱된 행 개수: ${rows.size}")
 
             val home = rows.mapNotNull { row ->
                 row.toSearchResult(realUrl)
@@ -61,7 +52,6 @@ class KingkongTv : MainAPI() {
                 hasNext = false
             )
         } catch (e: Exception) {
-            println("DEBUG [KingkongTv] v5.1: 메인 페이지 로드 실패 - ${e.message}")
             e.printStackTrace()
             return newHomePageResponse(request.name, emptyList())
         }
@@ -80,11 +70,13 @@ class KingkongTv : MainAPI() {
             fixUrl(refererUrl, it) 
         } ?: ""
 
-        // URL 인코딩 (데이터 전달용)
         val encodedTitle = URLEncoder.encode(title, "UTF-8")
         val encodedPoster = URLEncoder.encode(thumbUrl, "UTF-8")
+        
+        // Iframe URL을 Referer로 넘겨야 함
         val encodedRef = URLEncoder.encode(refererUrl, "UTF-8")
 
+        // URL에 streamId 뿐만 아니라 referer 정보도 포함
         val fakeUrl = "$mainUrl/live_stream/$streamId?title=$encodedTitle&poster=$encodedPoster&ref=$encodedRef"
 
         return newLiveSearchResponse(title, fakeUrl, TvType.Live) {
@@ -93,17 +85,15 @@ class KingkongTv : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse? {
-        println("DEBUG [KingkongTv] v5.1: 상세 페이지(load) 진입 - URL: $url")
         val uri = Uri.parse(url)
         val streamId = url.substringAfter("/live_stream/").substringBefore("?")
         
         val rawTitle = uri.getQueryParameter("title")
-        val title = if (!rawTitle.isNullOrBlank()) URLDecoder.decode(rawTitle, "UTF-8") else "Live $streamId"
+        val title = if (!rawTitle.isNullOrBlank()) URLDecoder.decode(rawTitle, "UTF-8") else "Live Stream"
         
         val rawPoster = uri.getQueryParameter("poster")
         val poster = if (!rawPoster.isNullOrBlank()) URLDecoder.decode(rawPoster, "UTF-8") else null
 
-        // 상세페이지 제목 동기화 및 플롯 고정
         return newLiveStreamLoadResponse(title, url, url) {
             this.posterUrl = poster
             this.plot = "실시간 중계" 
@@ -116,71 +106,77 @@ class KingkongTv : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("DEBUG [KingkongTv] v5.1: loadLinks 시작")
-        println("DEBUG [KingkongTv] v5.1: 요청 데이터: $data")
-
+        // 1. 파라미터 파싱
         val uri = Uri.parse(data)
         val streamId = data.substringAfter("/live_stream/").substringBefore("?")
         val rawRef = uri.getQueryParameter("ref")
-        val refererUrl = if (!rawRef.isNullOrBlank()) URLDecoder.decode(rawRef, "UTF-8") else "https://kktv.speed10-1.com/"
+        // Referer는 메인 페이지가 아닌 Iframe 주소여야 함 (DaddyLive 방식)
+        val refererUrl = if (!rawRef.isNullOrBlank()) URLDecoder.decode(rawRef, "UTF-8") else "https://kktv.speed10-1.com/kktv/index.php"
+        
+        println("DEBUG [KingkongTv] v7.0: ID=$streamId, Referer=$refererUrl")
 
-        println("DEBUG [KingkongTv] v5.1: Target Stream ID: $streamId")
-        println("DEBUG [KingkongTv] v5.1: Target Referer: $refererUrl")
-
-        // 테스트할 URL 패턴 목록
-        val candidates = listOf(
-            "HLS_V1" to "http://play.ogtv3.com/live/$streamId/playlist.m3u8?site=kktv",
-            "HLS_V2" to "http://play.ogtv3.com/live/$streamId.m3u8?site=kktv",
-            "HLS_V3" to "http://play.ogtv3.com/live/$streamId/chunklist.m3u8?site=kktv",
-            "FLV_V1" to "http://play.ogtv3.com/live/$streamId.flv?site=kktv"
-        )
-
+        // 2. 플레이어 페이지 소스 가져오기 (DaddyLive의 extractFromNewzar 방식 모방)
+        // 실제 플레이어가 로드되는 URL (pc_view.php 추정)
+        val playerPageUrl = "https://kktv.speed10-1.com/kktv/pc_view.php?stream=$streamId"
+        
         val headers = mapOf(
+            "User-Agent" to userAgent,
             "Referer" to refererUrl,
-            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Origin" to "https://kktv.speed10-1.com"
         )
 
-        var foundValidLink = false
-
-        // 각 후보 URL에 대해 실제 연결 테스트(Probe) 수행
-        for ((label, testUrl) in candidates) {
-            println("DEBUG [KingkongTv] v5.1: 네트워크 테스트 시도 [$label] -> $testUrl")
-            try {
-                // 타임아웃 5초 설정하여 빠르게 체크
-                val response = app.get(testUrl, headers = headers, timeout = 5000L)
-                val code = response.code
-                println("DEBUG [KingkongTv] v5.1: 응답 코드 [$code] - $label")
-
-                if (code == 200) {
-                    println("DEBUG [KingkongTv] v5.1: >> 유효한 링크 발견! 플레이어에 전달합니다.")
-                    foundValidLink = true
-                    
-                    val type = if (label.contains("FLV")) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8
-                    
-                    callback.invoke(
-                        newExtractorLink(
-                            name = "KingkongTv ($label)",
-                            source = name,
-                            url = testUrl,
-                            type = type
-                        ) {
-                            this.referer = refererUrl
-                            // [수정됨] putAll 대신 대입 연산자 사용
-                            this.headers = headers
-                            this.quality = Qualities.Unknown.value
-                        }
-                    )
-                } else {
-                    println("DEBUG [KingkongTv] v5.1: 유효하지 않은 응답 ($code). 패스.")
+        try {
+            println("DEBUG [KingkongTv] v7.0: 플레이어 페이지 요청 - $playerPageUrl")
+            val response = app.get(playerPageUrl, headers = headers).text
+            
+            // 3. 페이지 소스에서 URL 추출 (Regex)
+            // 패턴 1: 직접적인 .m3u8 링크 찾기
+            var m3u8Url = Regex("""['"](http[^'"]+\.m3u8[^'"]*)['"]""").find(response)?.groupValues?.get(1)
+            
+            // 패턴 2: WebRTC 링크 찾기 (webrtc://...) -> HTTPS HLS로 변환
+            if (m3u8Url == null) {
+                val webrtcMatch = Regex("""['"](webrtc://[^'"]+)['"]""").find(response)?.groupValues?.get(1)
+                if (webrtcMatch != null) {
+                    println("DEBUG [KingkongTv] v7.0: WebRTC 링크 발견 - $webrtcMatch")
+                    // webrtc://play.ogtv3.com/live/live503?site=kktv
+                    // -> https://play.ogtv3.com/live/live503.m3u8?site=kktv (프로토콜 및 확장자 변경)
+                    m3u8Url = webrtcMatch
+                        .replace("webrtc://", "https://")
+                        .replace(streamId, "$streamId.m3u8") // live503 -> live503.m3u8 변환 시도
                 }
-            } catch (e: Exception) {
-                println("DEBUG [KingkongTv] v5.1: 연결 실패 [$label] - ${e.javaClass.simpleName}: ${e.message}")
             }
-        }
 
-        if (!foundValidLink) {
-            println("DEBUG [KingkongTv] v5.1: 모든 URL 패턴 테스트 실패. 서버가 WebRTC 전용이거나 HTTP 접근을 차단했을 가능성이 높습니다.")
+            // 4. 추출 실패 시, 수동 구성 (Backup Plan)
+            if (m3u8Url == null) {
+                println("DEBUG [KingkongTv] v7.0: 링크 추출 실패. 수동 구성 시도.")
+                // HTTPS 프로토콜 강제 사용 (DaddyLive는 HTTPS를 씀)
+                m3u8Url = "https://play.ogtv3.com/live/$streamId.m3u8?site=kktv"
+            }
+
+            println("DEBUG [KingkongTv] v7.0: 최종 M3U8 URL - $m3u8Url")
+
+            // 5. ExtractorLink 반환 (DaddyLive 스타일)
+            callback.invoke(
+                newExtractorLink(
+                    source = name,
+                    name = name,
+                    url = m3u8Url!!,
+                    type = ExtractorLinkType.M3U8
+                ) {
+                    this.referer = "https://kktv.speed10-1.com/" // Origin과 동일하게 맞춤
+                    this.quality = Qualities.Unknown.value
+                    // 헤더 강제 설정 (중요: putAll 대신 대입)
+                    this.headers = mapOf(
+                        "Origin" to "https://kktv.speed10-1.com",
+                        "Referer" to "https://kktv.speed10-1.com/",
+                        "User-Agent" to userAgent
+                    )
+                }
+            )
+
+        } catch (e: Exception) {
+            println("DEBUG [KingkongTv] v7.0: 에러 발생 - ${e.message}")
+            e.printStackTrace()
         }
 
         return true
