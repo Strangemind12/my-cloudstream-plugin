@@ -46,7 +46,7 @@ class DaddyLiveScheduleProvider : MainAPI() {
     @Suppress("ConstPropertyName")
     companion object {
         private const val posterUrl =
-            "https://raw.githubusercontent.com/DaddyLiveProvider/refs/heads/master/DaddyLive/daddylive.jpg"
+            "https://raw.githubusercontent.com/hsp1020/TestPlugins/6714d45bc449b7d8b824f99baacc5575caea143f/DaddyLiveProvider/daddylive.jpg"
 
         fun convertGMTToLocalTime(gmtTime: String): String {
             // Define the input format (GMT time)
