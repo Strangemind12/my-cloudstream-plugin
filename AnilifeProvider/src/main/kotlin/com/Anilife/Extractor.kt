@@ -14,7 +14,7 @@ import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.AcraApplication
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.suspendCancellableCoroutine
 import java.io.BufferedReader
@@ -32,10 +32,9 @@ import kotlin.concurrent.thread
 import kotlin.coroutines.resume
 
 /**
- * Anilife Proxy Extractor v76.0
- * - [Paradigm Shift] "Resource Injection": 외부 주입이 아닌, 로딩되는 JS 파일 자체를 변조하여 후킹 스크립트 삽입
- * - [Target] Iframe 내부 및 타이밍 이슈 완벽 해결. 플레이어가 실행되려면 반드시 우리 코드를 먼저 거쳐야 함.
- * - [Fix] 32바이트 키 대응 및 17개 후보군 생성 로직 유지
+ * Anilife Proxy Extractor v78.0
+ * - [Debug] 모든 단계에 상세 로그 추가 (성공/실패/URL/데이터크기)
+ * - [Logic] 리소스 변조(Trojan) 방식 유지
  */
 class AnilifeProxyExtractor : ExtractorApi() {
     override val name = "AnilifeProxy"
@@ -51,7 +50,6 @@ class AnilifeProxyExtractor : ExtractorApi() {
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) { }
 
     fun extractPlayerUrl(html: String, domain: String): String? {
-        // 기존 로직 유지
         val patterns = listOf(
             Regex("""location\.href\s*=\s*["']([^"']+)["']"""),
             Regex("""["']([^"']*h\/live\?p=[^"']+)["']""")
@@ -79,12 +77,11 @@ class AnilifeProxyExtractor : ExtractorApi() {
     ): Boolean {
         synchronized(this) { currentProxyServer?.stop(); currentProxyServer = null }
 
-        println("[Anilife][Proxy] 1. 프록시 서버 및 키 저장소 초기화")
+        println("[Anilife][Proxy] 1. 프록시 서버 시작 준비")
         val sessionKeys = Collections.synchronizedSet(mutableSetOf<String>())
 
-        // [v76.0] 리소스 변조 방식의 웹뷰 후킹 시작
-        println("[Anilife][Proxy] 2. 리소스 변조(Injection) 웹뷰 가동...")
-        runWebViewResourceInjection(playerUrl, referer, ssid, cookies, sessionKeys)
+        println("[Anilife][Proxy] 2. 리소스 변조 웹뷰 실행 요청 (TargetKey: $directKeyUrl)")
+        runWebViewResourceInjection(playerUrl, referer, ssid, cookies, directKeyUrl, sessionKeys)
 
         val proxy = ProxyWebServer(sessionKeys).apply { 
             start()
@@ -104,6 +101,8 @@ class AnilifeProxyExtractor : ExtractorApi() {
 
         try {
             val res = app.get(m3u8Url, headers = proxy.getCurrentHeaders())
+            println("[Anilife][Proxy] M3U8 원본 다운로드 완료 (Size: ${res.text.length})")
+            
             val content = res.text
             val baseUri = URI(m3u8Url)
             val sb = StringBuilder()
@@ -135,7 +134,7 @@ class AnilifeProxyExtractor : ExtractorApi() {
             proxy.setPlaylist(sb.toString())
             val finalProxyUrl = "http://127.0.0.1:${proxy.port}/playlist.m3u8"
             
-            println("[Anilife][Proxy] 3. 프록시 링크 반환: $finalProxyUrl")
+            println("[Anilife][Proxy] 3. 프록시 URL 반환: $finalProxyUrl")
             callback(newExtractorLink(name, name, finalProxyUrl, ExtractorLinkType.M3U8) {
                 this.referer = ""
                 this.headers = proxy.getCurrentHeaders()
@@ -143,25 +142,24 @@ class AnilifeProxyExtractor : ExtractorApi() {
             return true
 
         } catch (e: Exception) {
-            println("[Anilife][Proxy] Error: ${e.message}")
+            println("[Anilife][Proxy] 에러: ${e.message}")
             return false
         }
     }
 
-    // [v76.0 핵심] JS 파일을 가로채서 후킹 코드를 심어버리는 함수
     private suspend fun runWebViewResourceInjection(
         url: String, 
         referer: String, 
         ssid: String?,
         cookies: String,
+        targetKeyUrl: String?,
         sessionKeys: MutableSet<String>
     ) = suspendCancellableCoroutine<Unit> { cont ->
         val handler = Handler(Looper.getMainLooper())
         
-        // 우리가 심을 악성(?) 코드: 키를 낚아채서 콘솔로 뱉음
-        val injectionCode = """
+        // Passive Hook Code
+        val passiveHookCode = """
             (function() {
-                // 이미 주입되었으면 패스
                 if (window.keyHookInjected) return;
                 window.keyHookInjected = true;
                 console.log("CapturedKeyHex: [INIT] Injected into " + window.location.href);
@@ -169,8 +167,7 @@ class AnilifeProxyExtractor : ExtractorApi() {
                 if (window.crypto && window.crypto.subtle) {
                     const oI = window.crypto.subtle.importKey;
                     window.crypto.subtle.importKey = function(f, k, ...args) {
-                        // 16바이트 or 32바이트 감지
-                        if (f === 'raw' && (k.byteLength === 16 || k.byteLength === 32 || k.length === 16 || k.length === 32)) {
+                        if (f === 'raw' && (k.byteLength === 16 || k.byteLength === 32)) {
                             let hex = Array.from(new Uint8Array(k)).map(b => b.toString(16).padStart(2, '0')).join('');
                             console.log("CapturedKeyHex:" + hex);
                         }
@@ -187,6 +184,28 @@ class AnilifeProxyExtractor : ExtractorApi() {
                 };
             })();
         """.trimIndent()
+
+        // Active Fetch Code
+        val activeFetchCode = if (targetKeyUrl != null) """
+            <script>
+            (async function() {
+                console.log("[JS] Active Fetching: $targetKeyUrl");
+                try {
+                    const response = await fetch("$targetKeyUrl", { referrerPolicy: "no-referrer", credentials: "include" });
+                    if (!response.ok) {
+                        console.log("[JS] Fetch Failed: " + response.status);
+                        return;
+                    }
+                    const buffer = await response.arrayBuffer();
+                    const bytes = new Uint8Array(buffer);
+                    const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+                    console.log("CapturedKeyHex:" + hex);
+                } catch(e) {
+                    console.log("[JS] Fetch Error: " + e.message);
+                }
+            })();
+            </script>
+        """.trimIndent() else ""
 
         handler.post {
             try {
@@ -205,65 +224,81 @@ class AnilifeProxyExtractor : ExtractorApi() {
                         val msg = cm?.message() ?: ""
                         if (msg.contains("CapturedKeyHex:")) {
                             val key = msg.substringAfter("CapturedKeyHex:").trim()
-                            // 초기화 로그 외에 실제 키만 등록
                             if (!key.startsWith("[INIT]") && sessionKeys.add(key)) {
                                 println("[Anilife][Hook] ★키 발견★: $key")
                             } else if (key.startsWith("[INIT]")) {
-                                println("[Anilife][Hook] 인젝션 성공: ${msg.substringAfter("[INIT]")}")
+                                println("[Anilife][Hook] 초기화 완료.")
                             }
+                        } else if (msg.contains("[JS]")) {
+                            println("[Anilife][JS] $msg")
                         }
                         return true
                     }
                 }
 
                 webView.webViewClient = object : WebViewClient() {
-                    // [v76.0] 리소스 요청 가로채기
                     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                         val reqUrl = request?.url.toString()
                         
-                        // .js 파일이거나 플레이어 관련 스크립트인 경우
-                        if (reqUrl.endsWith(".js") || reqUrl.contains("player") || reqUrl.contains("hls")) {
-                            println("[Anilife][Inject] JS 파일 감지: $reqUrl")
+                        // 1. HTML 변조 (Active Fetch 주입)
+                        if (reqUrl.contains("/h/live") && !reqUrl.endsWith(".js") && !reqUrl.endsWith(".css") && !reqUrl.endsWith(".png")) {
+                            println("[Anilife][Inject] HTML 요청 감지: $reqUrl")
                             try {
-                                // 1. 원본 JS 다운로드 (헤더 유지)
-                                val headers = mutableMapOf(
-                                    "User-Agent" to DESKTOP_UA,
-                                    "Referer" to referer,
-                                    "Cookie" to cookies
-                                )
+                                val headers = mutableMapOf("User-Agent" to DESKTOP_UA, "Referer" to referer, "Cookie" to cookies)
                                 if (!ssid.isNullOrBlank()) headers["x-user-ssid"] = ssid
                                 
-                                // runBlocking을 사용하여 동기적으로 다운로드 (shouldInterceptRequest는 백그라운드 스레드에서 돔)
-                                val response = runBlocking {
-                                    app.get(reqUrl, headers = headers)
+                                val response = runBlocking { app.get(reqUrl, headers = headers) }
+                                if (response.code != 200) {
+                                    println("[Anilife][Inject] 원본 HTML 로드 실패: ${response.code}")
+                                    return super.shouldInterceptRequest(view, request)
+                                }
+
+                                var html = response.text
+                                // <head> 태그 뒤에 주입, 없으면 <html> 뒤, 없으면 맨 앞
+                                if (html.contains("<head>")) {
+                                    html = html.replaceFirst("<head>", "<head>\n$activeFetchCode")
+                                } else if (html.contains("<html>")) {
+                                    html = html.replaceFirst("<html>", "<html>\n$activeFetchCode")
+                                } else {
+                                    html = "$activeFetchCode\n$html"
                                 }
                                 
-                                // 2. 우리 코드를 맨 앞에 붙임 (Prepend)
-                                val originalJs = response.text
-                                val modifiedJs = injectionCode + "\n" + originalJs
-                                
-                                // 3. 변조된 JS 반환
-                                return WebResourceResponse(
-                                    "application/javascript",
-                                    "utf-8",
-                                    ByteArrayInputStream(modifiedJs.toByteArray())
-                                )
-                            } catch (e: Exception) {
-                                println("[Anilife][Inject] 변조 실패 (원본 로드): ${e.message}")
-                            }
+                                println("[Anilife][Inject] HTML 변조 완료 및 반환")
+                                return WebResourceResponse("text/html", "utf-8", ByteArrayInputStream(html.toByteArray()))
+                            } catch (e: Exception) { println("[Anilife][Inject] HTML 처리 중 예외: ${e.message}") }
                         }
+                        
+                        // 2. JS 변조 (Passive Hook 주입)
+                        // 플레이어 스크립트, hls 관련, 또는 일반 js 파일
+                        if (reqUrl.endsWith(".js") || reqUrl.contains(".js?") || reqUrl.contains("player") || reqUrl.contains("hls")) {
+                            // println("[Anilife][Inject] JS 요청 감지: $reqUrl")
+                            try {
+                                val headers = mutableMapOf("User-Agent" to DESKTOP_UA, "Referer" to referer, "Cookie" to cookies)
+                                if (!ssid.isNullOrBlank()) headers["x-user-ssid"] = ssid
+                                
+                                val response = runBlocking { app.get(reqUrl, headers = headers) }
+                                val js = passiveHookCode + "\n" + response.text
+                                
+                                return WebResourceResponse("application/javascript", "utf-8", ByteArrayInputStream(js.toByteArray()))
+                            } catch (e: Exception) {}
+                        }
+                        
                         return super.shouldInterceptRequest(view, request)
                     }
 
                     override fun onPageFinished(view: WebView?, url: String?) {
                         super.onPageFinished(view, url)
-                        // 타임아웃 15초 설정
+                        println("[Anilife][Inject] 페이지 로드 완료. (15초 대기 시작)")
                         handler.postDelayed({ if (cont.isActive) { webView.destroy(); cont.resume(Unit) } }, 15000)
                     }
                 }
                 
+                println("[Anilife][Inject] 웹뷰 loadUrl 시작: $url")
                 webView.loadUrl(url, mapOf("Referer" to referer))
-            } catch (e: Exception) { if (cont.isActive) cont.resume(Unit) }
+            } catch (e: Exception) { 
+                println("[Anilife][Inject] 웹뷰 생성 실패: ${e.message}")
+                if (cont.isActive) cont.resume(Unit) 
+            }
         }
     }
 
@@ -280,6 +315,7 @@ class AnilifeProxyExtractor : ExtractorApi() {
             server = ServerSocket(0).also { port = it.localPort }
             isRunning = true
             thread { while (isRunning) { try { handle(server!!.accept()) } catch (e: Exception) {} } }
+            println("[Anilife][Proxy] 서버 시작됨 (Port: $port)")
         }
 
         fun stop() { isRunning = false; server?.close() }
@@ -294,6 +330,8 @@ class AnilifeProxyExtractor : ExtractorApi() {
             val path = line.split(" ")[1]
             val out = socket.getOutputStream()
 
+            // println("[Anilife][Proxy] 요청 수신: $path")
+
             when {
                 path.contains("playlist.m3u8") -> {
                     out.write("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\n\r\n".toByteArray())
@@ -306,6 +344,7 @@ class AnilifeProxyExtractor : ExtractorApi() {
                         out.write("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nAccess-Control-Allow-Origin: *\r\n\r\n".toByteArray())
                         out.write(verifiedKey!!)
                     } else {
+                        println("[Anilife][Proxy] 키 반환 실패 (검증 실패)")
                         out.write("HTTP/1.1 404 Not Found\r\n\r\n".toByteArray())
                     }
                 }
@@ -328,7 +367,7 @@ class AnilifeProxyExtractor : ExtractorApi() {
             println("[Anilife][Verify] 키 검증 진입 (후보: ${sessionKeys.size}개)")
             
             if (sessionKeys.isEmpty()) {
-                println("[Anilife][Verify] 실패: 수집된 키 없음. (Iframe 후킹 실패 가능성)")
+                println("[Anilife][Verify] 실패: 수집된 키가 0개입니다.")
                 return@runBlocking null
             }
 
@@ -351,13 +390,13 @@ class AnilifeProxyExtractor : ExtractorApi() {
                             cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(k, "AES"), IvParameterSpec(ByteArray(16)))
                             val dec = cipher.doFinal(chunk)
                             if (dec.size > 188 && dec[0] == 0x47.toByte() && dec[188] == 0x47.toByte()) {
-                                println("[Anilife][Verify] 정답 키 확정: ${k.joinToString("") { "%02x".format(it) }}")
+                                println("[Anilife][Verify] 검증 성공! Key: ${k.joinToString("") { "%02x".format(it) }}")
                                 return@runBlocking k
                             }
                         }
                     } catch (e: Exception) {}
                 }
-            } catch (e: Exception) { println("[Anilife][Verify] 에러: ${e.message}") }
+            } catch (e: Exception) { println("[Anilife][Verify] 검증 예외: ${e.message}") }
             null
         }
     }
