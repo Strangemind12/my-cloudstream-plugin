@@ -1,4 +1,4 @@
-// v2.2 - ExtractorLink 생성자 직접 호출로 빌드 에러 수정
+// v2.4 - KKTV 스타일 헤더 설정 적용 (빌드 에러 및 헤더 누락 해결)
 package com.DaddyLive
 
 import android.content.Context
@@ -14,6 +14,7 @@ import com.lagradost.cloudstream3.AcraApplication
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
@@ -40,22 +41,17 @@ class DaddyLiveExtractor : ExtractorApi() {
             
             val finalReferer = "https://dlhd.link/" 
             
-            // [수정] newExtractorLink 대신 ExtractorLink 생성자 직접 사용
-            // Named Arguments를 사용하여 파라미터 매핑 오류 방지
+            // [수정됨] KKTV 코드 스타일 적용: newExtractorLink + headers 설정
             callback(
-                ExtractorLink(
-                    source = name,
-                    name = name,
-                    url = m3u8Url,
-                    referer = finalReferer,
-                    quality = Qualities.Unknown.value,
-                    type = ExtractorLinkType.M3U8,
-                    headers = mapOf(
+                newExtractorLink(name, name, m3u8Url, ExtractorLinkType.M3U8) {
+                    this.referer = finalReferer
+                    this.quality = Qualities.Unknown.value
+                    this.headers = mapOf(
                         "User-Agent" to DESKTOP_UA,
                         "Referer" to finalReferer,
                         "Origin" to "https://dlhd.link"
                     )
-                )
+                }
             )
         } else {
             println("[DaddyLiveExtractor] M3U8 추출 실패 (타임아웃 또는 발견 못함): $url")
@@ -91,6 +87,7 @@ class DaddyLiveExtractor : ExtractorApi() {
                     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                         val reqUrl = request?.url?.toString() ?: ""
                         
+                        // DaddyLive 스트림은 보통 .m3u8을 포함함
                         if (reqUrl.contains(".m3u8") && !reqUrl.contains("favicon")) {
                             println("[DaddyLiveExtractor] >>> M3U8 발견됨! <<< : $reqUrl")
                             
@@ -103,6 +100,7 @@ class DaddyLiveExtractor : ExtractorApi() {
                             return null
                         }
                         
+                        // 불필요한 리소스 차단
                         if (reqUrl.matches(Regex(".*\\.(jpg|png|gif|css|woff2?)$")) || 
                             reqUrl.contains("google") || 
                             reqUrl.contains("facebook") ||
