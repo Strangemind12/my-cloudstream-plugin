@@ -7,7 +7,11 @@ import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.network.WebViewResolver
 import org.jsoup.nodes.Document
 
-// v71.0: v4.1 메타데이터 로직 유지 및 Extractor 연동
+/**
+ * Anilife Provider v78.0
+ * - [Debug] 모든 프로세스 단계별 상세 로깅 추가 (성공/실패/예외 명시)
+ * - [Logic] M3U8 파싱 및 키 주소 추출 로직 로깅 강화
+ */
 class Anilife : MainAPI() {
     override var mainUrl = "https://anilife.live"
     override var name = "Anilife"
@@ -36,10 +40,15 @@ class Anilife : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (request.name.contains("TOP 20")) "$mainUrl${request.data}" 
                   else "$mainUrl${request.data.substringBeforeLast("/")}/$page"
+        
+        println("$TAG [MainPage] 요청 시작: $url")
         return try {
             val doc = app.get(url, headers = commonHeaders).document
-            newHomePageResponse(request.name, parseCommonList(doc))
+            val home = parseCommonList(doc)
+            println("$TAG [MainPage] 파싱 성공: ${home.size}개 항목")
+            newHomePageResponse(request.name, home)
         } catch (e: Exception) {
+            println("$TAG [MainPage] 실패: ${e.message}")
             newHomePageResponse(request.name, emptyList())
         }
     }
@@ -66,11 +75,12 @@ class Anilife : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val url = "$mainUrl/search?keyword=$query"
-        return parseCommonList(app.get(url, headers = commonHeaders).document)
+        println("$TAG [Search] 검색 요청: $query")
+        return parseCommonList(app.get("$mainUrl/search?keyword=$query", headers = commonHeaders).document)
     }
 
     override suspend fun load(url: String): LoadResponse {
+        println("$TAG [Load] 상세 페이지 분석: $url")
         var tunnelingPoster: String? = null
         val cleanUrl = if (url.contains("poster=")) {
             val posterParam = url.substringAfter("poster=")
@@ -99,6 +109,7 @@ class Anilife : MainAPI() {
             }
         }.reversed()
 
+        println("$TAG [Load] 완료. 에피소드 수: ${episodes.size}")
         return newAnimeLoadResponse(title, cleanUrl, TvType.Anime) {
             this.posterUrl = doc.selectFirst(".thumb img")?.attr("src") ?: tunnelingPoster
             this.posterHeaders = commonHeaders
@@ -114,6 +125,8 @@ class Anilife : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        println("$TAG [LoadLinks] =================== v78.0 시작 ===================")
+        
         var cleanData = data.substringBefore("?poster=")
         var detailReferer = "$mainUrl/"
         if (cleanData.contains("ref=")) {
@@ -121,10 +134,11 @@ class Anilife : MainAPI() {
                 val refEncoded = cleanData.substringAfter("ref=").substringBefore("&")
                 detailReferer = String(Base64.decode(refEncoded, Base64.NO_WRAP))
                 cleanData = cleanData.substringBefore("?ref=").substringBefore("&ref=")
-            } catch (e: Exception) { }
+            } catch (e: Exception) { println("$TAG [Error] Referer 디코딩 실패") }
         }
 
         try {
+            println("$TAG [Step 1] 웹뷰 로드 시작: $cleanData")
             val webResponse = app.get(
                 cleanData, 
                 headers = mapOf("Referer" to detailReferer, "User-Agent" to pcUserAgent), 
@@ -132,6 +146,9 @@ class Anilife : MainAPI() {
             )
 
             val playerUrl = AnilifeProxyExtractor().extractPlayerUrl(webResponse.text, mainUrl) ?: return false
+            println("$TAG [Step 2] 플레이어 URL 발견: $playerUrl")
+
+            println("$TAG [Step 3] API 스니핑 (gcdn.app) 시도...")
             val gcdnInterceptor = WebViewResolver(Regex(""".*api\.gcdn\.app.*"""))
             val gcdnResponse = app.get(
                 playerUrl,
@@ -139,21 +156,30 @@ class Anilife : MainAPI() {
                 interceptor = gcdnInterceptor
             )
             val sniffedUrl = gcdnResponse.url
+            println("$TAG [Step 3] 스니핑 성공: $sniffedUrl")
 
             val finalCookies = CookieManager.getInstance().getCookie("https://anilife.live") ?: ""
+            println("$TAG [Info] 쿠키 획득 (길이: ${finalCookies.length})")
+            
             var xUserSsid: String? = null
             var finalM3u8: String? = null
             var targetKeyUrl: String? = null
 
             if (sniffedUrl.contains("/m3u8/st/")) {
+                println("$TAG [Step 4] API 응답 파싱 및 SSID 추출...")
                 val apiResponse = app.get(
                     sniffedUrl,
                     headers = mapOf("User-Agent" to pcUserAgent, "Referer" to "https://anilife.live/", "Cookie" to finalCookies)
                 )
                 xUserSsid = apiResponse.headers["x-user-ssid"] ?: apiResponse.headers["X-User-Ssid"]
+                if (xUserSsid != null) println("$TAG [Step 4] SSID 획득 성공: $xUserSsid") else println("$TAG [Step 4] SSID 없음")
+
                 val match = Regex("""https://api\.gcdn\.app/v1/manifest/[^"']+""").find(apiResponse.text)
                 if (match != null) {
                     finalM3u8 = match.value.replace("\\/", "/")
+                    println("$TAG [Step 4] Master M3U8 주소: $finalM3u8")
+                    
+                    // M3U8 미리 읽어서 키 주소 파싱
                     try {
                         val m3u8Content = app.get(finalM3u8!!, headers = mapOf("User-Agent" to pcUserAgent, "Referer" to "https://anilife.live/")).text
                         val keyMatch = Regex("""URI="([^"]+)"""").find(m3u8Content)
@@ -164,14 +190,18 @@ class Anilife : MainAPI() {
                                        else finalM3u8!!.substringBeforeLast("/") + "/" + kUrl
                             }
                             targetKeyUrl = kUrl
+                            println("$TAG [Step 4] ★ 타겟 키 URL 파싱 성공: $targetKeyUrl")
+                        } else {
+                            println("$TAG [Step 4] 경고: M3U8 내에서 키 URI를 찾지 못함.")
                         }
-                    } catch (e: Exception) { }
+                    } catch (e: Exception) { println("$TAG [Step 4] M3U8 읽기 실패: ${e.message}") }
                 }
             } else {
                 finalM3u8 = sniffedUrl
             }
 
             if (finalM3u8 != null) {
+                println("$TAG [Step 5] Extractor 호출 (TargetKey: $targetKeyUrl)")
                 return AnilifeProxyExtractor().extractWithProxy(
                     m3u8Url = finalM3u8!!,
                     playerUrl = playerUrl,
@@ -181,9 +211,14 @@ class Anilife : MainAPI() {
                     directKeyUrl = targetKeyUrl,
                     callback = callback
                 )
+            } else {
+                println("$TAG [Error] 최종 M3U8 주소를 찾지 못함.")
             }
 
-        } catch (e: Exception) { e.printStackTrace() }
+        } catch (e: Exception) {
+            println("$TAG [Error] 치명적 오류: ${e.message}")
+            e.printStackTrace()
+        }
         return false
     }
 }
