@@ -1,4 +1,4 @@
-// v1.5 - 헤더 설정 로직 정상화 (KKTV 참조)
+// v1.7 - newExtractorLink 사용 + 빌드 에러 수정 (구조 단순화)
 package com.DaddyLive
 
 import com.lagradost.cloudstream3.HomePageList
@@ -164,19 +164,22 @@ class DaddyLiveScheduleProvider : MainAPI() {
         println("[DaddyLive] 총 ${channels.size}개의 채널 소스 처리 시작")
         val extractor = DaddyLiveExtractor()
 
-        channels.forEachIndexed { index, channel ->
+        // 코루틴 내에서 순차적으로 처리되므로, forEach 대신 일반 루프 사용이 안전할 수 있음
+        for ((index, channel) in channels.withIndex()) {
             println("[DaddyLive] 소스 요청 ($index/${channels.size}): ${channel.name} -> ${channel.url}")
             
+            // Extractor 호출. 여기서 반환되는 link는 이미 정보가 채워진 상태임.
             extractor.getUrl(channel.url, mainUrl, subtitleCallback) { link ->
                 println("[DaddyLive] 링크 추출 성공! 소스 등록: ${channel.name}")
                 
-                // [수정됨] KKTV 스타일 참조: newExtractorLink 사용 및 헤더 복사
+                // [수정 핵심] newExtractorLink 사용.
+                // 이미 생성된 link 객체의 정보를 바탕으로 이름만 바꾸어 새로 생성
+                // 이 람다 블록은 suspend가 아니므로 안심하고 호출 가능
                 callback(
                     newExtractorLink(link.source, channel.name, link.url, link.type) {
                         this.referer = link.referer
                         this.quality = link.quality
-                        // 원본 링크에 설정된 헤더가 있다면 그대로 가져옴
-                        this.headers = link.headers 
+                        this.headers = link.headers
                     }
                 )
             }
