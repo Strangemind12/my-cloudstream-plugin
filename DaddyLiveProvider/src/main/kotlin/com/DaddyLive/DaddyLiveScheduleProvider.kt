@@ -1,4 +1,4 @@
-// v1.8 - 비동기 에러 해결을 위해 ExtractorLink 생성자 직접 사용
+// v1.9 - fetchM3u8Url 사용으로 빌드 에러 완전 해결
 package com.DaddyLive
 
 import com.lagradost.cloudstream3.HomePageList
@@ -19,7 +19,9 @@ import com.lagradost.cloudstream3.newLiveStreamLoadResponse
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
-// newExtractorLink import 제거 (사용하지 않음)
+import com.lagradost.cloudstream3.utils.newExtractorLink // 이제 사용 가능
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.Qualities
 import org.jsoup.nodes.Element
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -164,27 +166,30 @@ class DaddyLiveScheduleProvider : MainAPI() {
         println("[DaddyLive] 총 ${channels.size}개의 채널 소스 처리 시작")
         val extractor = DaddyLiveExtractor()
 
-        // 코루틴 내 루프로 안전하게 처리
+        // [중요] 일반 루프 사용 (forEachIndexed 사용 시 인라인 람다라 문제는 없지만 명시적으로)
         for ((index, channel) in channels.withIndex()) {
-            println("[DaddyLive] 소스 요청 ($index/${channels.size}): ${channel.name} -> ${channel.url}")
+            println("[DaddyLive] 소스 처리 ($index/${channels.size}): ${channel.name}")
             
-            // Extractor 호출. 
-            // 여기 전달하는 람다는 '일반 함수'이므로 내부에서 suspend 함수인 newExtractorLink를 부르면 에러가 남.
-            extractor.getUrl(channel.url, mainUrl, subtitleCallback) { link ->
-                println("[DaddyLive] 링크 추출 성공! 소스 등록: ${channel.name}")
+            // [해결] getUrl(callback) 대신 직접 값을 받아오는 함수 호출
+            // loadLinks가 suspend 함수이므로 여기서 기다렸다가 결과(String?)를 받음
+            val m3u8Url = extractor.fetchM3u8Url(channel.url, mainUrl)
+            
+            if (m3u8Url != null) {
+                println("[DaddyLive] M3U8 확보 성공: ${channel.name} -> $m3u8Url")
                 
-                // [해결] 생성자 직접 호출. 이것은 suspend가 아니므로 100% 안전함.
-                callback(
-                    ExtractorLink(
-                        source = link.source,
-                        name = channel.name, // 채널 이름으로 덮어쓰기
-                        url = link.url,
-                        referer = link.referer,
-                        quality = link.quality,
-                        type = link.type, 
-                        headers = link.headers
+                // [해결] 여기서 newExtractorLink 호출은 loadLinks(suspend) 내부이므로 100% 안전
+                val link = newExtractorLink(name, channel.name, m3u8Url, ExtractorLinkType.M3U8) {
+                    this.referer = "https://dlhd.link/"
+                    this.quality = Qualities.Unknown.value
+                    this.headers = mapOf(
+                        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                        "Referer" to "https://dlhd.link/",
+                        "Origin" to "https://dlhd.link"
                     )
-                )
+                }
+                callback(link)
+            } else {
+                println("[DaddyLive] M3U8 확보 실패: ${channel.name}")
             }
         }
         
