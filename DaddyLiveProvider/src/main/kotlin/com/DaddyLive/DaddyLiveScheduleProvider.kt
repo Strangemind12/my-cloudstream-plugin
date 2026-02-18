@@ -1,4 +1,4 @@
-// v1.7 - newExtractorLink 사용 + 빌드 에러 수정 (구조 단순화)
+// v1.8 - 비동기 에러 해결을 위해 ExtractorLink 생성자 직접 사용
 package com.DaddyLive
 
 import com.lagradost.cloudstream3.HomePageList
@@ -19,7 +19,7 @@ import com.lagradost.cloudstream3.newLiveStreamLoadResponse
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.newExtractorLink
+// newExtractorLink import 제거 (사용하지 않음)
 import org.jsoup.nodes.Element
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -164,23 +164,26 @@ class DaddyLiveScheduleProvider : MainAPI() {
         println("[DaddyLive] 총 ${channels.size}개의 채널 소스 처리 시작")
         val extractor = DaddyLiveExtractor()
 
-        // 코루틴 내에서 순차적으로 처리되므로, forEach 대신 일반 루프 사용이 안전할 수 있음
+        // 코루틴 내 루프로 안전하게 처리
         for ((index, channel) in channels.withIndex()) {
             println("[DaddyLive] 소스 요청 ($index/${channels.size}): ${channel.name} -> ${channel.url}")
             
-            // Extractor 호출. 여기서 반환되는 link는 이미 정보가 채워진 상태임.
+            // Extractor 호출. 
+            // 여기 전달하는 람다는 '일반 함수'이므로 내부에서 suspend 함수인 newExtractorLink를 부르면 에러가 남.
             extractor.getUrl(channel.url, mainUrl, subtitleCallback) { link ->
                 println("[DaddyLive] 링크 추출 성공! 소스 등록: ${channel.name}")
                 
-                // [수정 핵심] newExtractorLink 사용.
-                // 이미 생성된 link 객체의 정보를 바탕으로 이름만 바꾸어 새로 생성
-                // 이 람다 블록은 suspend가 아니므로 안심하고 호출 가능
+                // [해결] 생성자 직접 호출. 이것은 suspend가 아니므로 100% 안전함.
                 callback(
-                    newExtractorLink(link.source, channel.name, link.url, link.type) {
-                        this.referer = link.referer
-                        this.quality = link.quality
-                        this.headers = link.headers
-                    }
+                    ExtractorLink(
+                        source = link.source,
+                        name = channel.name, // 채널 이름으로 덮어쓰기
+                        url = link.url,
+                        referer = link.referer,
+                        quality = link.quality,
+                        type = link.type, 
+                        headers = link.headers
+                    )
                 )
             }
         }
