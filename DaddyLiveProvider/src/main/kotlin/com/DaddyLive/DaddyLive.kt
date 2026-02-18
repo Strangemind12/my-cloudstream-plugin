@@ -21,7 +21,7 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
 
 class DaddyLiveTVProvider : MainAPI() {
-    override var mainUrl = "https://dlhd.dad"
+    override var mainUrl = "https://dlhd.link"
     override var name = "DaddyLive TV"
     override val supportedTypes = setOf(TvType.Live)
     override var lang = "un"
