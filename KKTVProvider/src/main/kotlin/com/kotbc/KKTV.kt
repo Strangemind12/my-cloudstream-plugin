@@ -1,4 +1,4 @@
-// v3.1 - 빌드 에러 수정 (plot 제거, 리스트 문법 수정, ExtractorLink 수정)
+// v3.2 - 빌드 에러 수정 및 newExtractorLink 적용
 package com.KingkongTv
 
 import com.lagradost.cloudstream3.*
@@ -84,28 +84,24 @@ class KingkongTv : MainAPI() {
             fixUrl(refererUrl, it) 
         }
 
-        // 카테고리/리그 정보
-        val categoryClass = this.classNames().firstOrNull { it.startsWith("cate_") } ?: ""
-        val categoryName = categoryMap[categoryClass] ?: "스포츠"
-        // val league = this.selectFirst("td.league")?.text()?.trim() ?: ""
+        // 카테고리/리그 정보 등은 필요 시 활용
+        // val categoryClass = this.classNames().firstOrNull { it.startsWith("cate_") } ?: ""
 
         val fakeUrl = "$mainUrl/live_stream/$streamId?ref=$refererUrl"
 
-        // [수정 1] newLiveSearchResponse는 plot 파라미터가 없거나 람다 내부에서 지원하지 않을 수 있음
-        // LiveTv 타입은 보통 posterUrl 정도만 설정 가능합니다.
+        // LiveSearchResponse 생성
         return newLiveSearchResponse(title, fakeUrl, TvType.Live) {
             this.posterUrl = thumbUrl
-            // this.plot = ... (지원하지 않으므로 제거)
         }
     }
 
     override suspend fun load(url: String): LoadResponse? {
         val streamId = url.substringAfter("/live_stream/").substringBefore("?")
         
-        // [수정 2] 빈 리스트는 [] 가 아니라 emptyList() 또는 listOf() 사용
-        // plot은 여기서 설정 가능
-        return newLiveStreamLoadResponse("LIVE $streamId", url, emptyList()) {
+        // [수정 1] 3번째 인자에 emptyList() 대신 url(String) 전달 (String 타입을 요구함)
+        return newLiveStreamLoadResponse("LIVE $streamId", url, url) {
             this.plot = "실시간 중계 ID: $streamId"
+            // this.posterUrl = ... (필요시 추가)
         }
     }
 
@@ -115,22 +111,24 @@ class KingkongTv : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        // url에서 파라미터 파싱
         val streamId = data.substringAfter("/live_stream/").substringBefore("?")
         val refererUrl = data.substringAfter("ref=", "")
         val finalReferer = if (refererUrl.isNotBlank()) refererUrl else "https://kktv.speed10-1.com/"
 
         val m3u8Url = "http://play.ogtv3.com/live/$streamId/playlist.m3u8"
-        
-        // [수정 3] ExtractorLink 생성자 수정 (source, name, url, referer, quality, isM3u8)
+
+        // [수정 2] 구형 ExtractorLink 생성자 대신 newExtractorLink 사용 (Tennistream 스타일)
         callback.invoke(
-            ExtractorLink(
+            newExtractorLink(
                 source = name,
                 name = name,
                 url = m3u8Url,
-                referer = finalReferer,
-                quality = Qualities.Unknown.value,
-                isM3u8 = true
-            )
+                type = ExtractorLinkType.M3U8 // 최신 Enum 타입 사용
+            ) {
+                this.referer = finalReferer
+                this.quality = Qualities.Unknown.value
+            }
         )
         return true
     }
