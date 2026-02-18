@@ -1,4 +1,4 @@
-// v3.1 - 정확한 Referer 획득을 위한 로직 개선
+// v3.1 - (재확인용) 정확한 Referer 획득 및 M3U8 반환
 package com.DaddyLive
 
 import android.content.Context
@@ -34,26 +34,20 @@ class DaddyLiveExtractor : ExtractorApi() {
         return runWebViewSniffing(url, referer ?: mainUrl)
     }
 
-    // 기존 Interface 구현 (Provider에서는 직접 호출하지 않음)
     override suspend fun getUrl(
         url: String,
         referer: String?,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
+        // Provider에서 fetchM3u8Url을 직접 사용하므로 이 함수는 사용되지 않지만 인터페이스 구현을 위해 남겨둠
         val result = fetchM3u8Url(url, referer)
         if (result != null) {
             val (m3u8Url, finalReferer) = result
-            val link = newExtractorLink(name, name, m3u8Url, ExtractorLinkType.M3U8) {
+            callback(newExtractorLink(name, name, m3u8Url, ExtractorLinkType.M3U8) {
                 this.referer = finalReferer
-                this.quality = Qualities.Unknown.value
-                this.headers = mapOf(
-                    "User-Agent" to DESKTOP_UA,
-                    "Referer" to finalReferer,
-                    "Origin" to "https://dlhd.link"
-                )
-            }
-            callback(link)
+                this.headers = mapOf("Referer" to finalReferer)
+            })
         }
     }
 
@@ -86,12 +80,10 @@ class DaddyLiveExtractor : ExtractorApi() {
                     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                         val reqUrl = request?.url?.toString() ?: ""
                         
-                        // .m3u8 요청 감지
                         if (reqUrl.contains(".m3u8") && !reqUrl.contains("favicon")) {
                             println("[DaddyLiveExtractor] M3U8 발견: $reqUrl")
                             
-                            // [핵심] 현재 페이지의 URL을 Referer로 사용
-                            // iframe 내부에서 로드된 경우 iframe URL이 됨
+                            // 현재 페이지 URL(iframe 주소)을 캡처하여 Referer로 사용
                             val currentUrl = view?.url ?: referer
                             println("[DaddyLiveExtractor] 캡처된 Referer: $currentUrl")
                             
@@ -104,7 +96,6 @@ class DaddyLiveExtractor : ExtractorApi() {
                             return null
                         }
                         
-                        // 불필요 리소스 차단
                         if (reqUrl.matches(Regex(".*\\.(jpg|png|gif|css|woff2?|ico)$"))) {
                             return WebResourceResponse("text/plain", "utf-8", null)
                         }
