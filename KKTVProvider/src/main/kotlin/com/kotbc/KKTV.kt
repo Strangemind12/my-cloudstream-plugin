@@ -1,4 +1,4 @@
-// v5.0 - 재생 실패 원인 분석을 위한 강력한 로깅 및 네트워크 프리체크(Probe) 추가
+// v5.1 - 빌드 에러 수정 (headers.putAll -> headers = ...)
 package com.KingkongTv
 
 import android.net.Uri
@@ -10,7 +10,7 @@ import java.net.URLEncoder
 
 class KingkongTv : MainAPI() {
     override var mainUrl = "https://holyindia.org"
-    override var name = "KKTv"
+    override var name = "KingkongTv"
     override val hasMainPage = true
     override var lang = "ko"
     override val supportedTypes = setOf(TvType.Live)
@@ -29,7 +29,7 @@ class KingkongTv : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = "$mainUrl${request.data}"
-        println("DEBUG [KingkongTv] v5.0: 메인 페이지 요청 - URL: $url")
+        println("DEBUG [KingkongTv] v5.1: 메인 페이지 요청 - URL: $url")
         
         try {
             val mainDoc = app.get(url).document
@@ -37,16 +37,16 @@ class KingkongTv : MainAPI() {
             var iframeSrc = iframeElement?.attr("src")
 
             if (iframeSrc.isNullOrBlank()) {
-                println("DEBUG [KingkongTv] v5.0: iframe#broadcastFrame 없음. 기본값 사용.")
+                println("DEBUG [KingkongTv] v5.1: iframe#broadcastFrame 없음. 기본값 사용.")
                 iframeSrc = "https://kktv.speed10-1.com/kktv/index.php?tg=1ch&ca=0"
             }
 
             val realUrl = fixUrl(url, iframeSrc!!)
-            println("DEBUG [KingkongTv] v5.0: Iframe 내부 진입 - URL: $realUrl")
+            println("DEBUG [KingkongTv] v5.1: Iframe 내부 진입 - URL: $realUrl")
 
             val contentDoc = app.get(realUrl, referer = url).document
             val rows = contentDoc.select("div.sports_on_list table tbody tr")
-            println("DEBUG [KingkongTv] v5.0: 파싱된 행 개수: ${rows.size}")
+            println("DEBUG [KingkongTv] v5.1: 파싱된 행 개수: ${rows.size}")
 
             val home = rows.mapNotNull { row ->
                 row.toSearchResult(realUrl)
@@ -61,7 +61,7 @@ class KingkongTv : MainAPI() {
                 hasNext = false
             )
         } catch (e: Exception) {
-            println("DEBUG [KingkongTv] v5.0: 메인 페이지 로드 실패 - ${e.message}")
+            println("DEBUG [KingkongTv] v5.1: 메인 페이지 로드 실패 - ${e.message}")
             e.printStackTrace()
             return newHomePageResponse(request.name, emptyList())
         }
@@ -93,7 +93,7 @@ class KingkongTv : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse? {
-        println("DEBUG [KingkongTv] v5.0: 상세 페이지(load) 진입 - URL: $url")
+        println("DEBUG [KingkongTv] v5.1: 상세 페이지(load) 진입 - URL: $url")
         val uri = Uri.parse(url)
         val streamId = url.substringAfter("/live_stream/").substringBefore("?")
         
@@ -116,19 +116,18 @@ class KingkongTv : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("DEBUG [KingkongTv] v5.0: loadLinks 시작")
-        println("DEBUG [KingkongTv] v5.0: 요청 데이터: $data")
+        println("DEBUG [KingkongTv] v5.1: loadLinks 시작")
+        println("DEBUG [KingkongTv] v5.1: 요청 데이터: $data")
 
         val uri = Uri.parse(data)
         val streamId = data.substringAfter("/live_stream/").substringBefore("?")
         val rawRef = uri.getQueryParameter("ref")
         val refererUrl = if (!rawRef.isNullOrBlank()) URLDecoder.decode(rawRef, "UTF-8") else "https://kktv.speed10-1.com/"
 
-        println("DEBUG [KingkongTv] v5.0: Target Stream ID: $streamId")
-        println("DEBUG [KingkongTv] v5.0: Target Referer: $refererUrl")
+        println("DEBUG [KingkongTv] v5.1: Target Stream ID: $streamId")
+        println("DEBUG [KingkongTv] v5.1: Target Referer: $refererUrl")
 
         // 테스트할 URL 패턴 목록
-        // HLS 및 FLV, 파라미터 유무 등 다양한 조합 시도
         val candidates = listOf(
             "HLS_V1" to "http://play.ogtv3.com/live/$streamId/playlist.m3u8?site=kktv",
             "HLS_V2" to "http://play.ogtv3.com/live/$streamId.m3u8?site=kktv",
@@ -146,44 +145,42 @@ class KingkongTv : MainAPI() {
 
         // 각 후보 URL에 대해 실제 연결 테스트(Probe) 수행
         for ((label, testUrl) in candidates) {
-            println("DEBUG [KingkongTv] v5.0: 네트워크 테스트 시도 [$label] -> $testUrl")
+            println("DEBUG [KingkongTv] v5.1: 네트워크 테스트 시도 [$label] -> $testUrl")
             try {
                 // 타임아웃 5초 설정하여 빠르게 체크
                 val response = app.get(testUrl, headers = headers, timeout = 5000L)
                 val code = response.code
-                println("DEBUG [KingkongTv] v5.0: 응답 코드 [$code] - $label")
+                println("DEBUG [KingkongTv] v5.1: 응답 코드 [$code] - $label")
 
                 if (code == 200) {
-                    println("DEBUG [KingkongTv] v5.0: >> 유효한 링크 발견! 플레이어에 전달합니다.")
+                    println("DEBUG [KingkongTv] v5.1: >> 유효한 링크 발견! 플레이어에 전달합니다.")
                     foundValidLink = true
                     
                     val type = if (label.contains("FLV")) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8
                     
                     callback.invoke(
                         newExtractorLink(
-                            name = "KKTV ($label)",
+                            name = "KingkongTv ($label)",
                             source = name,
                             url = testUrl,
                             type = type
                         ) {
                             this.referer = refererUrl
-                            // 중요: 헤더를 ExtractorLink에도 명시적으로 포함
-                            this.headers.putAll(headers) 
+                            // [수정됨] putAll 대신 대입 연산자 사용
+                            this.headers = headers
                             this.quality = Qualities.Unknown.value
                         }
                     )
                 } else {
-                    println("DEBUG [KingkongTv] v5.0: 유효하지 않은 응답 ($code). 패스.")
+                    println("DEBUG [KingkongTv] v5.1: 유효하지 않은 응답 ($code). 패스.")
                 }
             } catch (e: Exception) {
-                println("DEBUG [KingkongTv] v5.0: 연결 실패 [$label] - ${e.javaClass.simpleName}: ${e.message}")
-                // SocketTimeoutException 등이 발생하면 서버가 HTTP 접속을 아예 막아둔 것일 수 있음.
+                println("DEBUG [KingkongTv] v5.1: 연결 실패 [$label] - ${e.javaClass.simpleName}: ${e.message}")
             }
         }
 
         if (!foundValidLink) {
-            println("DEBUG [KingkongTv] v5.0: 모든 URL 패턴 테스트 실패. 서버가 WebRTC 전용이거나 HTTP 접근을 차단했을 가능성이 높습니다.")
-            // 사용자에게 피드백을 주기 위해 실패하더라도 강제로 하나는 던져볼 수 있음 (선택 사항)
+            println("DEBUG [KingkongTv] v5.1: 모든 URL 패턴 테스트 실패. 서버가 WebRTC 전용이거나 HTTP 접근을 차단했을 가능성이 높습니다.")
         }
 
         return true
