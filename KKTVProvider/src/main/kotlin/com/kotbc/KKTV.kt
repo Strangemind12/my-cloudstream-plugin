@@ -10,7 +10,7 @@ import java.net.URLEncoder
 
 class KingkongTv : MainAPI() {
     override var mainUrl = "https://holyindia.org"
-    override var name = "KingkongTv"
+    override var name = "KKTV"
     override val hasMainPage = true
     override var lang = "ko"
     override val supportedTypes = setOf(TvType.Live)
