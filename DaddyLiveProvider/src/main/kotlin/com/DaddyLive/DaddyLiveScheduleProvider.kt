@@ -1,4 +1,4 @@
-// v1.2 - 다중 채널 소스 선택 기능 추가 및 디버깅 강화
+// v1.3 - ExtractorLink 수동 복사 로직 적용 (빌드 에러 수정)
 package com.DaddyLive
 
 import com.lagradost.cloudstream3.HomePageList
@@ -106,7 +106,6 @@ class DaddyLiveScheduleProvider : MainAPI() {
         return try {
             val doc = app.get(mainUrl).document
             
-            // data-title이 일치하는 이벤트를 찾음
             val event = doc.select(".schedule__event").firstOrNull {
                 it.select("div.schedule__eventHeader").attr("data-title") == dataTitle
             } ?: throw Exception("이벤트를 찾을 수 없습니다: $dataTitle")
@@ -114,13 +113,10 @@ class DaddyLiveScheduleProvider : MainAPI() {
             val eventTitle = event.select(".schedule__eventTitle").text()
             val time = event.select(".schedule__time").text()
             
-            // [수정됨] 채널 목록 파싱 로직
-            // .schedule__channels 내부의 모든 <a> 태그를 가져와서 이름과 링크를 저장
             val channels = event.select(".schedule__channels > a").mapNotNull {
                 val name = it.text().trim()
                 val href = it.attr("href")
                 if (href.isNotEmpty()) {
-                    // href가 상대 경로(/watch.php...)일 수 있으므로 fixUrl로 절대 경로 변환
                     val fullUrl = fixUrl(href)
                     println("[DaddyLive] 채널 발견: $name -> $fullUrl")
                     Channel(name, fullUrl)
@@ -135,7 +131,6 @@ class DaddyLiveScheduleProvider : MainAPI() {
 
             val formattedTime = convertGMTToLocalTime(time)
             
-            // 채널 목록을 JSON으로 변환하여 dataUrl에 저장 (loadLinks에서 사용)
             newLiveStreamLoadResponse("$formattedTime - $eventTitle", url, dataUrl = channels.toJson()) {
                 this.posterUrl = Companion.posterUrl
             }
@@ -168,24 +163,31 @@ class DaddyLiveScheduleProvider : MainAPI() {
         println("[DaddyLive] 총 ${channels.size}개의 채널 소스 처리 시작")
         val extractor = DaddyLiveExtractor()
 
-        // 각 채널을 돌면서 Extractor 호출
         channels.forEachIndexed { index, channel ->
             println("[DaddyLive] 소스 요청 ($index/${channels.size}): ${channel.name} -> ${channel.url}")
             
-            // Extractor에게 URL 전달
-            // callback을 감싸서, Extractor가 찾아낸 링크의 이름을 채널 이름(예: Sky Sport 7 NZ)으로 변경
             extractor.getUrl(channel.url, mainUrl, subtitleCallback) { link ->
                 println("[DaddyLive] 링크 추출 성공! 소스 등록: ${channel.name}")
                 
-                // 원본 링크 정보에 이름을 덮어씌워 소스 목록에 표시되게 함
-                callback(link.copy(name = channel.name))
+                // [수정] link.copy() 대신 생성자를 직접 사용하여 객체 복제 및 name 변경
+                // ExtractorLink가 data class가 아닐 경우를 대비
+                callback(
+                    ExtractorLink(
+                        source = link.source,
+                        name = channel.name, // 채널 이름으로 덮어쓰기
+                        url = link.url,
+                        referer = link.referer,
+                        quality = link.quality,
+                        type = link.type,
+                        headers = link.headers
+                    )
+                )
             }
         }
         
         return true
     }
 
-    // 채널 정보를 담는 데이터 클래스
     data class Channel(
         val name: String,
         val url: String
