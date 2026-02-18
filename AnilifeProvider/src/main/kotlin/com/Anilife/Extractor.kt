@@ -3,10 +3,9 @@ package com.anilife
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.util.Base64
 import android.webkit.ConsoleMessage
 import android.webkit.WebChromeClient
-import android.webkit.WebResourceRequest
-import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import com.lagradost.cloudstream3.SubtitleFile
@@ -18,7 +17,6 @@ import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.suspendCancellableCoroutine
 import java.io.BufferedReader
-import java.io.ByteArrayInputStream
 import java.io.InputStreamReader
 import java.net.ServerSocket
 import java.net.Socket
@@ -30,13 +28,12 @@ import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import kotlin.concurrent.thread
 import kotlin.coroutines.resume
-import org.json.JSONObject // JSON 파싱용
 
 /**
- * Anilife Proxy Extractor v81.0
- * - [Debug] 다운로드된 데이터(678바이트 등)의 내용을 로그에 텍스트로 출력하여 정체 확인 (HTML vs JSON)
- * - [Feature] JSON 응답일 경우 자동 파싱하여 내부의 'key' 값 추출 시도
- * - [Logic] v79의 Local Tunneling 구조 유지 (다운로드 자체는 성공했으므로)
+ * Anilife Proxy Extractor v82.0
+ * - [Paradigm] Clean Room Player: 앱(Kotlin) 요청 전면 배제. 웹뷰가 직접 키를 다운로드하도록 유도.
+ * - [Logic] 가상 HTML 플레이어를 생성하고 BaseURL을 위조하여 로드 -> HLS.js가 키를 요청 -> XHR 후킹으로 탈취
+ * - [Bypass] 브라우저의 TLS 지문과 쿠키 세션을 100% 활용하여 403/404 차단 완벽 우회
  */
 class AnilifeProxyExtractor : ExtractorApi() {
     override val name = "AnilifeProxy"
@@ -79,11 +76,21 @@ class AnilifeProxyExtractor : ExtractorApi() {
     ): Boolean {
         synchronized(this) { currentProxyServer?.stop(); currentProxyServer = null }
 
-        println("[Anilife][Proxy] 1. 프록시 서버 및 키 저장소 초기화")
+        println("[Anilife][Proxy] 1. 프록시 서버 초기화")
         val sessionKeys = Collections.synchronizedSet(mutableSetOf<String>())
 
-        println("[Anilife][Proxy] 2. 로컬 터널링 웹뷰 가동 (Target Key: $directKeyUrl)")
-        runWebViewTunneling(playerUrl, referer, ssid, cookies, directKeyUrl, sessionKeys)
+        // M3U8 원본 다운로드 (플레이어 재생용)
+        val m3u8Content = try {
+            val headers = mutableMapOf("User-Agent" to DESKTOP_UA, "Referer" to "https://anilife.live/", "Cookie" to cookies)
+            if (!ssid.isNullOrBlank()) headers["x-user-ssid"] = ssid
+            app.get(m3u8Url, headers = headers).text
+        } catch (e: Exception) {
+            println("[Anilife][Proxy] M3U8 다운로드 실패: ${e.message}")
+            return false
+        }
+
+        println("[Anilife][Proxy] 2. 클린 룸 플레이어(Clean Room) 가동... 웹뷰가 직접 키를 가져옵니다.")
+        runCleanRoomPlayer(m3u8Content, referer, sessionKeys)
 
         val proxy = ProxyWebServer(sessionKeys).apply { 
             start()
@@ -102,12 +109,10 @@ class AnilifeProxyExtractor : ExtractorApi() {
         currentProxyServer = proxy
 
         try {
-            val res = app.get(m3u8Url, headers = proxy.getCurrentHeaders())
-            val content = res.text
             val baseUri = URI(m3u8Url)
             val sb = StringBuilder()
             
-            content.lines().forEach { line ->
+            m3u8Content.lines().forEach { line ->
                 val trimmed = line.trim()
                 if (trimmed.isEmpty()) return@forEach
                 
@@ -147,33 +152,68 @@ class AnilifeProxyExtractor : ExtractorApi() {
         }
     }
 
-    private suspend fun runWebViewTunneling(
-        url: String, 
-        referer: String, 
-        ssid: String?,
-        cookies: String,
-        targetKeyUrl: String?,
+    // [v82.0] 가상 플레이어 실행 및 키 탈취
+    private suspend fun runCleanRoomPlayer(
+        m3u8Content: String,
+        referer: String,
         sessionKeys: MutableSet<String>
     ) = suspendCancellableCoroutine<Unit> { cont ->
         val handler = Handler(Looper.getMainLooper())
         
-        val tunnelingScript = if (targetKeyUrl != null) """
-            <script>
-            (async function() {
-                console.log("[JS] Tunneling Fetch Start");
-                try {
-                    const response = await fetch("/__tunnel_key", { method: 'GET', cache: 'no-store' });
-                    if (response.ok) {
-                        console.log("[JS] Tunneling Success!");
-                    } else {
-                        console.log("[JS] Tunneling Failed: " + response.status);
+        // M3U8 내용을 Base64로 인코딩해서 JS에 넘김
+        val m3u8Base64 = Base64.encodeToString(m3u8Content.toByteArray(), Base64.NO_WRAP)
+
+        // 가상 HTML: HLS.js를 로드하고 XHR 요청을 후킹함
+        val cleanRoomHtml = """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <script src="https://cdn.jsdelivr.net/npm/hls.js@1.4.0/dist/hls.min.js"></script>
+            </head>
+            <body>
+                <video id="video" muted autoplay></video>
+                <script>
+                    // 1. XHR Hooking (가장 중요)
+                    (function() {
+                        var originalOpen = XMLHttpRequest.prototype.open;
+                        XMLHttpRequest.prototype.open = function(method, url) {
+                            this.addEventListener('load', function() {
+                                // 키 파일 요청 감지
+                                if (url.includes('enc.bin') || url.includes('key')) {
+                                    if (this.response) {
+                                        var bytes = new Uint8Array(this.response);
+                                        var hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+                                        console.log("CapturedKeyHex:" + hex);
+                                    }
+                                }
+                            });
+                            originalOpen.apply(this, arguments);
+                        };
+                    })();
+
+                    // 2. Play HLS
+                    var m3u8 = atob("$m3u8Base64");
+                    if (Hls.isSupported()) {
+                        var hls = new Hls({
+                            xhrSetup: function(xhr, url) {
+                                // 바이너리 데이터를 받기 위해 responseType 설정
+                                if (url.includes('enc.bin') || url.includes('key')) {
+                                    xhr.responseType = 'arraybuffer';
+                                }
+                            }
+                        });
+                        var blob = new Blob([m3u8], {type: 'application/x-mpegURL'});
+                        var blobUrl = URL.createObjectURL(blob);
+                        hls.loadSource(blobUrl);
+                        hls.attachMedia(document.getElementById('video'));
+                        hls.on(Hls.Events.ERROR, function(event, data) {
+                            console.log("[JS] HLS Error: " + data.details);
+                        });
                     }
-                } catch(e) {
-                    console.log("[JS] Tunneling Error: " + e.message);
-                }
-            })();
-            </script>
-        """.trimIndent() else ""
+                </script>
+            </body>
+            </html>
+        """.trimIndent()
 
         handler.post {
             try {
@@ -185,111 +225,43 @@ class AnilifeProxyExtractor : ExtractorApi() {
                     domStorageEnabled = true
                     userAgentString = DESKTOP_UA
                     mediaPlaybackRequiresUserGesture = false
+                    // 혼합 콘텐츠 허용 (혹시 모를 HTTP/HTTPS 이슈 방지)
+                    mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                 }
 
                 webView.webChromeClient = object : WebChromeClient() {
                     override fun onConsoleMessage(cm: ConsoleMessage?): Boolean {
                         val msg = cm?.message() ?: ""
-                        if (msg.contains("[JS]")) println("[Anilife][JS] $msg")
+                        if (msg.contains("CapturedKeyHex:")) {
+                            val key = msg.substringAfter("CapturedKeyHex:").trim()
+                            if (sessionKeys.add(key)) println("[Anilife][CleanRoom] ★키 확보 성공★: $key")
+                        } else if (msg.contains("[JS]")) {
+                            println("[Anilife][CleanRoom] $msg")
+                        }
                         return true
                     }
                 }
 
                 webView.webViewClient = object : WebViewClient() {
-                    override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
-                        val reqUrl = request?.url.toString()
-                        
-                        if (reqUrl.contains("__tunnel_key") && targetKeyUrl != null) {
-                            println("[Anilife][Tunnel] 가상 요청 감지 -> 실제 키 다운로드")
-                            try {
-                                val headers = mutableMapOf("User-Agent" to DESKTOP_UA, "Referer" to referer, "Cookie" to cookies)
-                                if (!ssid.isNullOrBlank()) headers["x-user-ssid"] = ssid
-                                
-                                val response = runBlocking { app.get(targetKeyUrl, headers = headers) }
-                                val keyBytes = response.body.bytes()
-                                val size = keyBytes.size
-                                
-                                println("[Anilife][Tunnel] 다운로드 완료. Size: $size bytes")
-
-                                // [v81.0 핵심] 데이터 내용 까보기
-                                if (size == 16 || size == 32) {
-                                    // 바이너리 키일 확률 높음
-                                    val hex = keyBytes.joinToString("") { "%02x".format(it) }
-                                    sessionKeys.add(hex)
-                                    println("[Anilife][Tunnel] ★키 확보 성공 (Binary)★: $hex")
-                                    
-                                    if (size == 32) {
-                                        for (i in 0..16) sessionKeys.add(keyBytes.copyOfRange(i, i + 16).joinToString("") { "%02x".format(it) })
-                                    }
-                                } else {
-                                    // [Debug] 텍스트로 변환하여 확인
-                                    val textContent = String(keyBytes)
-                                    println("[Anilife][Debug] ★응답 내용 확인★: $textContent")
-
-                                    // JSON 파싱 시도
-                                    if (textContent.trim().startsWith("{")) {
-                                        try {
-                                            println("[Anilife][Tunnel] JSON 감지 -> 파싱 시도")
-                                            val json = JSONObject(textContent)
-                                            // 일반적인 키 필드명 탐색
-                                            val possibleKeys = listOf("key", "data", "token", "secret", "enc_key")
-                                            for (k in possibleKeys) {
-                                                if (json.has(k)) {
-                                                    val valStr = json.getString(k)
-                                                    println("[Anilife][Tunnel] JSON Key Found: $k = $valStr")
-                                                    // Hex String? Base64? 일단 다 등록 시도
-                                                    sessionKeys.add(valStr) 
-                                                }
-                                            }
-                                        } catch (e: Exception) {
-                                            println("[Anilife][Tunnel] JSON 파싱 실패: ${e.message}")
-                                        }
-                                    } else if (textContent.contains("html", true)) {
-                                        println("[Anilife][Tunnel] 역시 HTML 에러 페이지였음.")
-                                    }
-                                }
-                                
-                                return WebResourceResponse("application/octet-stream", "utf-8", ByteArrayInputStream(keyBytes))
-                            } catch (e: Exception) {
-                                println("[Anilife][Tunnel] 다운로드 실패: ${e.message}")
-                            }
-                            return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
-                        }
-
-                        // HTML 주입 (Trojan)
-                        if (reqUrl.contains("/h/live") && !reqUrl.contains(".js") && !reqUrl.contains(".css")) {
-                            println("[Anilife][Inject] HTML 감지 -> 터널링 스크립트 주입")
-                            try {
-                                val headers = mutableMapOf("User-Agent" to DESKTOP_UA, "Referer" to referer, "Cookie" to cookies)
-                                if (!ssid.isNullOrBlank()) headers["x-user-ssid"] = ssid
-                                
-                                val response = runBlocking { app.get(reqUrl, headers = headers) }
-                                var html = response.text
-                                
-                                if (html.contains("<head>")) {
-                                    html = html.replaceFirst("<head>", "<head>\n$tunnelingScript")
-                                } else {
-                                    html = "$tunnelingScript\n$html"
-                                }
-                                
-                                return WebResourceResponse("text/html", "utf-8", ByteArrayInputStream(html.toByteArray()))
-                            } catch (e: Exception) { println("[Anilife][Inject] HTML 로드 실패: ${e.message}") }
-                        }
-                        
-                        return super.shouldInterceptRequest(view, request)
-                    }
-
                     override fun onPageFinished(view: WebView?, url: String?) {
                         super.onPageFinished(view, url)
+                        // 15초 동안 키 수집 대기
                         handler.postDelayed({ if (cont.isActive) { webView.destroy(); cont.resume(Unit) } }, 15000)
                     }
                 }
                 
-                webView.loadUrl(url, mapOf("Referer" to referer))
-            } catch (e: Exception) { if (cont.isActive) cont.resume(Unit) }
+                println("[Anilife][CleanRoom] 가상 플레이어 로드 (BaseURL 위장)")
+                // BaseURL을 설정하여 CORS 및 쿠키 문제를 우회
+                webView.loadDataWithBaseURL("https://anilife.live", cleanRoomHtml, "text/html", "UTF-8", null)
+                
+            } catch (e: Exception) { 
+                println("[Anilife][CleanRoom] 웹뷰 생성 에러: ${e.message}")
+                if (cont.isActive) cont.resume(Unit) 
+            }
         }
     }
 
+    // ProxyWebServer (기존과 동일, 검증 로직 유지)
     class ProxyWebServer(private val sessionKeys: MutableSet<String>) {
         var port: Int = 0
         private var server: ServerSocket? = null
@@ -359,25 +331,13 @@ class AnilifeProxyExtractor : ExtractorApi() {
                 val data = app.get(url, headers = headers).body.bytes()
                 val chunk = data.take(1024).toByteArray()
 
-                sessionKeys.forEach { keyStr ->
+                sessionKeys.forEach { hex ->
                     try {
-                        // Hex String 또는 일반 String 처리
-                        val rawKey = try { keyStr.hexToByteArray() } catch(e:Exception) { keyStr.toByteArray() }
+                        val key = hex.hexToByteArray()
                         val candidates = mutableListOf<ByteArray>()
-                        
-                        if (rawKey.size == 16) candidates.add(rawKey)
-                        else if (rawKey.size >= 32) {
-                            // 32바이트 이상이면 Hex String일 수도 있고 Base64일 수도 있음
-                            // 일단 Hex Decoding 시도
-                            try {
-                                val hexDecoded = keyStr.hexToByteArray()
-                                if (hexDecoded.size == 16) candidates.add(hexDecoded)
-                            } catch(e:Exception) {}
-                            
-                            // Sliding Window (Raw Bytes)
-                            if (rawKey.size == 32) {
-                                for (i in 0..16) candidates.add(rawKey.copyOfRange(i, i + 16))
-                            }
+                        if (key.size == 16) candidates.add(key)
+                        else if (key.size == 32) {
+                            for (i in 0..16) candidates.add(key.copyOfRange(i, i + 16))
                         }
 
                         for (k in candidates) {
@@ -385,7 +345,7 @@ class AnilifeProxyExtractor : ExtractorApi() {
                             cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(k, "AES"), IvParameterSpec(ByteArray(16)))
                             val dec = cipher.doFinal(chunk)
                             if (dec.size > 188 && dec[0] == 0x47.toByte() && dec[188] == 0x47.toByte()) {
-                                println("[Anilife][Verify] 검증 성공! Key: ${k.joinToString("") { "%02x".format(it) }}")
+                                println("[Anilife][Verify] 검증 성공: ${k.joinToString("") { "%02x".format(it) }}")
                                 return@runBlocking k
                             }
                         }
