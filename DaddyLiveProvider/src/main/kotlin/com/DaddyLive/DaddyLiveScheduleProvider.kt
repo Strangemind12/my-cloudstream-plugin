@@ -1,4 +1,4 @@
-// v1.10 - 동적 Referer 적용을 위한 코드 수정
+// v2.0 - 단일 채널 로드 및 성능 최적화
 package com.DaddyLive
 
 import com.lagradost.cloudstream3.HomePageList
@@ -108,20 +108,26 @@ class DaddyLiveScheduleProvider : MainAPI() {
             val eventTitle = event.select(".schedule__eventTitle").text()
             val time = event.select(".schedule__time").text()
             
-            val channels = event.select(".schedule__channels > a").mapNotNull {
-                val name = it.text().trim()
-                val href = it.attr("href")
+            // [최적화] 여러 채널 중 첫 번째(Main) 채널 딱 1개만 선택
+            val firstChannel = event.selectFirst(".schedule__channels > a")
+            
+            val channelList = if (firstChannel != null) {
+                val name = firstChannel.text().trim()
+                val href = firstChannel.attr("href")
                 if (href.isNotEmpty()) {
                     val fullUrl = fixUrl(href)
-                    Channel(name, fullUrl)
+                    println("[DaddyLive] 메인 채널 선택됨: $name -> $fullUrl")
+                    listOf(Channel(name, fullUrl))
                 } else {
-                    null
+                    emptyList()
                 }
+            } else {
+                emptyList()
             }
             
             val formattedTime = convertGMTToLocalTime(time)
             
-            newLiveStreamLoadResponse("$formattedTime - $eventTitle", url, dataUrl = channels.toJson()) {
+            newLiveStreamLoadResponse("$formattedTime - $eventTitle", url, dataUrl = channelList.toJson()) {
                 this.posterUrl = Companion.posterUrl
             }
         } catch (e: Exception) {
@@ -143,31 +149,33 @@ class DaddyLiveScheduleProvider : MainAPI() {
 
         if (channels.isEmpty()) return false
 
+        // 단일 채널이므로 첫 번째 요소만 가져옴
+        val mainChannel = channels.first()
         val extractor = DaddyLiveExtractor()
 
-        for ((index, channel) in channels.withIndex()) {
-            println("[DaddyLive] 소스 처리 ($index/${channels.size}): ${channel.name}")
+        println("[DaddyLive] 단일 소스 처리 시작: ${mainChannel.name}")
+        
+        // Extractor 호출 (동적 Referer 및 M3U8 획득)
+        val result = extractor.fetchM3u8Url(mainChannel.url, mainUrl)
+        
+        if (result != null) {
+            val (m3u8Url, refererUrl) = result
+            println("[DaddyLive] 링크 확보 성공! M3U8: $m3u8Url")
+            println("[DaddyLive] 적용할 Referer: $refererUrl")
             
-            // [변경] URL과 Referer를 쌍으로 받아옴
-            val result = extractor.fetchM3u8Url(channel.url, mainUrl)
-            
-            if (result != null) {
-                val (m3u8Url, refererUrl) = result
-                println("[DaddyLive] M3U8 확보: $m3u8Url (Ref: $refererUrl)")
-                
-                val link = newExtractorLink(name, channel.name, m3u8Url, ExtractorLinkType.M3U8) {
-                    this.referer = refererUrl // [중요] 동적으로 획득한 Referer 사용
-                    this.quality = Qualities.Unknown.value
-                    this.headers = mapOf(
-                        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                        "Referer" to refererUrl,
-                        "Origin" to "https://dlhd.link" // Origin은 고정일 수 있으나, 필요시 refererUrl 기반으로 변경 고려
-                    )
-                }
-                callback(link)
-            } else {
-                println("[DaddyLive] M3U8 확보 실패: ${channel.name}")
+            val link = newExtractorLink(name, mainChannel.name, m3u8Url, ExtractorLinkType.M3U8) {
+                this.referer = refererUrl
+                this.quality = Qualities.Unknown.value
+                // 403 에러 방지를 위해 WebView에서 캡처한 주소를 Referer로 사용
+                this.headers = mapOf(
+                    "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                    "Referer" to refererUrl,
+                    "Origin" to "https://dlhd.link" // 필요 시 iframe 도메인으로 교체 가능하나 일단 유지
+                )
             }
+            callback(link)
+        } else {
+            println("[DaddyLive] 링크 확보 실패 (타임아웃 또는 감지 실패)")
         }
         
         return true
