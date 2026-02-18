@@ -6,7 +6,7 @@ cloudstream {
     // All of these properties are optional, you can safely remove them
 
     description = "Live TV from DaddyLive. You might need a VPN"
-    authors = listOf("doGior")
+    authors = listOf("hsp1020")
 
     /**
     * Status int as the following:
