@@ -1,4 +1,4 @@
-// v1.3 - ExtractorLink 수동 복사 로직 적용 (빌드 에러 수정)
+// v1.5 - 헤더 설정 로직 정상화 (KKTV 참조)
 package com.DaddyLive
 
 import com.lagradost.cloudstream3.HomePageList
@@ -19,6 +19,7 @@ import com.lagradost.cloudstream3.newLiveStreamLoadResponse
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.jsoup.nodes.Element
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -169,18 +170,14 @@ class DaddyLiveScheduleProvider : MainAPI() {
             extractor.getUrl(channel.url, mainUrl, subtitleCallback) { link ->
                 println("[DaddyLive] 링크 추출 성공! 소스 등록: ${channel.name}")
                 
-                // [수정] link.copy() 대신 생성자를 직접 사용하여 객체 복제 및 name 변경
-                // ExtractorLink가 data class가 아닐 경우를 대비
+                // [수정됨] KKTV 스타일 참조: newExtractorLink 사용 및 헤더 복사
                 callback(
-                    ExtractorLink(
-                        source = link.source,
-                        name = channel.name, // 채널 이름으로 덮어쓰기
-                        url = link.url,
-                        referer = link.referer,
-                        quality = link.quality,
-                        type = link.type,
-                        headers = link.headers
-                    )
+                    newExtractorLink(link.source, channel.name, link.url, link.type) {
+                        this.referer = link.referer
+                        this.quality = link.quality
+                        // 원본 링크에 설정된 헤더가 있다면 그대로 가져옴
+                        this.headers = link.headers 
+                    }
                 )
             }
         }
