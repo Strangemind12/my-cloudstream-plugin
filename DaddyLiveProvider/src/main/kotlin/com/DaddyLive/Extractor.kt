@@ -1,4 +1,4 @@
-// v2.6 - newExtractorLink 사용 및 헤더 설정 (빌드 에러 해결)
+// v2.7 - ExtractorLink 생성자 사용 및 헤더 완벽 적용
 package com.DaddyLive
 
 import android.content.Context
@@ -14,7 +14,7 @@ import com.lagradost.cloudstream3.AcraApplication
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
-import com.lagradost.cloudstream3.utils.newExtractorLink
+// newExtractorLink 사용 안함 (생성자 직접 호출)
 import com.lagradost.cloudstream3.utils.Qualities
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
@@ -34,7 +34,7 @@ class DaddyLiveExtractor : ExtractorApi() {
     ) {
         println("[DaddyLiveExtractor] getUrl 호출됨. 타겟: $url")
         
-        // WebView 스니핑은 suspend 함수이므로 코루틴 내에서 실행됨
+        // WebView 작업은 비동기(suspend)로 실행
         val m3u8Url = runWebViewSniffing(url, referer ?: mainUrl)
         
         if (m3u8Url != null) {
@@ -42,18 +42,21 @@ class DaddyLiveExtractor : ExtractorApi() {
             
             val finalReferer = "https://dlhd.link/" 
             
-            // [수정] newExtractorLink 사용.
-            // callback은 일반 함수이므로 바로 호출 가능.
+            // [수정] ExtractorLink 생성자 직접 호출로 안전하게 객체 생성
             callback(
-                newExtractorLink(name, name, m3u8Url, ExtractorLinkType.M3U8) {
-                    this.referer = finalReferer
-                    this.quality = Qualities.Unknown.value
-                    this.headers = mapOf(
+                ExtractorLink(
+                    source = name,
+                    name = name,
+                    url = m3u8Url,
+                    referer = finalReferer,
+                    quality = Qualities.Unknown.value,
+                    type = ExtractorLinkType.M3U8,
+                    headers = mapOf(
                         "User-Agent" to DESKTOP_UA,
                         "Referer" to finalReferer,
                         "Origin" to "https://dlhd.link"
                     )
-                }
+                )
             )
         } else {
             println("[DaddyLiveExtractor] M3U8 추출 실패 (타임아웃 또는 발견 못함): $url")
