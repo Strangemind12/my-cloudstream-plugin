@@ -1,4 +1,4 @@
-// v1.9 - fetchM3u8Url 사용으로 빌드 에러 완전 해결
+// v1.10 - 동적 Referer 적용을 위한 코드 수정
 package com.DaddyLive
 
 import com.lagradost.cloudstream3.HomePageList
@@ -19,7 +19,7 @@ import com.lagradost.cloudstream3.newLiveStreamLoadResponse
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.newExtractorLink // 이제 사용 가능
+import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import org.jsoup.nodes.Element
@@ -69,7 +69,6 @@ class DaddyLiveScheduleProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        println("[DaddyLive] 메인 페이지 로드 시작: $mainUrl")
         return try {
             val doc = app.get(mainUrl).document
             val schedule = doc.select(".schedule__category").map {
@@ -77,41 +76,34 @@ class DaddyLiveScheduleProvider : MainAPI() {
                 val events = searchResponseBuilder(it)
                 HomePageList(sectionTitle, events, false)
             }
-            println("[DaddyLive] 메인 페이지 파싱 완료: ${schedule.size}개 카테고리")
             newHomePageResponse(schedule, false)
         } catch (e: Exception) {
-            println("[DaddyLive] 메인 페이지 로드 실패: ${e.message}")
-            e.printStackTrace()
             newHomePageResponse(emptyList(), false)
         }
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        println("[DaddyLive] 검색 수행: $query")
         return try {
             val doc = app.get(mainUrl).document
             val schedule = doc.select(".schedule__category").map { searchResponseBuilder(it) }.flatten()
             val matches = schedule.filter {
                 query.lowercase().replace(" ", "") in it.name.lowercase().replace(" ", "")
             }
-            println("[DaddyLive] 검색 결과: ${matches.size}건 발견")
             matches
         } catch (e: Exception) {
-            println("[DaddyLive] 검색 실패: ${e.message}")
             emptyList()
         }
     }
 
     override suspend fun load(url: String): LoadResponse {
         val dataTitle = url.removePrefix("$mainUrl/")
-        println("[DaddyLive] 상세 정보 로드 요청: Title=$dataTitle")
         
         return try {
             val doc = app.get(mainUrl).document
             
             val event = doc.select(".schedule__event").firstOrNull {
                 it.select("div.schedule__eventHeader").attr("data-title") == dataTitle
-            } ?: throw Exception("이벤트를 찾을 수 없습니다: $dataTitle")
+            } ?: throw Exception("Event not found")
 
             val eventTitle = event.select(".schedule__eventTitle").text()
             val time = event.select(".schedule__time").text()
@@ -121,24 +113,18 @@ class DaddyLiveScheduleProvider : MainAPI() {
                 val href = it.attr("href")
                 if (href.isNotEmpty()) {
                     val fullUrl = fixUrl(href)
-                    println("[DaddyLive] 채널 발견: $name -> $fullUrl")
                     Channel(name, fullUrl)
                 } else {
                     null
                 }
             }
             
-            if (channels.isEmpty()) {
-                println("[DaddyLive] 경고: 이 이벤트에 연결된 채널이 없습니다.")
-            }
-
             val formattedTime = convertGMTToLocalTime(time)
             
             newLiveStreamLoadResponse("$formattedTime - $eventTitle", url, dataUrl = channels.toJson()) {
                 this.posterUrl = Companion.posterUrl
             }
         } catch (e: Exception) {
-            println("[DaddyLive] Load Error: ${e.message}")
             throw e
         }
     }
@@ -149,42 +135,33 @@ class DaddyLiveScheduleProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        println("[DaddyLive] loadLinks 시작. 데이터 파싱 중...")
-        
         val channels = try {
             parseJson<List<Channel>>(data)
         } catch (e: Exception) {
-            println("[DaddyLive] loadLinks JSON 파싱 실패: ${e.message}")
             emptyList()
         }
 
-        if (channels.isEmpty()) {
-            println("[DaddyLive] 로드할 채널 링크가 없습니다.")
-            return false
-        }
+        if (channels.isEmpty()) return false
 
-        println("[DaddyLive] 총 ${channels.size}개의 채널 소스 처리 시작")
         val extractor = DaddyLiveExtractor()
 
-        // [중요] 일반 루프 사용 (forEachIndexed 사용 시 인라인 람다라 문제는 없지만 명시적으로)
         for ((index, channel) in channels.withIndex()) {
             println("[DaddyLive] 소스 처리 ($index/${channels.size}): ${channel.name}")
             
-            // [해결] getUrl(callback) 대신 직접 값을 받아오는 함수 호출
-            // loadLinks가 suspend 함수이므로 여기서 기다렸다가 결과(String?)를 받음
-            val m3u8Url = extractor.fetchM3u8Url(channel.url, mainUrl)
+            // [변경] URL과 Referer를 쌍으로 받아옴
+            val result = extractor.fetchM3u8Url(channel.url, mainUrl)
             
-            if (m3u8Url != null) {
-                println("[DaddyLive] M3U8 확보 성공: ${channel.name} -> $m3u8Url")
+            if (result != null) {
+                val (m3u8Url, refererUrl) = result
+                println("[DaddyLive] M3U8 확보: $m3u8Url (Ref: $refererUrl)")
                 
-                // [해결] 여기서 newExtractorLink 호출은 loadLinks(suspend) 내부이므로 100% 안전
                 val link = newExtractorLink(name, channel.name, m3u8Url, ExtractorLinkType.M3U8) {
-                    this.referer = "https://dlhd.link/"
+                    this.referer = refererUrl // [중요] 동적으로 획득한 Referer 사용
                     this.quality = Qualities.Unknown.value
                     this.headers = mapOf(
                         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                        "Referer" to "https://dlhd.link/",
-                        "Origin" to "https://dlhd.link"
+                        "Referer" to refererUrl,
+                        "Origin" to "https://dlhd.link" // Origin은 고정일 수 있으나, 필요시 refererUrl 기반으로 변경 고려
                     )
                 }
                 callback(link)
