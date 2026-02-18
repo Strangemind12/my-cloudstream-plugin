@@ -1,4 +1,4 @@
-// v2.4 - KKTV 스타일 헤더 설정 적용 (빌드 에러 및 헤더 누락 해결)
+// v2.6 - newExtractorLink 사용 및 헤더 설정 (빌드 에러 해결)
 package com.DaddyLive
 
 import android.content.Context
@@ -34,6 +34,7 @@ class DaddyLiveExtractor : ExtractorApi() {
     ) {
         println("[DaddyLiveExtractor] getUrl 호출됨. 타겟: $url")
         
+        // WebView 스니핑은 suspend 함수이므로 코루틴 내에서 실행됨
         val m3u8Url = runWebViewSniffing(url, referer ?: mainUrl)
         
         if (m3u8Url != null) {
@@ -41,7 +42,8 @@ class DaddyLiveExtractor : ExtractorApi() {
             
             val finalReferer = "https://dlhd.link/" 
             
-            // [수정됨] KKTV 코드 스타일 적용: newExtractorLink + headers 설정
+            // [수정] newExtractorLink 사용.
+            // callback은 일반 함수이므로 바로 호출 가능.
             callback(
                 newExtractorLink(name, name, m3u8Url, ExtractorLinkType.M3U8) {
                     this.referer = finalReferer
@@ -87,7 +89,6 @@ class DaddyLiveExtractor : ExtractorApi() {
                     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                         val reqUrl = request?.url?.toString() ?: ""
                         
-                        // DaddyLive 스트림은 보통 .m3u8을 포함함
                         if (reqUrl.contains(".m3u8") && !reqUrl.contains("favicon")) {
                             println("[DaddyLiveExtractor] >>> M3U8 발견됨! <<< : $reqUrl")
                             
@@ -100,7 +101,6 @@ class DaddyLiveExtractor : ExtractorApi() {
                             return null
                         }
                         
-                        // 불필요한 리소스 차단
                         if (reqUrl.matches(Regex(".*\\.(jpg|png|gif|css|woff2?)$")) || 
                             reqUrl.contains("google") || 
                             reqUrl.contains("facebook") ||
