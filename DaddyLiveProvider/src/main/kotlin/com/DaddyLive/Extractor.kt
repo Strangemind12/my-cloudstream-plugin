@@ -1,4 +1,4 @@
-// v2.7 - ExtractorLink 생성자 사용 및 헤더 완벽 적용
+// v3.0 - 구조적 해결: URL 문자열 반환 함수 추가
 package com.DaddyLive
 
 import android.content.Context
@@ -14,7 +14,7 @@ import com.lagradost.cloudstream3.AcraApplication
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
-// newExtractorLink 사용 안함 (생성자 직접 호출)
+import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
@@ -26,40 +26,35 @@ class DaddyLiveExtractor : ExtractorApi() {
     
     private val DESKTOP_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
+    /**
+     * [구조 개선] 직접 M3U8 문자열을 반환하는 Suspend 함수
+     * Provider에서 이 함수를 직접 호출하면 콜백 지옥이나 Suspend 에러 없이 깔끔하게 처리 가능
+     */
+    suspend fun fetchM3u8Url(url: String, referer: String?): String? {
+        return runWebViewSniffing(url, referer ?: mainUrl)
+    }
+
+    // 기존 Interface 구현 (Provider에서는 사용하지 않음)
     override suspend fun getUrl(
         url: String,
         referer: String?,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        println("[DaddyLiveExtractor] getUrl 호출됨. 타겟: $url")
-        
-        // WebView 작업은 비동기(suspend)로 실행
-        val m3u8Url = runWebViewSniffing(url, referer ?: mainUrl)
-        
+        val m3u8Url = fetchM3u8Url(url, referer)
         if (m3u8Url != null) {
-            println("[DaddyLiveExtractor] M3U8 추출 성공: $m3u8Url")
-            
-            val finalReferer = "https://dlhd.link/" 
-            
-            // [수정] ExtractorLink 생성자 직접 호출로 안전하게 객체 생성
-            callback(
-                ExtractorLink(
-                    source = name,
-                    name = name,
-                    url = m3u8Url,
-                    referer = finalReferer,
-                    quality = Qualities.Unknown.value,
-                    type = ExtractorLinkType.M3U8,
-                    headers = mapOf(
-                        "User-Agent" to DESKTOP_UA,
-                        "Referer" to finalReferer,
-                        "Origin" to "https://dlhd.link"
-                    )
+            val finalReferer = "https://dlhd.link/"
+            // getUrl은 suspend 함수이므로 여기서 newExtractorLink 호출 가능
+            val link = newExtractorLink(name, name, m3u8Url, ExtractorLinkType.M3U8) {
+                this.referer = finalReferer
+                this.quality = Qualities.Unknown.value
+                this.headers = mapOf(
+                    "User-Agent" to DESKTOP_UA,
+                    "Referer" to finalReferer,
+                    "Origin" to "https://dlhd.link"
                 )
-            )
-        } else {
-            println("[DaddyLiveExtractor] M3U8 추출 실패 (타임아웃 또는 발견 못함): $url")
+            }
+            callback(link)
         }
     }
 
@@ -68,7 +63,7 @@ class DaddyLiveExtractor : ExtractorApi() {
         
         handler.post {
             try {
-                println("[DaddyLiveExtractor] WebView 인스턴스 생성 및 설정...")
+                println("[DaddyLiveExtractor] WebView 초기화: $url")
                 val context = (AcraApplication.context ?: app) as Context
                 val webView = WebView(context)
 
@@ -81,7 +76,7 @@ class DaddyLiveExtractor : ExtractorApi() {
 
                 val timeoutRunnable = Runnable {
                     if (cont.isActive) {
-                        println("[DaddyLiveExtractor] WebView 타임아웃 (15초). 강제 종료.")
+                        println("[DaddyLiveExtractor] 타임아웃 종료")
                         try { webView.destroy() } catch (e: Exception) {}
                         cont.resume(null)
                     }
@@ -93,10 +88,8 @@ class DaddyLiveExtractor : ExtractorApi() {
                         val reqUrl = request?.url?.toString() ?: ""
                         
                         if (reqUrl.contains(".m3u8") && !reqUrl.contains("favicon")) {
-                            println("[DaddyLiveExtractor] >>> M3U8 발견됨! <<< : $reqUrl")
-                            
+                            println("[DaddyLiveExtractor] M3U8 발견: $reqUrl")
                             handler.removeCallbacks(timeoutRunnable)
-                            
                             if (cont.isActive) {
                                 view?.post { try { webView.destroy() } catch (e: Exception) {} }
                                 cont.resume(reqUrl)
@@ -104,27 +97,15 @@ class DaddyLiveExtractor : ExtractorApi() {
                             return null
                         }
                         
-                        if (reqUrl.matches(Regex(".*\\.(jpg|png|gif|css|woff2?)$")) || 
-                            reqUrl.contains("google") || 
-                            reqUrl.contains("facebook") ||
-                            reqUrl.contains("analytics")) {
+                        if (reqUrl.matches(Regex(".*\\.(jpg|png|gif|css|woff2?)$"))) {
                             return WebResourceResponse("text/plain", "utf-8", null)
                         }
 
                         return super.shouldInterceptRequest(view, request)
                     }
-
-                    override fun onPageFinished(view: WebView?, url: String?) {
-                        super.onPageFinished(view, url)
-                        println("[DaddyLiveExtractor] 페이지 로딩 완료: $url")
-                    }
                 }
-
-                println("[DaddyLiveExtractor] URL 로드 시작 (Referer: $referer): $url")
                 webView.loadUrl(url, mapOf("Referer" to referer))
-
             } catch (e: Exception) {
-                println("[DaddyLiveExtractor] WebView 초기화 중 에러: ${e.message}")
                 if (cont.isActive) cont.resume(null)
             }
         }
