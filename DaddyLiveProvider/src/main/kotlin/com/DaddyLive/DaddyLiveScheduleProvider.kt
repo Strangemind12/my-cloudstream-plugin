@@ -1,3 +1,8 @@
+/**
+ * DaddyLiveScheduleProvider v2.20
+ * - [Fix] 모든 채널, 6개 모든 플레이어 요소 전수 조사
+ * - [Debug] 실행 이력 관리를 위한 v2.20 버전 명시
+ */
 package com.DaddyLive
 
 import com.lagradost.cloudstream3.*
@@ -30,12 +35,15 @@ class DaddyLiveScheduleProvider : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val doc = app.get(mainUrl).document
         val schedule = doc.select(".schedule__category").map {
+            val sectionTitle = it.select(".card__meta").text()
             val events = it.select(".schedule__event").map { e ->
                 val dataTitle = e.select(".schedule__eventHeader").attr("data-title")
                 val formattedTime = convertGMTToLocalTime(e.select(".schedule__time").text())
-                newLiveSearchResponse("$formattedTime - ${e.select(".schedule__eventTitle").text()}", dataTitle) { this.posterUrl = Companion.posterUrl }
+                newLiveSearchResponse("$formattedTime - ${e.select(".schedule__eventTitle").text()}", dataTitle) {
+                    this.posterUrl = Companion.posterUrl
+                }
             }
-            HomePageList(it.select(".card__meta").text(), events, false)
+            HomePageList(sectionTitle, events, false)
         }
         return newHomePageResponse(schedule, false)
     }
@@ -45,19 +53,22 @@ class DaddyLiveScheduleProvider : MainAPI() {
         val dataTitle = url.removePrefix("$mainUrl/")
         val event = doc.select(".schedule__event").first { it.select("div.schedule__eventHeader").attr("data-title") == dataTitle }
         val channels = event.select(".schedule__channels > a").map {
-            Channel(it.text(), "$mainUrl/%s/stream-${it.attr("href").substringAfter("id=")}.php")
+            val id = it.attr("href").substringAfter("id=")
+            Channel(it.text(), "$mainUrl/%s/stream-$id.php")
         }
         return newLiveStreamLoadResponse(event.select(".schedule__eventTitle").text(), url, dataUrl = channels.toJson())
     }
 
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         val channels = AppUtils.tryParseJson<List<Channel>>(data) ?: return false
+        val allPlayers = listOf("stream", "cast", "watch", "plus", "casting", "player")
         
-        // [Fix] 성공률 높은 player와 이번에 확인된 stream 요소를 병행 추출
-        val targetLinks = channels.take(3).flatMap { ch ->
-            listOf("player", "stream").map { p -> ch.channelName + " - $p" to ch.channelId.format(p) }
+        // 모든 채널의 모든 요소를 검사 대상으로 생성
+        val targetLinks = channels.flatMap { ch ->
+            allPlayers.map { p -> ch.channelName + " - $p" to ch.channelId.format(p) }
         }
 
+        println("[DaddyLive] v2.20 전수 조사 시작: ${targetLinks.size}개 경로")
         DaddyLiveExtractor().getUrl(targetLinks.toJson(), null, subtitleCallback, callback)
         return true
     }
