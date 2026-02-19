@@ -1,7 +1,6 @@
 /**
- * DaddyLiveScheduleProvider v2.7
- * - [Fix] 최대 5개 채널 x 6개 플레이어 = 30개 경로 생성
- * - [Optimize] 모든 경로를 리스트로 만들어 Extractor에 한 번에 전달 (병렬 처리용)
+ * DaddyLiveScheduleProvider v2.8
+ * - [Fix] 최대 5개 채널 x 6개 플레이어 조합 생성 로직 유지
  */
 package com.DaddyLive
 
@@ -62,12 +61,10 @@ class DaddyLiveScheduleProvider : MainAPI() {
         val channels = AppUtils.tryParseJson<List<Channel>>(data) ?: return false
         val allPlayers = listOf("stream", "cast", "watch", "plus", "casting", "player")
         
-        // 최대 5개 채널 x 6개 플레이어 = 30개 조합
         val targetLinks = channels.take(5).flatMap { ch ->
             allPlayers.map { p -> ch.channelName + " - $p" to ch.channelId.format(p) }
         }
 
-        println("[DaddyLive] 30개 경로 고속 병렬 추출 시작")
         DaddyLiveExtractor().getUrl(targetLinks.toJson(), null, subtitleCallback, callback)
         return true
     }
