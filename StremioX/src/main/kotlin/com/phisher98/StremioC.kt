@@ -1,4 +1,4 @@
-// v1.5
+// v1.7
 package com.phisher98
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -48,6 +48,10 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     override val supportedTypes = setOf(TvType.Others)
     override val hasMainPage = true
 
+    // v1.7: 로딩 속도 극대화를 위한 Manifest 메모리 캐싱 변수
+    private var cachedManifest: Manifest? = null
+    private var lastManifestUrl: String = ""
+
     companion object {
         private const val cinemeta = "https://aiometadata.elfhosted.com/stremio/b7cb164b-074b-41d5-b458-b3a834e197bb"
         val TRACKER_LIST_URLS = listOf(
@@ -56,7 +60,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         )
         private const val TRACKER_LIST_URL = "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt"
     }
-
 
     private fun baseUrl(): String {
         return mainUrl.substringBefore("?").trimEnd('/')
@@ -73,11 +76,24 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         return "${baseUrl()}$path${querySuffix()}"
     }
 
+    // v1.7: 중복 네트워크 요청을 제거하는 스마트 캐싱 로직 구현
+    private suspend fun getManifest(): Manifest? {
+        val currentUrl = buildUrl("/manifest.json")
+        if (cachedManifest != null && lastManifestUrl == currentUrl) {
+            println("[v1.7 Debug] 캐시된 Manifest 사용 (네트워크 지연 시간 단축 완료)")
+            return cachedManifest
+        }
+        println("[v1.7 Debug] Manifest 새로 다운로드: $currentUrl")
+        cachedManifest = app.get(currentUrl).parsedSafe<Manifest>()
+        lastManifestUrl = currentUrl
+        return cachedManifest
+    }
+
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-        println("[v1.5 Debug] getMainPage 실행 (홈 화면 로드) - page: $page")
+        println("[v1.7 Debug] getMainPage 실행 - page: $page")
         if (mainUrl.isEmpty()) {
             throw IllegalArgumentException("Configure in Extension Settings\n")
         }
@@ -86,24 +102,17 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val pageSize = 100
         val skip = (page - 1) * pageSize
 
-        val manifest = app
-            .get(buildUrl("/manifest.json"))
-            .parsedSafe<Manifest>()
+        val manifest = getManifest()
 
-        val lists = mutableListOf<HomePageList>()
+        val targetCatalogs = manifest?.catalogs?.filter { !it.isSearchRequired() } ?: emptyList()
 
-        // v1.5: 검색이 "필수(isRequired)"인 전용 카탈로그는 홈 화면 일반 목록에서 제외하여 오류 방지
-        manifest?.catalogs?.filter { !it.isSearchRequired() }?.amap { catalog ->
-            println("[v1.5 Debug] 일반 카탈로그 로드 허용됨: ${catalog.name ?: catalog.id}")
+        val lists = targetCatalogs.amap { catalog ->
+            println("[v1.7 Debug] 일반 카탈로그 병렬 로드 시작: ${catalog.name ?: catalog.id}")
             catalog.toHomePageList(
                 provider = this,
                 skip = skip
-            ).let {
-                if (it.list.isNotEmpty()) {
-                    lists.add(it)
-                }
-            }
-        }
+            )
+        }.filter { it.list.isNotEmpty() }
 
         return newHomePageResponse(
             lists,
@@ -111,27 +120,24 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         )
     }
 
-
     override suspend fun search(query: String): List<SearchResponse> {
-        println("[v1.5 Debug] search 실행 (검색창) - query: $query")
+        println("[v1.7 Debug] search 실행 - query: $query")
         mainUrl = mainUrl.fixSourceUrl()
-        val res = app.get(buildUrl("/manifest.json")).parsedSafe<Manifest>()
-        val list = mutableListOf<SearchResponse>()
         
-        // v1.5: extra 속성을 통해 명시적으로 'search' 기능을 지원하는 카탈로그만 필터링 (쓰레기 데이터 유입 차단)
-        val targetCatalogs = res?.catalogs?.filter { it.supportsSearch() } ?: emptyList()
-        println("[v1.5 Debug] 검색을 지원하는 카탈로그 개수: ${targetCatalogs.size}")
+        val manifest = getManifest()
+        val targetCatalogs = manifest?.catalogs?.filter { it.supportsSearch() } ?: emptyList()
 
-        targetCatalogs.amap { catalog ->
-            list.addAll(catalog.search(query, this))
-        }
+        val list = targetCatalogs.amap { catalog ->
+            catalog.search(query, this)
+        }.flatten()
         
-        println("[v1.5 Debug] 검색 완료 - 총 반환 아이템 수: ${list.distinct().size}")
-        return list.distinct()
+        val distinctList = list.distinctBy { it.url }
+        println("[v1.7 Debug] 검색 완료 - 총 반환 아이템 수: ${distinctList.size}")
+        return distinctList
     }
 
     override suspend fun load(url: String): LoadResponse {
-        println("[v1.5 Debug] load 실행 - url: $url")
+        println("[v1.7 Debug] load 실행 - url: $url")
         val res: CatalogEntry = if (url.startsWith("{")) {
             parseJson(url)
         } else {
@@ -168,7 +174,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("[v1.5 Debug] loadLinks 실행")
+        println("[v1.7 Debug] loadLinks 실행")
         val loadData = parseJson<LoadData>(data)
         val encodedId = URLEncoder.encode(loadData.id, "UTF-8")
         val request = app.get(buildUrl("/stream/${loadData.type}/$encodedId.json"))
@@ -252,7 +258,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         @JsonProperty("lang") val lang: String,
     )
 
-    // check if id is imdb/tmdb cause stremio addons like torrentio works base on imdbId
     private fun isImdborTmdb(url: String?): Boolean {
         return imdbUrlToIdNullable(url) != null || url?.startsWith("tmdb:") == true
     }
@@ -261,10 +266,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         return imdbUrlToIdNullable(url) != null
     }
 
-
     private data class Manifest(val catalogs: List<Catalog>)
     
-    // v1.5: Stremio Extra 속성 파싱 데이터 클래스
     private data class Extra(
         @JsonProperty("name") val name: String?,
         @JsonProperty("isRequired") val isRequired: Boolean? = false
@@ -275,20 +278,17 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val id: String,
         val type: String?,
         val types: MutableList<String> = mutableListOf(),
-        @JsonProperty("extra") val extra: List<Extra>? = null, // v1.5 추가
-        @JsonProperty("extraSupported") val extraSupported: List<String>? = null // v1.5 추가
+        @JsonProperty("extra") val extra: List<Extra>? = null,
+        @JsonProperty("extraSupported") val extraSupported: List<String>? = null
     ) {
         init {
             if (type != null) types.add(type)
         }
 
-        // v1.5: 오직 검색만이 필수 목적인 카탈로그인지 확인 (홈 화면 제외용)
         fun isSearchRequired(): Boolean {
-            val hasRequiredSearch = extra?.any { it.name == "search" && it.isRequired == true } == true
-            return hasRequiredSearch
+            return extra?.any { it.name == "search" && it.isRequired == true } == true
         }
 
-        // v1.5: 어떤 형태든 'search' 파라미터를 지원하는 카탈로그인지 확인 (검색 요청 승인용)
         fun supportsSearch(): Boolean {
             val hasSearchInExtra = extra?.any { it.name == "search" } == true
             val hasSearchInExtraSupported = extraSupported?.contains("search") == true
@@ -296,52 +296,40 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         }
 
         suspend fun search(query: String, provider: StremioC): List<SearchResponse> {
-            val entries = mutableListOf<SearchResponse>()
-            types.forEach { type ->
+            // v1.7: 단일 카탈로그 내의 다중 type(movie, series 등) 요청을 순차(forEach)에서 병렬(amap)로 업그레이드하여 속도 향상
+            val allMetas = types.amap { type ->
                 val searchUrl = provider.buildUrl("/catalog/${type}/${id}/search=${query}.json")
-                println("[v1.5 Debug] 검색 API 호출 대상: $searchUrl")
-                val res = app.get(
-                    searchUrl,
-                    timeout = 120L
-                ).parsedSafe<CatalogResponse>()
-                res?.metas?.forEach { entry ->
-                    entries.add(entry.toSearchResponse(provider))
-                }
-            }
-            return entries
+                println("[v1.7 Debug] 검색 API 병렬 호출 대상: $searchUrl")
+                val res = app.get(searchUrl, timeout = 120L).parsedSafe<CatalogResponse>()
+                res?.metas ?: emptyList()
+            }.flatten()
+
+            return allMetas.distinctBy { it.id }.map { it.toSearchResponse(provider) }
         }
 
         suspend fun toHomePageList(
             provider: StremioC,
             skip: Int
         ): HomePageList {
-            val entries = mutableMapOf<String, SearchResponse>()
-
-            types.forEach { type ->
+            // v1.7: 카탈로그 내부 아이템 조회 속도 극대화를 위해 forEach를 amap 비동기 다중 스레드로 교체
+            val allMetas = types.amap { type ->
                 val path = if (skip > 0) {
                     "/catalog/$type/$id/skip=$skip.json"
                 } else {
                     "/catalog/$type/$id.json"
                 }
-
                 val url = provider.buildUrl(path)
-                println("[v1.5 Debug] 홈 화면 카탈로그 호출 대상: $url")
+                println("[v1.7 Debug] 홈 화면 카탈로그 병렬 호출: $url")
 
-                val res = app.get(
-                    url,
-                    timeout = 120L
-                ).parsedSafe<CatalogResponse>()
+                val res = app.get(url, timeout = 120L).parsedSafe<CatalogResponse>()
+                res?.metas ?: emptyList()
+            }.flatten()
 
-                res?.metas?.forEach { entry ->
-                    if (!entries.containsKey(entry.id)) {
-                        entries[entry.id] = entry.toSearchResponse(provider)
-                    }
-                }
-            }
+            val distinctEntries = allMetas.distinctBy { it.id }.map { it.toSearchResponse(provider) }
 
             return HomePageList(
                 name ?: id,
-                entries.values.toList()
+                distinctEntries
             )
         }
     }
@@ -352,7 +340,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val source: String?,
         val type: String?
     )
-
 
     private data class CatalogEntry(
         @JsonProperty("name") val name: String,
@@ -378,8 +365,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 posterUrl = poster
             }
         }
-
-
 
         suspend fun toLoadResponse(provider: StremioC, imdbId: String?): LoadResponse {
             if (videos.isNullOrEmpty()) {
@@ -420,7 +405,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     addImdbId(imdbId)
                 }
             }
-
         }
     }
 
