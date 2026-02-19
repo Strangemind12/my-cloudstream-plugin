@@ -1,8 +1,7 @@
 /**
- * DaddyLiveExtractor v2.14
- * - [Fix] 상위 3개 채널의 "player" 소스만 병렬 추출하여 속도 및 재생 성공률 극대화
- * - [Fix] 'webViewParam' 변수명 통일로 빌드 에러 원천 차단
- * - [Fix] S3 및 CDN 보안 통과를 위한 이중 쿠키 주입 로직 강화
+ * DaddyLiveExtractor v2.15
+ * - [Fix] 위장된 스트림 패턴(.css) 감시 추가: dvalna.ru 등의 신규 서버 대응
+ * - [Fix] S3 및 위장 서버의 403 에러 방지를 위한 헤더/쿠키 로직 최적화
  */
 package com.DaddyLive
 
@@ -23,59 +22,43 @@ class DaddyLiveExtractor : ExtractorApi() {
 
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val links = AppUtils.tryParseJson<List<Pair<String, String>>>(url) ?: return
-        println("[DaddyLiveExt] v2.14 병렬 추출 프로세스 시작 (3개 동시)")
         
         coroutineScope {
-            // Player 소스 3개를 동시에 웹뷰로 처리
             links.amap { (name, link) ->
                 val result = runWebViewInterceptor(link)
                 if (result != null) {
-                    println("[DaddyLiveExt] ★데이터 획득 성공: $result")
-                    processAndAddSource(name, result, callback)
+                    processSource(name, result, callback)
                 }
             }
         }
     }
 
-    private suspend fun processAndAddSource(name: String, result: String, callback: (ExtractorLink) -> Unit) {
+    private suspend fun processSource(name: String, result: String, callback: (ExtractorLink) -> Unit) {
         val fixedReferer = "https://dlhd.link/"
-        val fixedOrigin = "https://dlhd.link"
+        val cookies = CookieManager.getInstance().getCookie(result)
         
-        // 보안 통과를 위해 사이트 및 영상 도메인 쿠키 획득
-        val cookieManager = CookieManager.getInstance()
-        val siteCookies = cookieManager.getCookie("https://dlhd.link")
-        val streamCookies = cookieManager.getCookie(result)
-        val combinedCookies = listOfNotNull(siteCookies, streamCookies).joinToString("; ").takeIf { it.isNotBlank() }
-
+        // [Fix] .css 위장 주소일 경우 강제로 M3U8 타입으로 지정하여 재생 유도
+        val isM3U8 = result.contains(".m3u8") || result.contains("mono.css")
         val is1080 = result.contains("/1080p/")
         val is720 = result.contains("/720p/")
 
-        // [Fix] newExtractorLink 호출을 위해 suspend 내부 함수 사용
-        suspend fun push(finalName: String, finalUrl: String, qual: Int) {
-            println("[DaddyLiveExt] 리스트 추가: $finalName")
-            callback(newExtractorLink(finalName, name, finalUrl, type = ExtractorLinkType.M3U8) {
-                this.quality = qual
+        suspend fun push(n: String, u: String, q: Int) {
+            callback(newExtractorLink(n, name, u, type = ExtractorLinkType.M3U8) {
+                this.quality = q
                 this.referer = fixedReferer
-                this.headers = mutableMapOf(
-                    "User-Agent" to userAgent,
-                    "Referer" to fixedReferer,
-                    "Origin" to fixedOrigin,
-                    "Accept" to "*/*"
-                ).apply {
-                    if (combinedCookies != null) put("Cookie", combinedCookies)
+                this.headers = mutableMapOf("User-Agent" to userAgent, "Referer" to fixedReferer, "Origin" to "https://dlhd.link").apply {
+                    if (!cookies.isNullOrEmpty()) put("Cookie", cookies)
                 }
             })
         }
 
-        // 1. 원본 소스 추가
-        val originalQual = if (is1080) Qualities.P1080.value else if (is720) Qualities.P720.value else Qualities.Unknown.value
-        push("$name ${if(is1080) "(1080p)" else if(is720) "(720p)" else ""}", result, originalQual)
+        val baseQual = if(is1080) Qualities.P1080.value else if(is720) Qualities.P720.value else Qualities.Unknown.value
+        push("$name ${if(is1080) "(1080p)" else if(is720) "(720p)" else ""}", result, baseQual)
 
-        // 2. 화질 교차 재조립 (1080p <-> 720p)
-        if (is1080) {
-            push("$name (720p - 재조립)", result.replace("/1080p/", "/720p/"), Qualities.P720.value)
-        } else if (is720) {
-            push("$name (1080p - 재조립)", result.replace("/720p/", "/1080p/"), Qualities.P1080.value)
+        // 화질 재조립 (CSS 위장 주소는 경로 규칙이 다를 수 있어 S3인 경우에만 우선 적용)
+        if (result.contains("amazonaws.com")) {
+            if (is1080) push("$name (720p - 재조립)", result.replace("/1080p/", "/720p/"), Qualities.P720.value)
+            else if (is720) push("$name (1080p - 재조립)", result.replace("/720p/", "/1080p/"), Qualities.P1080.value)
         }
     }
 
@@ -91,55 +74,32 @@ class DaddyLiveExtractor : ExtractorApi() {
                     javaScriptEnabled = true
                     domStorageEnabled = true
                     userAgentString = userAgent
-                    blockNetworkImage = true // 속도 향상을 위해 이미지 차단
+                    blockNetworkImage = true 
                     mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                 }
 
                 webView.webViewClient = object : WebViewClient() {
                     override fun onReceivedSslError(v: WebView?, h: SslErrorHandler?, e: android.net.http.SslError?) { h?.proceed() }
                     
-                    // [Fix] webViewParam 매개변수 사용으로 unresolved reference 에러 방지
                     override fun shouldInterceptRequest(webViewParam: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                         val reqUrl = request?.url?.toString() ?: ""
-                        if (reqUrl.contains(".m3u8") && !reqUrl.contains("topembed.pw") && !isFinished) {
+                        val lower = reqUrl.lowercase()
+                        
+                        // [핵심] 감시 패턴에 .css (위장 스트림) 추가
+                        val isMatch = lower.contains(".m3u8") || lower.contains("mono.css") || lower.contains("mizhls")
+                        
+                        if (isMatch && !lower.contains("topembed.pw") && !isFinished) {
                             isFinished = true
-                            println("[DaddyLiveExt] ★네트워크 가로채기 성공")
+                            println("[DaddyLiveExt] ★인터셉트 성공: $reqUrl")
                             handler.post { webView.destroy() }
                             if (cont.isActive) cont.resume(reqUrl)
                         }
                         return super.shouldInterceptRequest(webViewParam, request)
                     }
-
-                    override fun onPageFinished(webViewParam: WebView?, url: String?) {
-                        if (!isFinished) {
-                            webViewParam?.evaluateJavascript(
-                                "(function(){var s=document.getElementsByTagName('script');for(var i=0;i<s.length;i++){var m=s[i].innerHTML.match(/file\\s*:\\s*[\"']([^\"']+\\.m3u8[^\"']*)[\"']/);if(m)return m[1];}return null;})();"
-                            ) { jsResult ->
-                                val clean = jsResult?.trim('"')?.takeIf { it != "null" && it.isNotEmpty() }
-                                if (clean != null && !isFinished) {
-                                    isFinished = true
-                                    println("[DaddyLiveExt] ★JS Injection 성공")
-                                    handler.post { webView.destroy() }
-                                    if (cont.isActive) cont.resume(clean)
-                                }
-                            }
-                        }
-                    }
                 }
-                println("[DaddyLiveExt] 웹뷰 분석 중: $targetUrl")
                 webView.loadUrl(targetUrl, mapOf("Referer" to "https://dlhd.link/"))
-
-                handler.postDelayed({ 
-                    if (!isFinished && cont.isActive) { 
-                        isFinished = true
-                        webView.destroy()
-                        println("[DaddyLiveExt] 분석 타임아웃")
-                        cont.resume(null) 
-                    } 
-                }, 20000)
-            } catch (e: Exception) { 
-                if (cont.isActive) cont.resume(null) 
-            }
+                handler.postDelayed({ if (!isFinished && cont.isActive) { isFinished = true; webView.destroy(); cont.resume(null) } }, 20000)
+            } catch (e: Exception) { if (cont.isActive) cont.resume(null) }
         }
     }
 }
