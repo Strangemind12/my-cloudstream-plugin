@@ -1,4 +1,4 @@
-package com.tvmom
+package com.tvmon
 import com.tvmon.TVMon // 예시 경로
 import com.tvmon.BunnyPoorCdn
 import com.lagradost.cloudstream3.plugins.BasePlugin
