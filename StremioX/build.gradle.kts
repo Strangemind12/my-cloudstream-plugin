@@ -1,13 +1,10 @@
-// v1.12
+// v1.13
 import java.util.Properties
 
-// use an integer for version numbers
 version = 13
 
 android {
-    // v1.12: namespace를 명시하여 BuildConfig 패키지를 고정함
     namespace = "com.phisher98"
-    
     buildFeatures {
         buildConfig = true
         viewBinding = true
@@ -16,7 +13,7 @@ android {
         val propFile = project.rootProject.file("local.properties")
         val properties = Properties()
         
-        // v1.12: 파일이 있을 때만 읽고, 없으면 환경변수나 빈 값을 사용함
+        // v1.13: 파일이 없을 경우 에러 대신 빈 값 처리 (CI 환경 대응)
         val tmdbApiKey = if (propFile.exists()) {
             propFile.inputStream().use { properties.load(it) }
             properties.getProperty("TMDB_API") ?: ""
