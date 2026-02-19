@@ -1,7 +1,8 @@
 /**
- * DaddyLiveExtractor v2.12
- * - [Fix] AWS S3 403(2004) 에러 해결: Cookie 및 Origin 헤더 주입 강화
- * - [Fix] ExoPlayer용 헤더 세트 정밀 조정 (Referer/Origin/Cookie 일치)
+ * DaddyLiveExtractor v2.13
+ * - [Fix] 'Unresolved reference view' 빌드 에러 해결 (매개변수명 통일)
+ * - [Fix] AWS S3 403 에러 해결: 세션 쿠키 및 Origin 헤더 주입 강화
+ * - [Optimize] 병렬 처리(amap) 및 1080p/720p 상호 재조립 로직 유지
  */
 package com.DaddyLive
 
@@ -24,30 +25,32 @@ class DaddyLiveExtractor : ExtractorApi() {
         val links = AppUtils.tryParseJson<List<Pair<String, String>>>(url) ?: return
         
         coroutineScope {
+            // 3개씩 병렬 처리하여 타임아웃 방지
             links.chunked(3).forEach { chunk ->
-                chunk.map { (name, link) ->
-                    async {
-                        val result = runWebViewInterceptor(link)
-                        if (result != null) {
-                            processLinkWithAdvancedHeaders(name, result, callback)
-                        }
+                chunk.amap { (name, link) ->
+                    val result = runWebViewInterceptor(link)
+                    if (result != null) {
+                        processFinalLink(name, result, callback)
                     }
-                }.awaitAll()
+                }
             }
         }
     }
 
-    private suspend fun processLinkWithAdvancedHeaders(name: String, result: String, callback: (ExtractorLink) -> Unit) {
+    private suspend fun processFinalLink(name: String, result: String, callback: (ExtractorLink) -> Unit) {
         val fixedReferer = "https://dlhd.link/"
         val fixedOrigin = "https://dlhd.link"
-        // 웹뷰에서 생성된 쿠키를 해당 M3U8 주소 기준으로 획득
-        val cookies = CookieManager.getInstance().getCookie(result)
         
-        val isS3 = result.contains("amazonaws.com")
+        // S3 보안 통과를 위해 웹뷰에 저장된 모든 쿠키(세션)를 긁어옴
+        val cookieManager = CookieManager.getInstance()
+        val siteCookies = cookieManager.getCookie("https://dlhd.link")
+        val streamCookies = cookieManager.getCookie(result)
+        val combinedCookies = listOfNotNull(siteCookies, streamCookies).joinToString("; ").takeIf { it.isNotBlank() }
+
         val is1080 = result.contains("/1080p/")
         val is720 = result.contains("/720p/")
 
-        suspend fun push(n: String, u: String, q: Int) {
+        suspend fun add(n: String, u: String, q: Int) {
             callback(newExtractorLink(n, name, u, type = ExtractorLinkType.M3U8) {
                 this.quality = q
                 this.referer = fixedReferer
@@ -57,17 +60,20 @@ class DaddyLiveExtractor : ExtractorApi() {
                     "Origin" to fixedOrigin,
                     "Accept" to "*/*"
                 ).apply {
-                    // S3 스토리지는 쿠키가 없으면 403을 뱉는 경우가 많음
-                    if (!cookies.isNullOrEmpty()) put("Cookie", cookies)
+                    if (combinedCookies != null) {
+                        put("Cookie", combinedCookies)
+                    }
                 }
             })
         }
 
+        // 원본 추가
         val baseQual = if(is1080) Qualities.P1080.value else if(is720) Qualities.P720.value else Qualities.Unknown.value
-        push("$name ${if(is1080) "(1080p)" else if(is720) "(720p)" else ""}", result, baseQual)
+        add("$name ${if(is1080) "(1080p)" else if(is720) "(720p)" else ""}", result, baseQual)
 
-        if (is1080) push("$name (720p - 재조립)", result.replace("/1080p/", "/720p/"), Qualities.P720.value)
-        else if (is720) push("$name (1080p - 재조립)", result.replace("/720p/", "/1080p/"), Qualities.P1080.value)
+        // 화질 재조립 추가
+        if (is1080) add("$name (720p - 재조립)", result.replace("/1080p/", "/720p/"), Qualities.P720.value)
+        else if (is720) add("$name (1080p - 재조립)", result.replace("/720p/", "/1080p/"), Qualities.P1080.value)
     }
 
     private suspend fun runWebViewInterceptor(targetUrl: String): String? = suspendCancellableCoroutine { cont ->
@@ -88,15 +94,33 @@ class DaddyLiveExtractor : ExtractorApi() {
 
                 webView.webViewClient = object : WebViewClient() {
                     override fun onReceivedSslError(v: WebView?, h: SslErrorHandler?, e: android.net.http.SslError?) { h?.proceed() }
-                    override fun shouldInterceptRequest(v: WebView, request: WebResourceRequest): WebResourceResponse? {
-                        val reqUrl = request.url.toString()
+                    
+                    // [Fix] 매개변수 이름을 webViewParam으로 명확히 하여 unresolved reference 해결
+                    override fun shouldInterceptRequest(webViewParam: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                        val reqUrl = request?.url?.toString() ?: ""
                         if (reqUrl.contains(".m3u8") && !reqUrl.contains("topembed.pw") && !isFinished) {
                             isFinished = true
                             println("[DaddyLiveExt] ★인터셉트 성공: $reqUrl")
                             handler.post { webView.destroy() }
                             if (cont.isActive) cont.resume(reqUrl)
                         }
-                        return super.shouldInterceptRequest(view, request)
+                        return super.shouldInterceptRequest(webViewParam, request)
+                    }
+
+                    override fun onPageFinished(webViewParam: WebView?, url: String?) {
+                        if (!isFinished) {
+                            webViewParam?.evaluateJavascript(
+                                "(function(){var s=document.getElementsByTagName('script');for(var i=0;i<s.length;i++){var m=s[i].innerHTML.match(/file\\s*:\\s*[\"']([^\"']+\\.m3u8[^\"']*)[\"']/);if(m)return m[1];}return null;})();"
+                            ) { r ->
+                                val clean = r?.trim('"')?.takeIf { it != "null" && it.isNotEmpty() }
+                                if (clean != null && !isFinished) {
+                                    isFinished = true
+                                    println("[DaddyLiveExt] ★JS 추출 성공: $clean")
+                                    handler.post { webView.destroy() }
+                                    if (cont.isActive) cont.resume(clean)
+                                }
+                            }
+                        }
                     }
                 }
                 webView.loadUrl(targetUrl, mapOf("Referer" to "https://dlhd.link/"))
