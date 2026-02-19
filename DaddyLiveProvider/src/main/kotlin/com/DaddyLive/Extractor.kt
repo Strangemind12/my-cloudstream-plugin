@@ -1,8 +1,8 @@
 /**
- * DaddyLiveExtractor v2.2
- * - [Fix] 2004 에러(403 Forbidden) 해결: Referer를 원본 사이트로 고정 및 Origin 헤더 추가
- * - [Fix] JS Injection 로직 정교화 (file/source 패턴 매칭 강화)
- * - [Debug] 추출된 m3u8 주소와 함께 적용된 헤더 정보를 로그에 출력
+ * DaddyLiveExtractor v2.3
+ * - [Fix] 2004(403) 에러 해결: WebView에서 쿠키(Cookie)를 추출하여 ExoPlayer 헤더에 주입
+ * - [Fix] AWS S3 차단 방지: 불필요한 Origin 헤더 제거 및 Referer 최적화
+ * - [Debug] DNS 및 403 경고 로그 추가
  */
 package com.DaddyLive
 
@@ -30,28 +30,34 @@ class DaddyLiveExtractor : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         val links = AppUtils.tryParseJson<List<Pair<String, String>>>(url)
-        println("[DaddyLiveExt] v2.2 추출 프로세스 시작")
+        println("[DaddyLiveExt] v2.3 추출 시작 (Cookie Injection 모드)")
         
         links?.forEach { (name, link) ->
             val result = runWebViewInterceptor(link)
             if (result != null) {
-                // [핵심] 403 에러 방지를 위한 헤더 재설정
-                // Referer는 영상 서버(S3) 주소가 아닌, 원본 사이트(dlhd.link)여야 함
+                // 웹뷰로부터 해당 URL에 대한 쿠키 획득
+                val cookies = CookieManager.getInstance().getCookie(result)
                 val fixedReferer = "https://dlhd.link/"
-                val fixedOrigin = "https://dlhd.link"
 
-                println("[DaddyLiveExt] ★확보된 링크: $result")
-                println("[DaddyLiveExt] 적용 헤더: Referer=$fixedReferer, Origin=$fixedOrigin")
+                println("[DaddyLiveExt] ★링크 확보: $result")
+                if (result.contains("amazonaws.com")) {
+                    println("[DaddyLiveExt] AWS S3 감지: 헤더 최소화 적용")
+                }
 
                 callback(newExtractorLink(name, name, result, type = ExtractorLinkType.M3U8) {
                     this.referer = fixedReferer
-                    this.headers = mapOf(
+                    this.headers = mutableMapOf(
                         "User-Agent" to userAgent,
-                        "Origin" to fixedOrigin,
-                        "Referer" to fixedReferer
-                    )
+                        "Referer" to fixedReferer,
+                        "Accept" to "*/*"
+                    ).apply {
+                        if (!cookies.isNullOrEmpty()) {
+                            put("Cookie", cookies)
+                            println("[DaddyLiveExt] 쿠키 주입 완료")
+                        }
+                    }
                 })
-                return // 성공 시 즉시 종료
+                return
             }
         }
     }
@@ -80,10 +86,7 @@ class DaddyLiveExtractor : ExtractorApi() {
 
                     override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                         val reqUrl = request.url.toString()
-                        val lower = reqUrl.lowercase()
-                        
-                        // m3u8 감시 (topembed.pw와 같은 낚시 주소 제외)
-                        if (lower.contains(".m3u8") && !lower.contains("topembed.pw") && !isFinished) {
+                        if (reqUrl.contains(".m3u8") && !reqUrl.contains("topembed.pw") && !isFinished) {
                             isFinished = true
                             println("[DaddyLiveExt] ★네트워크 가로채기 성공")
                             handler.post { webView.destroy() }
@@ -119,14 +122,14 @@ class DaddyLiveExtractor : ExtractorApi() {
                     }
                 }
 
-                val browserHeaders = mapOf("Referer" to "https://dlhd.link/")
                 println("[DaddyLiveExt] 웹뷰 로딩: $targetUrl")
-                webView.loadUrl(targetUrl, browserHeaders)
+                webView.loadUrl(targetUrl, mapOf("Referer" to "https://dlhd.link/"))
 
                 handler.postDelayed({
                     if (!isFinished && cont.isActive) {
                         isFinished = true
                         webView.destroy()
+                        println("[DaddyLiveExt] 분석 타임아웃")
                         cont.resume(null)
                     }
                 }, 20000)
