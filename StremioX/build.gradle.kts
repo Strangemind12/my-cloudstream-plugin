@@ -1,4 +1,4 @@
-// v1.4
+// v1.4.
 import java.util.Properties
 
 // use an integer for version numbers
