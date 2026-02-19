@@ -1,8 +1,8 @@
 /**
- * DaddyLiveScheduleProvider v2.21
- * - [Optimize] 추출 대상을 watch, plus, player 3개 요소로 제한
- * - [Fix] 모든 채널에 대해 해당 3개 요소의 조합을 생성하여 추출기 전달
- * - [Debug] 실행 단계별 상세 println 로그 포함
+ * DaddyLiveScheduleProvider v3.0
+ * - [Reassemble] 원본 코드의 정적 로드 구조 복원
+ * - [Optimize] 모든 플레이어 요소(6종)에 대해 고속 파싱 시도
+ * - [Debug] 실행 단계별 println 로그 포함
  */
 package com.DaddyLive
 
@@ -23,6 +23,7 @@ class DaddyLiveScheduleProvider : MainAPI() {
     @Suppress("ConstPropertyName")
     companion object {
         private const val posterUrl = "https://raw.githubusercontent.com/hsp1020/TestPlugins/refs/heads/master/DaddyLiveProvider/daddylive.jpg"
+
         fun convertGMTToLocalTime(gmtTime: String): String {
             return try {
                 val gmtFormat = SimpleDateFormat("HH:mm", Locale.getDefault()).apply { timeZone = TimeZone.getTimeZone("GMT") }
@@ -34,14 +35,15 @@ class DaddyLiveScheduleProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        println("[DaddyLive] getMainPage 로드 시작")
+        println("[DaddyLive] v3.0 메인 페이지 요청")
         val doc = app.get(mainUrl).document
         val schedule = doc.select(".schedule__category").map {
             val sectionTitle = it.select(".card__meta").text()
             val events = it.select(".schedule__event").map { e ->
                 val dataTitle = e.select(".schedule__eventHeader").attr("data-title")
+                val eventTitle = e.select(".schedule__eventTitle").text()
                 val formattedTime = convertGMTToLocalTime(e.select(".schedule__time").text())
-                newLiveSearchResponse("$formattedTime - ${e.select(".schedule__eventTitle").text()}", dataTitle) {
+                newLiveSearchResponse("$formattedTime - $eventTitle", dataTitle) {
                     this.posterUrl = Companion.posterUrl
                 }
             }
@@ -51,7 +53,7 @@ class DaddyLiveScheduleProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        println("[DaddyLive] 상세 페이지 분석: $url")
+        println("[DaddyLive] 상세 로드: $url")
         val doc = app.get(mainUrl).document
         val dataTitle = url.removePrefix("$mainUrl/")
         val event = doc.select(".schedule__event").first { it.select("div.schedule__eventHeader").attr("data-title") == dataTitle }
@@ -62,18 +64,21 @@ class DaddyLiveScheduleProvider : MainAPI() {
         return newLiveStreamLoadResponse(event.select(".schedule__eventTitle").text(), url, dataUrl = channels.toJson())
     }
 
-    override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
-        println("[DaddyLive] loadLinks v2.21 (watch, plus, player) 모드 시작")
+    override suspend fun loadLinks(
+        data: String,
+        isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        println("[DaddyLive] loadLinks v3.0 시작 (고속 모드)")
         val channels = AppUtils.tryParseJson<List<Channel>>(data) ?: return false
-        
-        // [핵심] 요청하신 3개 요소로 타겟 한정
-        val selectedPlayers = listOf("watch", "plus", "player")
-        
+        val players = listOf("stream", "cast", "watch", "plus", "casting", "player")
+
         val targetLinks = channels.flatMap { ch ->
-            selectedPlayers.map { p -> ch.channelName + " - $p" to ch.channelId.format(p) }
+            players.map { p -> ch.channelName + " - $p" to ch.channelId.format(p) }
         }
 
-        println("[DaddyLive] 총 ${targetLinks.size}개 경로에 대해 정밀 추출 시작")
+        println("[DaddyLive] 총 ${targetLinks.size}개 경로 고속 파싱 시작")
         DaddyLiveExtractor().getUrl(targetLinks.toJson(), null, subtitleCallback, callback)
         return true
     }
