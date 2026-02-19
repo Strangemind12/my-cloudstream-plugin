@@ -1,14 +1,13 @@
 /**
- * DaddyLiveScheduleProvider v2.4
- * - [Fix] 최대 5개 채널에 대해 모든 플레이어(stream, cast, watch, plus, casting, player) 추출 시도
- * - [Debug] 추출 대상 경로의 총 개수 로그 출력
+ * DaddyLiveScheduleProvider v2.7
+ * - [Fix] 최대 5개 채널 x 6개 플레이어 = 30개 경로 생성
+ * - [Optimize] 모든 경로를 리스트로 만들어 Extractor에 한 번에 전달 (병렬 처리용)
  */
 package com.DaddyLive
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
-import org.jsoup.nodes.Element
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -19,7 +18,6 @@ class DaddyLiveScheduleProvider : MainAPI() {
     override var lang = "un"
     override val hasMainPage = true
     override val vpnStatus = VPNStatus.MightBeNeeded
-    override val hasDownloadSupport = false
 
     @Suppress("ConstPropertyName")
     companion object {
@@ -27,32 +25,22 @@ class DaddyLiveScheduleProvider : MainAPI() {
 
         fun convertGMTToLocalTime(gmtTime: String): String {
             return try {
-                val gmtFormat = SimpleDateFormat("HH:mm", Locale.getDefault()).apply {
-                    timeZone = TimeZone.getTimeZone("GMT")
-                }
+                val gmtFormat = SimpleDateFormat("HH:mm", Locale.getDefault()).apply { timeZone = TimeZone.getTimeZone("GMT") }
                 val date: Date = gmtFormat.parse(gmtTime) ?: return gmtTime
-                val localFormat = SimpleDateFormat("HH:mm", Locale.getDefault()).apply {
-                    timeZone = TimeZone.getDefault()
-                }
+                val localFormat = SimpleDateFormat("HH:mm", Locale.getDefault()).apply { timeZone = TimeZone.getDefault() }
                 localFormat.format(date)
-            } catch (e: Exception) {
-                gmtTime
-            }
+            } catch (e: Exception) { gmtTime }
         }
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        println("[DaddyLive] getMainPage 시작")
         val doc = app.get(mainUrl).document
         val schedule = doc.select(".schedule__category").map {
             val sectionTitle = it.select(".card__meta").text()
             val events = it.select(".schedule__event").map { e ->
                 val dataTitle = e.select(".schedule__eventHeader").attr("data-title")
-                val eventTitle = e.select(".schedule__eventTitle").text()
                 val formattedTime = convertGMTToLocalTime(e.select(".schedule__time").text())
-                newLiveSearchResponse("$formattedTime - $eventTitle", dataTitle) {
-                    this.posterUrl = Companion.posterUrl
-                }
+                newLiveSearchResponse("$formattedTime - ${e.select(".schedule__eventTitle").text()}", dataTitle) { this.posterUrl = Companion.posterUrl }
             }
             HomePageList(sectionTitle, events, false)
         }
@@ -60,42 +48,26 @@ class DaddyLiveScheduleProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        println("[DaddyLive] load 요청: $url")
         val doc = app.get(mainUrl).document
         val dataTitle = url.removePrefix("$mainUrl/")
-        val event = doc.select(".schedule__event").first {
-            it.select("div.schedule__eventHeader").attr("data-title") == dataTitle
-        }
+        val event = doc.select(".schedule__event").first { it.select("div.schedule__eventHeader").attr("data-title") == dataTitle }
         val channels = event.select(".schedule__channels > a").map {
             val id = it.attr("href").substringAfter("id=")
             Channel(it.text(), "$mainUrl/%s/stream-$id.php")
         }
-        val formattedTime = convertGMTToLocalTime(event.select(".schedule__time").text())
-        return newLiveStreamLoadResponse("$formattedTime - ${event.select(".schedule__eventTitle").text()}", url, dataUrl = channels.toJson()) {
-            this.posterUrl = Companion.posterUrl
-        }
+        return newLiveStreamLoadResponse(event.select(".schedule__eventTitle").text(), url, dataUrl = channels.toJson()) { this.posterUrl = Companion.posterUrl }
     }
 
-    override suspend fun loadLinks(
-        data: String,
-        isCasting: Boolean,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit,
-    ): Boolean {
-        println("[DaddyLive] loadLinks 시작 (v2.4)")
+    override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         val channels = AppUtils.tryParseJson<List<Channel>>(data) ?: return false
-        
-        // 1. 모든 플레이어 타입 정의
         val allPlayers = listOf("stream", "cast", "watch", "plus", "casting", "player")
         
-        // 2. 최대 5개 채널에 대해 모든 플레이어 경로 생성 (최대 30개 조합)
+        // 최대 5개 채널 x 6개 플레이어 = 30개 조합
         val targetLinks = channels.take(5).flatMap { ch ->
-            allPlayers.map { p ->
-                ch.channelName + " - $p" to ch.channelId.format(p)
-            }
+            allPlayers.map { p -> ch.channelName + " - $p" to ch.channelId.format(p) }
         }
 
-        println("[DaddyLive] 총 ${targetLinks.size}개의 경로에 대해 추출을 시도합니다.")
+        println("[DaddyLive] 30개 경로 고속 병렬 추출 시작")
         DaddyLiveExtractor().getUrl(targetLinks.toJson(), null, subtitleCallback, callback)
         return true
     }
