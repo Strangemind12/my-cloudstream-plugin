@@ -1,8 +1,8 @@
 /**
- * DaddyLiveExtractor v2.3
- * - [Fix] 2004(403) 에러 해결: WebView에서 쿠키(Cookie)를 추출하여 ExoPlayer 헤더에 주입
- * - [Fix] AWS S3 차단 방지: 불필요한 Origin 헤더 제거 및 Referer 최적화
- * - [Debug] DNS 및 403 경고 로그 추가
+ * DaddyLiveExtractor v2.4
+ * - [Fix] 화질 재조립: 1080p 발견 시 720p 링크 추가 생성 (반대의 경우도 포함)
+ * - [Fix] 추출 링크마다 정확한 화질(quality) 정보 및 명칭 부여
+ * - [Optimize] 모든 요청에 대해 순차적 추출을 보장하기 위해 return 제거
  */
 package com.DaddyLive
 
@@ -30,34 +30,61 @@ class DaddyLiveExtractor : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         val links = AppUtils.tryParseJson<List<Pair<String, String>>>(url)
-        println("[DaddyLiveExt] v2.3 추출 시작 (Cookie Injection 모드)")
+        println("[DaddyLiveExt] v2.4 추출 시작 (화질 재조립 모드)")
         
         links?.forEach { (name, link) ->
             val result = runWebViewInterceptor(link)
             if (result != null) {
-                // 웹뷰로부터 해당 URL에 대한 쿠키 획득
-                val cookies = CookieManager.getInstance().getCookie(result)
                 val fixedReferer = "https://dlhd.link/"
+                val cookies = CookieManager.getInstance().getCookie(result)
+                
+                val is1080 = result.contains("/1080p/")
+                val is720 = result.contains("/720p/")
 
-                println("[DaddyLiveExt] ★링크 확보: $result")
-                if (result.contains("amazonaws.com")) {
-                    println("[DaddyLiveExt] AWS S3 감지: 헤더 최소화 적용")
+                // 1. 발견된 원본 링크 추가
+                val originalName = when {
+                    is1080 -> "$name (1080p)"
+                    is720 -> "$name (720p)"
+                    else -> name
+                }
+                val originalQuality = when {
+                    is1080 -> Qualities.P1080.value
+                    is720 -> Qualities.P720.value
+                    else -> Qualities.Unknown.value
                 }
 
-                callback(newExtractorLink(name, name, result, type = ExtractorLinkType.M3U8) {
+                callback(newExtractorLink(originalName, name, result, type = ExtractorLinkType.M3U8) {
+                    this.quality = originalQuality
                     this.referer = fixedReferer
                     this.headers = mutableMapOf(
                         "User-Agent" to userAgent,
                         "Referer" to fixedReferer,
                         "Accept" to "*/*"
                     ).apply {
-                        if (!cookies.isNullOrEmpty()) {
-                            put("Cookie", cookies)
-                            println("[DaddyLiveExt] 쿠키 주입 완료")
-                        }
+                        if (!cookies.isNullOrEmpty()) put("Cookie", cookies)
                     }
                 })
-                return
+
+                // 2. 화질 재조립 링크 추가 (1080p <-> 720p)
+                if (is1080 || is720) {
+                    val altUrl = if (is1080) result.replace("/1080p/", "/720p/") else result.replace("/720p/", "/1080p/")
+                    val altQuality = if (is1080) Qualities.P720.value else Qualities.P1080.value
+                    val altName = if (is1080) "$name (720p)" else "$name (1080p)"
+                    
+                    println("[DaddyLiveExt] 화질 재조립 링크 추가: $altName")
+                    callback(newExtractorLink(altName, name, altUrl, type = ExtractorLinkType.M3U8) {
+                        this.quality = altQuality
+                        this.referer = fixedReferer
+                        this.headers = mutableMapOf(
+                            "User-Agent" to userAgent,
+                            "Referer" to fixedReferer,
+                            "Accept" to "*/*"
+                        ).apply {
+                            if (!cookies.isNullOrEmpty()) put("Cookie", cookies)
+                        }
+                    })
+                }
+                // 모든 채널/플레이어를 확인하기 위해 return을 제거했습니다.
             }
         }
     }
@@ -88,7 +115,7 @@ class DaddyLiveExtractor : ExtractorApi() {
                         val reqUrl = request.url.toString()
                         if (reqUrl.contains(".m3u8") && !reqUrl.contains("topembed.pw") && !isFinished) {
                             isFinished = true
-                            println("[DaddyLiveExt] ★네트워크 가로채기 성공")
+                            println("[DaddyLiveExt] ★인터셉트 성공: $reqUrl")
                             handler.post { webView.destroy() }
                             if (cont.isActive) cont.resume(reqUrl)
                         }
@@ -113,7 +140,7 @@ class DaddyLiveExtractor : ExtractorApi() {
                                 val cleanUrl = jsResult?.trim('"')?.takeIf { it != "null" && it.isNotEmpty() }
                                 if (cleanUrl != null && !isFinished) {
                                     isFinished = true
-                                    println("[DaddyLiveExt] ★JS Injection 성공")
+                                    println("[DaddyLiveExt] ★JS 추출 성공")
                                     handler.post { webView.destroy() }
                                     if (cont.isActive) cont.resume(cleanUrl)
                                 }
@@ -122,14 +149,12 @@ class DaddyLiveExtractor : ExtractorApi() {
                     }
                 }
 
-                println("[DaddyLiveExt] 웹뷰 로딩: $targetUrl")
                 webView.loadUrl(targetUrl, mapOf("Referer" to "https://dlhd.link/"))
 
                 handler.postDelayed({
                     if (!isFinished && cont.isActive) {
                         isFinished = true
                         webView.destroy()
-                        println("[DaddyLiveExt] 분석 타임아웃")
                         cont.resume(null)
                     }
                 }, 20000)
