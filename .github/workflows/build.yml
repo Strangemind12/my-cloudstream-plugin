@@ -46,7 +46,8 @@ jobs:
           # 데몬 없이 실행하여 메모리 부족 및 캔슬 방지
           ./gradlew make makePluginsJson --no-daemon 
           cp **/build/*.cs3 $GITHUB_WORKSPACE/builds/ || true
-          cp build/plugins.json $GITHUB_WORKSPACE/builds/ || true
+          cp **/build/*.jar $GITHUB_WORKSPACE/builds || true
+          cp build/plugins.json $GITHUB_WORKSPACE/builds || true
 
       - name: Push builds
         run: |
