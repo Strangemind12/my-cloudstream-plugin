@@ -1,7 +1,7 @@
 /**
- * DaddyLiveScheduleProvider v2.3
- * - [Fix] 2004 에러 해결을 위한 링크 전달 로직 안정화
- * - [Debug] 상세 실행 로그 포함
+ * DaddyLiveScheduleProvider v2.4
+ * - [Fix] 최대 5개 채널에 대해 모든 플레이어(stream, cast, watch, plus, casting, player) 추출 시도
+ * - [Debug] 추출 대상 경로의 총 개수 로그 출력
  */
 package com.DaddyLive
 
@@ -42,7 +42,7 @@ class DaddyLiveScheduleProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        println("[DaddyLive] getMainPage 요청 시작")
+        println("[DaddyLive] getMainPage 시작")
         val doc = app.get(mainUrl).document
         val schedule = doc.select(".schedule__category").map {
             val sectionTitle = it.select(".card__meta").text()
@@ -60,7 +60,7 @@ class DaddyLiveScheduleProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        println("[DaddyLive] load 정보 로드: $url")
+        println("[DaddyLive] load 요청: $url")
         val doc = app.get(mainUrl).document
         val dataTitle = url.removePrefix("$mainUrl/")
         val event = doc.select(".schedule__event").first {
@@ -70,7 +70,8 @@ class DaddyLiveScheduleProvider : MainAPI() {
             val id = it.attr("href").substringAfter("id=")
             Channel(it.text(), "$mainUrl/%s/stream-$id.php")
         }
-        return newLiveStreamLoadResponse(event.select(".schedule__eventTitle").text(), url, dataUrl = channels.toJson()) {
+        val formattedTime = convertGMTToLocalTime(event.select(".schedule__time").text())
+        return newLiveStreamLoadResponse("$formattedTime - ${event.select(".schedule__eventTitle").text()}", url, dataUrl = channels.toJson()) {
             this.posterUrl = Companion.posterUrl
         }
     }
@@ -81,14 +82,20 @@ class DaddyLiveScheduleProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        println("[DaddyLive] loadLinks 시작 (v2.3)")
+        println("[DaddyLive] loadLinks 시작 (v2.4)")
         val channels = AppUtils.tryParseJson<List<Channel>>(data) ?: return false
-        val firstChannel = channels.firstOrNull() ?: return false
         
-        val targetLinks = listOf("stream", "player").map { p ->
-            firstChannel.channelName + " - $p" to firstChannel.channelId.format(p)
+        // 1. 모든 플레이어 타입 정의
+        val allPlayers = listOf("stream", "cast", "watch", "plus", "casting", "player")
+        
+        // 2. 최대 5개 채널에 대해 모든 플레이어 경로 생성 (최대 30개 조합)
+        val targetLinks = channels.take(5).flatMap { ch ->
+            allPlayers.map { p ->
+                ch.channelName + " - $p" to ch.channelId.format(p)
+            }
         }
 
+        println("[DaddyLive] 총 ${targetLinks.size}개의 경로에 대해 추출을 시도합니다.")
         DaddyLiveExtractor().getUrl(targetLinks.toJson(), null, subtitleCallback, callback)
         return true
     }
