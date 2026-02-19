@@ -1,8 +1,8 @@
 /**
- * DaddyLiveExtractor v2.7
- * - [Reassemble] 원본 코드의 고속 구조 + 현재 발견된 S3 추출 로직 결합
- * - [Optimize] pmap(병렬 맵)을 사용하여 30개 링크를 수 초 내에 추출 (웹뷰 최소화)
- * - [Fix] 1080p <-> 720p 화질 상호 재조립 및 추가
+ * DaddyLiveExtractor v2.8
+ * - [Fix] 'pmap'을 표준 'amap'으로 교체하여 빌드 에러 해결
+ * - [Fix] 'view' 참조 에러 수정 및 코루틴 호출 구조 정상화
+ * - [Fix] 화질 재조립(1080p/720p) 로직 포함
  */
 package com.DaddyLive
 
@@ -24,28 +24,34 @@ class DaddyLiveExtractor : ExtractorApi() {
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val links = AppUtils.tryParseJson<List<Pair<String, String>>>(url) ?: return
         
-        // [핵심] pmap을 사용하여 30개의 HTTP 요청을 동시에 날림 (압도적 속도)
-        links.pmap { (name, link) ->
+        println("[DaddyLiveExt] v2.8 고속 병렬 추출 시작")
+        
+        // [Fix] pmap 대신 amap 사용 (Cloudstream 표준 병렬 처리)
+        links.amap { (name, link) ->
             try {
-                val result = extractDirectly(link) ?: runWebViewInterceptor(link)
+                // 1. HTTP 직접 추출 시도
+                var result = extractDirectly(link)
+                
+                // 2. 실패 시 웹뷰 인터셉터 가동
+                if (result == null) {
+                    result = runWebViewInterceptor(link)
+                }
+
                 if (result != null) {
                     processAndAddLink(name, result, callback)
                 }
             } catch (e: Exception) {
-                println("[DaddyLiveExt] $name 추출 실패: ${e.message}")
+                println("[DaddyLiveExt] $name 추출 오류: ${e.message}")
             }
         }
     }
 
-    // [v2.7 추가] 웹뷰 없이 소스 코드에서 주소를 바로 뽑아내는 고속 함수
     private suspend fun extractDirectly(targetUrl: String): String? {
         return try {
             val response = app.get(targetUrl, headers = mapOf("Referer" to "$mainUrl/")).text
             val iframeSrc = Regex("""<iframe[^>]+src=["']([^"']+)["']""").find(response)?.groupValues?.get(1) ?: return null
             
-            // iframe 페이지 소스 가져오기
             val iframeContent = app.get(iframeSrc, headers = mapOf("Referer" to targetUrl)).text
-            // 소스 내 m3u8 주소 정규식 추출
             val m3u8Match = Regex("""file\s*:\s*["']([^"']+\.m3u8[^"']*)["']""").find(iframeContent)
             m3u8Match?.groupValues?.get(1)
         } catch (e: Exception) { null }
@@ -58,7 +64,7 @@ class DaddyLiveExtractor : ExtractorApi() {
         val is1080 = result.contains("/1080p/")
         val is720 = result.contains("/720p/")
 
-        fun add(n: String, u: String, q: Int) {
+        fun addSource(n: String, u: String, q: Int) {
             callback(newExtractorLink(n, name, u, type = ExtractorLinkType.M3U8) {
                 this.quality = q
                 this.referer = fixedReferer
@@ -68,15 +74,13 @@ class DaddyLiveExtractor : ExtractorApi() {
             })
         }
 
-        // 원본 및 재조립 링크 추가
         val baseQual = if(is1080) Qualities.P1080.value else if(is720) Qualities.P720.value else Qualities.Unknown.value
-        add("$name ${if(is1080) "(1080p)" else if(is720) "(720p)" else ""}", result, baseQual)
+        addSource("$name ${if(is1080) "(1080p)" else if(is720) "(720p)" else ""}", result, baseQual)
 
-        if (is1080) add("$name (720p - 재조립)", result.replace("/1080p/", "/720p/"), Qualities.P720.value)
-        else if (is720) add("$name (1080p - 재조립)", result.replace("/720p/", "/1080p/"), Qualities.P1080.value)
+        if (is1080) addSource("$name (720p - 재조립)", result.replace("/1080p/", "/720p/"), Qualities.P720.value)
+        else if (is720) addSource("$name (1080p - 재조립)", result.replace("/720p/", "/1080p/"), Qualities.P1080.value)
     }
 
-    // 최후의 수단: 직접 추출 실패 시에만 실행 (기존 v2.6 로직 유지)
     private suspend fun runWebViewInterceptor(targetUrl: String): String? = suspendCancellableCoroutine { cont ->
         val handler = Handler(Looper.getMainLooper())
         handler.post {
@@ -85,6 +89,7 @@ class DaddyLiveExtractor : ExtractorApi() {
                 val webView = WebView(context)
                 var isFinished = false
                 webView.settings.apply { javaScriptEnabled = true; userAgentString = userAgent; blockNetworkImage = true }
+                
                 webView.webViewClient = object : WebViewClient() {
                     override fun onReceivedSslError(v: WebView?, h: SslErrorHandler?, e: android.net.http.SslError?) { h?.proceed() }
                     override fun shouldInterceptRequest(v: WebView, request: WebResourceRequest): WebResourceResponse? {
@@ -94,7 +99,21 @@ class DaddyLiveExtractor : ExtractorApi() {
                             handler.post { webView.destroy() }
                             if (cont.isActive) cont.resume(reqUrl)
                         }
-                        return super.shouldInterceptRequest(view, request)
+                        return super.shouldInterceptRequest(v, request)
+                    }
+
+                    // [Fix] view 참조 오류 해결 (매개변수 이름 일치)
+                    override fun onPageFinished(webViewInstance: WebView?, url: String?) {
+                        if (!isFinished) {
+                            webViewInstance?.evaluateJavascript("(function(){var s=document.getElementsByTagName('script');for(var i=0;i<s.length;i++){var m=s[i].innerHTML.match(/file\\s*:\\s*[\"']([^\"']+\\.m3u8[^\"']*)[\"']/);if(m)return m[1];}return null;})();") { r ->
+                                val clean = r?.trim('"')?.takeIf { it != "null" && it.isNotEmpty() }
+                                if (clean != null && !isFinished) {
+                                    isFinished = true
+                                    handler.post { webView.destroy() }
+                                    if (cont.isActive) cont.resume(clean)
+                                }
+                            }
+                        }
                     }
                 }
                 webView.loadUrl(targetUrl, mapOf("Referer" to "https://dlhd.link/"))
