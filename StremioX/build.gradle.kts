@@ -1,5 +1,5 @@
-// v1.10
-import java.util.Properties // org.jetbrains.kotlin... 대신 표준 java.util 사용
+// v1.11
+import java.util.Properties
 
 // use an integer for version numbers
 version = 13
@@ -10,12 +10,14 @@ android {
         viewBinding = true
     }
     defaultConfig {
+        // v1.11: local.properties 파일 읽기 로직 안전하게 수정
         val propFile = project.rootProject.file("local.properties")
         val tmdbApiKey = if (propFile.exists()) {
             val properties = Properties()
             propFile.inputStream().use { properties.load(it) }
             properties.getProperty("TMDB_API") ?: ""
         } else {
+            // CI 환경(GitHub Actions)에서는 환경 변수에서 읽어옴
             System.getenv("TMDB_API") ?: ""
         }
         
