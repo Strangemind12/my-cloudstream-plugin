@@ -1,12 +1,14 @@
 /**
- * DaddyLiveExtractor v2.10
- * - [Fix] 병렬 웹뷰 실행으로 9개 경로 고속 스캔
- * - [Fix] 1080p/720p 화질 자동 교차 생성 로직 적용
- * - [Optimize] 403 에러 방지를 위해 Referer 고정 및 쿠키 주입
+ * DaddyLiveExtractor v2.11
+ * - [Version] v2.11
+ * - [Fix] 'processLink' 및 내부 함수에 'suspend' 추가하여 빌드 에러(Suspend function call) 해결
+ * - [Fix] 1080p/720p 화질 자동 재조립 및 쿠키 주입 로직 유지
+ * - [Optimize] 병렬 웹뷰 실행(chunked) 및 디버깅 로그 강화
  */
 package com.DaddyLive
 
 import android.content.Context
+import android.net.http.SslError
 import android.os.*
 import android.webkit.*
 import com.lagradost.cloudstream3.*
@@ -14,7 +16,6 @@ import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.*
 import java.net.URL
 import kotlin.coroutines.resume
-import kotlinx.coroutines.suspendCancellableCoroutine
 
 class DaddyLiveExtractor : ExtractorApi() {
     override val mainUrl = "https://dlhd.link"
@@ -24,16 +25,16 @@ class DaddyLiveExtractor : ExtractorApi() {
 
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val links = AppUtils.tryParseJson<List<Pair<String, String>>>(url) ?: return
-        
-        println("[DaddyLiveExt] v2.10 병렬 추출 모드 가동")
+        println("[DaddyLiveExt] v2.11 추출 프로세스 가동 (병렬 3개씩)")
         
         coroutineScope {
-            // 한 번에 3개씩 병렬 실행하여 시스템 부하 조절
             links.chunked(3).forEach { chunk ->
                 chunk.map { (name, link) ->
                     async {
+                        println("[DaddyLiveExt] 분석 대기 중: $link")
                         val result = runWebViewInterceptor(link)
                         if (result != null) {
+                            println("[DaddyLiveExt] ★데이터 확보: $link -> $result")
                             processLink(name, result, callback)
                         }
                     }
@@ -42,32 +43,38 @@ class DaddyLiveExtractor : ExtractorApi() {
         }
     }
 
-    private fun processLink(name: String, result: String, callback: (ExtractorLink) -> Unit) {
+    // [Fix] newExtractorLink 호출을 위해 suspend 키워드 추가
+    private suspend fun processLink(name: String, result: String, callback: (ExtractorLink) -> Unit) {
         val fixedReferer = "https://dlhd.link/"
         val cookies = CookieManager.getInstance().getCookie(result)
         
         val is1080 = result.contains("/1080p/")
         val is720 = result.contains("/720p/")
 
-        fun push(n: String, u: String, q: Int) {
+        // [Fix] 내부 함수도 suspend로 선언하여 문법 오류 해결
+        suspend fun pushLink(n: String, u: String, q: Int) {
+            println("[DaddyLiveExt] 소스 추가 시도: $n")
             callback(newExtractorLink(n, name, u, type = ExtractorLinkType.M3U8) {
                 this.quality = q
                 this.referer = fixedReferer
                 this.headers = mutableMapOf("User-Agent" to userAgent, "Referer" to fixedReferer).apply {
-                    if (!cookies.isNullOrEmpty()) put("Cookie", cookies)
+                    if (!cookies.isNullOrEmpty()) {
+                        put("Cookie", cookies)
+                    }
                 }
             })
         }
 
-        // 원본 추가
-        val baseQual = if(is1080) Qualities.P1080.value else if(is720) Qualities.P720.value else Qualities.Unknown.value
-        push("$name ${if(is1080) "(1080p)" else if(is720) "(720p)" else ""}", result, baseQual)
+        // 1. 발견된 원본 추가
+        val originalQual = if (is1080) Qualities.P1080.value else if (is720) Qualities.P720.value else Qualities.Unknown.value
+        val originalName = "$name ${if(is1080) "(1080p)" else if(is720) "(720p)" else ""}"
+        pushLink(originalName, result, originalQual)
 
-        // 화질 재조립 (교차 추가)
+        // 2. 화질 재조립 추가 (1080p <-> 720p)
         if (is1080) {
-            push("$name (720p - 재조립)", result.replace("/1080p/", "/720p/"), Qualities.P720.value)
+            pushLink("$name (720p - 재조립)", result.replace("/1080p/", "/720p/"), Qualities.P720.value)
         } else if (is720) {
-            push("$name (1080p - 재조립)", result.replace("/720p/", "/1080p/"), Qualities.P1080.value)
+            pushLink("$name (1080p - 재조립)", result.replace("/720p/", "/1080p/"), Qualities.P1080.value)
         }
     }
 
@@ -87,13 +94,15 @@ class DaddyLiveExtractor : ExtractorApi() {
                 }
 
                 webView.webViewClient = object : WebViewClient() {
-                    override fun onReceivedSslError(v: WebView?, h: SslErrorHandler?, e: android.net.http.SslError?) { h?.proceed() }
+                    override fun onReceivedSslError(v: WebView?, h: SslErrorHandler?, e: android.net.http.SslError?) { 
+                        h?.proceed() 
+                    }
                     
                     override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                         val reqUrl = request.url.toString()
                         if (reqUrl.contains(".m3u8") && !reqUrl.contains("topembed.pw") && !isFinished) {
                             isFinished = true
-                            println("[DaddyLiveExt] ★인터셉트 성공")
+                            println("[DaddyLiveExt] ★인터셉트 성공!")
                             handler.post { webView.destroy() }
                             if (cont.isActive) cont.resume(reqUrl)
                         }
@@ -101,8 +110,18 @@ class DaddyLiveExtractor : ExtractorApi() {
                     }
                 }
                 webView.loadUrl(targetUrl, mapOf("Referer" to "https://dlhd.link/"))
-                handler.postDelayed({ if (!isFinished && cont.isActive) { isFinished = true; webView.destroy(); cont.resume(null) } }, 20000)
-            } catch (e: Exception) { if (cont.isActive) cont.resume(null) }
+                handler.postDelayed({ 
+                    if (!isFinished && cont.isActive) { 
+                        isFinished = true
+                        webView.destroy()
+                        println("[DaddyLiveExt] 분석 타임아웃: $targetUrl")
+                        cont.resume(null) 
+                    } 
+                }, 20000)
+            } catch (e: Exception) { 
+                println("[DaddyLiveExt] 웹뷰 생성 오류: ${e.message}")
+                if (cont.isActive) cont.resume(null) 
+            }
         }
     }
 }
