@@ -1,3 +1,8 @@
+/**
+ * DaddyLiveScheduleProvider v1.1
+ * - [Fix] 패키지명을 com.DaddyLive로 수정하여 DaddyLivePlugin에서의 참조 에러 해결
+ * - [Debug] 주요 메서드(getMainPage, search, load, loadLinks) 실행 로그 추가
+ */
 package com.DaddyLive
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -34,7 +39,7 @@ import java.util.TimeZone
 
 class DaddyLiveScheduleProvider : MainAPI() {
     override var mainUrl = "https://dlhd.link"
-    override var name = "DaddyLive Schedule"
+    override var name = "DaddyLive"
     override val supportedTypes = setOf(TvType.Live)
     override var lang = "un"
     override val hasMainPage = true
@@ -49,41 +54,12 @@ class DaddyLiveScheduleProvider : MainAPI() {
             "https://raw.githubusercontent.com/doGior/doGiorsHadEnough/refs/heads/master/DaddyLive/daddylive.jpg"
 
         fun convertGMTToLocalTime(gmtTime: String): String {
-            // Define the input format (GMT time)
             val gmtFormat = SimpleDateFormat("HH:mm", Locale.getDefault())
-            gmtFormat.timeZone = TimeZone.getTimeZone("GMT") // Set the timezone to GMT
-
-            // Parse the input time string
-            val date: Date =
-                gmtFormat.parse(gmtTime) ?: throw IllegalArgumentException("Invalid time format")
-
-            // Define the output format (local time)
+            gmtFormat.timeZone = TimeZone.getTimeZone("GMT")
+            val date: Date = gmtFormat.parse(gmtTime) ?: throw IllegalArgumentException("Invalid time format")
             val localFormat = SimpleDateFormat("HH:mm", Locale.getDefault())
-            localFormat.timeZone =
-                TimeZone.getDefault() // Set the timezone to the device's local timezone
-
-            // Format the date to local time
+            localFormat.timeZone = TimeZone.getDefault()
             return localFormat.format(date)
-        }
-
-        fun convertStringToLocalDate(objectKey: String): String {
-            val dateString = objectKey.substringBeforeLast(" -")
-
-            // Remove the ordinal suffix (e.g., "nd" in "02nd")
-            val cleanedDateString = dateString.replace(Regex("(?<=\\d)(st|nd|rd|th)"), "")
-
-            // Define the date format
-            val dateFormat = SimpleDateFormat("EEEE dd MMMM yyyy", Locale.ENGLISH)
-
-            // Parse the date string into a Date object
-            val date = dateFormat.parse(cleanedDateString)
-
-            // Convert the Date to a Calendar object in the system's default time zone
-            val calendar = Calendar.getInstance()
-            calendar.time = date!!
-
-            val outputFormat = SimpleDateFormat("dd MMMM yyyy", Locale.getDefault())
-            return outputFormat.format(calendar.time)
         }
     }
 
@@ -91,7 +67,6 @@ class DaddyLiveScheduleProvider : MainAPI() {
         return doc.select(".schedule__event").map { e ->
             val dataTitle = e.select(".schedule__eventHeader").attr("data-title")
             val eventTitle = e.select(".schedule__eventTitle").text()
-            val channels = e.select(".schedule__channels > a").map { fixUrl(it.attr("href")) }
             val time = e.select(".schedule__time").text()
             val formattedTime = convertGMTToLocalTime(time)
             newLiveSearchResponse("$formattedTime - $eventTitle", dataTitle){
@@ -101,54 +76,43 @@ class DaddyLiveScheduleProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        println("[DaddyLive] getMainPage 시작: $mainUrl")
         val doc = app.get(mainUrl).document
         val schedule = doc.select(".schedule__category").map {
             val sectionTitle = it.select(".card__meta").text()
             val events = searchResponseBuilder(it)
-            HomePageList(
-                sectionTitle,
-                events,
-                false
-            )
+            HomePageList(sectionTitle, events, false)
         }
-        return newHomePageResponse(
-            schedule,
-            false
-        )
+        println("[DaddyLive] getMainPage 완료: ${schedule.size}개 섹션 발견")
+        return newHomePageResponse(schedule, false)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
+        println("[DaddyLive] search 시작: $query")
         val doc = app.get(mainUrl).document
-        val schedule = doc.select(".schedule__category").map {
-            searchResponseBuilder(it)
-        }.flatten()
-        val matches = schedule.filter {
-            query.lowercase().replace(" ", "") in
-                    it.name.lowercase().replace(" ", "")
-        }
+        val schedule = doc.select(".schedule__category").map { searchResponseBuilder(it) }.flatten()
+        val matches = schedule.filter { query.lowercase().replace(" ", "") in it.name.lowercase().replace(" ", "") }
+        println("[DaddyLive] search 결과: ${matches.size}건")
         return matches
     }
 
     override suspend fun load(url: String): LoadResponse {
+        println("[DaddyLive] load 시작: $url")
         val doc = app.get(mainUrl).document
         val dataTitle = url.removePrefix("$mainUrl/")
-        val event = doc.select(".schedule__event").first{
-            val header = it.select("div.schedule__eventHeader")
-            header.attr("data-title") == dataTitle
-        }
+        val event = doc.select(".schedule__event").first { it.select("div.schedule__eventHeader").attr("data-title") == dataTitle }
         val eventTitle = event.select(".schedule__eventTitle").text()
         val channels = event.select(".schedule__channels > a").map {
             val id = it.attr("href").substringAfter("id=")
             Channel(it.text(), "$mainUrl/%s/stream-$id.php")
         }
-        Log.d("DDL Schedule - Channels", channels.toJson())
         val time = event.select(".schedule__time").text()
         val formattedTime = convertGMTToLocalTime(time)
+        println("[DaddyLive] load 완료: $eventTitle (${channels.size}개 채널)")
         return newLiveStreamLoadResponse("$formattedTime - $eventTitle", url, dataUrl = channels.toJson()){
             this.posterUrl = Companion.posterUrl
         }
     }
-
 
     override suspend fun loadLinks(
         data: String,
@@ -156,23 +120,21 @@ class DaddyLiveScheduleProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
+        println("[DaddyLive] loadLinks 시작: $data")
         val players = listOf("stream", "cast", "watch", "plus", "casting", "player")
-        val channels = parseJson<List<Channel>>(data)
+        val channels = tryParseJson<List<Channel>>(data) ?: return false
 
-        val links = channels.map {
+        val links = channels.map { ch ->
             players.map { l ->
-                val url = it.channelId.format(l)
-                Log.d("DDL - Servers", url)
-                it.channelName + " - $l" to url
+                val url = ch.channelId.format(l)
+                ch.channelName + " - $l" to url
             }
         }.flatten()
 
+        println("[DaddyLive] Extractor 호출 시도 (${links.size}개 후보)")
         DaddyLiveExtractor().getUrl(links.toJson(), null, subtitleCallback, callback)
         return true
     }
 
-    data class Channel(
-        val channelName: String,
-        val channelId: String
-    )
+    data class Channel(val channelName: String, val channelId: String)
 }
