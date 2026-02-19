@@ -1,14 +1,16 @@
 /**
- * DaddyLiveExtractor v1.7
- * - [Fix] 'newExtractorLink' 호출 위치를 WebView 콜백 밖으로 이동하여 빌드 에러 해결
- * - [Fix] 패키지명을 폴더 구조에 맞게 com.DaddyLive로 확정
- * - [Refactor] WebViewInterceptor는 URL 문자열만 추출하도록 경량화
+ * DaddyLiveExtractor v1.8
+ * - [Fix] SSL 인증서 에러 무시 로직(onReceivedSslError) 추가하여 페이지 로딩 중단 방지
+ * - [Fix] 패키지명 com.DaddyLive 유지
+ * - [Debug] SSL 에러 발생 시 로그 출력 및 강제 진행 상태 기록
  */
 package com.DaddyLive
 
 import android.content.Context
+import android.net.http.SslError
 import android.os.Handler
 import android.os.Looper
+import android.webkit.SslErrorHandler
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
@@ -32,7 +34,7 @@ class DaddyLiveExtractor : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         val links = AppUtils.tryParseJson<List<Pair<String, String>>>(url)
-        println("[DaddyLiveExt] 분석 시작 (v1.7)")
+        println("[DaddyLiveExt] v1.8 분석 시작 (SSL Bypass 적용)")
         
         links?.forEach { (name, link) ->
             extractAndCallback(link, name, callback)
@@ -44,13 +46,11 @@ class DaddyLiveExtractor : ExtractorApi() {
         sourceName: String, 
         callback: (ExtractorLink) -> Unit
     ) {
-        // 1. 웹뷰를 통해 주소만 가로챔 (일반 문자열 반환)
         val interceptedUrl = runWebViewInterceptor(url)
         
         if (interceptedUrl != null) {
-            println("[DaddyLiveExt] ★실제 주소 발견: $interceptedUrl")
+            println("[DaddyLiveExt] ★최종 주소 확보: $interceptedUrl")
             
-            // 2. 코루틴 안전 구역(suspend 함수 내부)에서 ExtractorLink 생성
             val extractorLink = newExtractorLink(
                 sourceName,
                 sourceName,
@@ -76,11 +76,25 @@ class DaddyLiveExtractor : ExtractorApi() {
                 val webView = WebView(context)
                 var isFinished = false
 
-                webView.settings.javaScriptEnabled = true
-                webView.settings.domStorageEnabled = true
-                webView.settings.userAgentString = userAgent
+                webView.settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    userAgentString = userAgent
+                    // 혼합 콘텐츠 허용
+                    mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                }
 
                 webView.webViewClient = object : WebViewClient() {
+                    // [핵심] SSL 인증서 에러 발생 시 강제로 진행
+                    override fun onReceivedSslError(
+                        view: WebView?,
+                        handler: SslErrorHandler?,
+                        error: SslError?
+                    ) {
+                        println("[DaddyLiveExt] SSL 에러 무시 및 진행: ${error?.url}")
+                        handler?.proceed() 
+                    }
+
                     override fun shouldInterceptRequest(
                         view: WebView,
                         request: WebResourceRequest
@@ -88,36 +102,45 @@ class DaddyLiveExtractor : ExtractorApi() {
                         val requestUrl = request.url.toString()
                         val lowerUrl = requestUrl.lowercase()
                         
-                        // 감시 패턴 유지
+                        // 감시 패턴
                         val isMedia = lowerUrl.contains(".m3u8") || lowerUrl.contains(".mpd") || lowerUrl.contains("playlist")
                         val isStreamServer = lowerUrl.contains("mizhls") || lowerUrl.contains("newkso")
                         val isFake = lowerUrl.contains("topembed.pw")
 
                         if ((isMedia || isStreamServer) && !isFake && !isFinished) {
                             isFinished = true
+                            println("[DaddyLiveExt] ★인터셉트 성공: $requestUrl")
+                            
                             handler.post { 
                                 webView.stopLoading()
                                 webView.destroy() 
                             }
-                            if (cont.isActive) cont.resume(requestUrl) // URL 문자열만 전달하고 코루틴 재개
+                            if (cont.isActive) cont.resume(requestUrl)
                         }
                         return super.shouldInterceptRequest(view, request)
                     }
+
+                    override fun onPageFinished(view: WebView?, url: String?) {
+                        println("[DaddyLiveExt] 페이지 로딩 완료: $url")
+                        super.onPageFinished(view, url)
+                    }
                 }
 
-                println("[DaddyLiveExt] 웹뷰 로딩 시작: $targetUrl")
+                println("[DaddyLiveExt] 웹뷰 로딩 시도 (SSL Bypass): $targetUrl")
                 webView.loadUrl(targetUrl)
 
-                // 20초 타임아웃
+                // 타임아웃 30초로 연장 (SSL 핸드셰이크 지연 고려)
                 handler.postDelayed({
                     if (!isFinished && cont.isActive) {
                         isFinished = true
                         webView.destroy()
+                        println("[DaddyLiveExt] 웹뷰 분석 타임아웃 (30s)")
                         cont.resume(null)
                     }
-                }, 20000)
+                }, 30000)
 
             } catch (e: Exception) {
+                println("[DaddyLiveExt] 오류 발생: ${e.message}")
                 if (cont.isActive) cont.resume(null)
             }
         }
