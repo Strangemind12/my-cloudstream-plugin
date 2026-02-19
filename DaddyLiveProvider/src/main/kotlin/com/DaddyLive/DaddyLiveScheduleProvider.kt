@@ -1,7 +1,7 @@
 /**
- * DaddyLiveScheduleProvider v2.13
- * - [Fix] 상위 3개 채널 x 3개 플레이어(stream, cast, player) 조합 생성
- * - [Debug] 버전 정보 v2.13 명시
+ * DaddyLiveScheduleProvider v2.14
+ * - [Optimize] 상위 3개 채널 x "player" 소스만 집중 추출 (성공률 최우선)
+ * - [Debug] 추출 경로 요약 정보 로그 출력
  */
 package com.DaddyLive
 
@@ -61,12 +61,12 @@ class DaddyLiveScheduleProvider : MainAPI() {
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         val channels = AppUtils.tryParseJson<List<Channel>>(data) ?: return false
         
-        // 상위 3개 채널 x 3개 플레이어 = 9개 경로
-        val targetLinks = channels.take(3).flatMap { ch ->
-            listOf("stream", "cast", "player").map { p -> ch.channelName + " - $p" to ch.channelId.format(p) }
+        // [Fix] 상위 3개 채널의 "player" 소스만 타겟팅
+        val targetLinks = channels.take(3).map { ch ->
+            ch.channelName + " - player" to ch.channelId.format("player")
         }
 
-        println("[DaddyLive] v2.13 추출 시작: ${targetLinks.size}개 경로 분석")
+        println("[DaddyLive] v2.14 추출 시작: ${targetLinks.size}개 'player' 소스 분석 중")
         DaddyLiveExtractor().getUrl(targetLinks.toJson(), null, subtitleCallback, callback)
         return true
     }
