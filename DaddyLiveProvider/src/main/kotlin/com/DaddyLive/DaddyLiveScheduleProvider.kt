@@ -1,8 +1,7 @@
 /**
- * DaddyLiveScheduleProvider v3.2
- * - [Optimize] 상위 1개 채널만 집중 타겟팅
- * - [Fix] 해당 채널의 모든 플레이어 요소(6종) 전수 조사
- * - [Debug] v3.2 버전 정보 및 상세 실행 로그 포함
+ * DaddyLiveScheduleProvider v2.22
+ * - [Optimize] 상위 1개 채널의 모든 플레이어 요소(6종) 전수 조사
+ * - [Debug] 실행 단계별 상세 println 로그 포함
  */
 package com.DaddyLive
 
@@ -34,7 +33,7 @@ class DaddyLiveScheduleProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        println("[DaddyLive] 메인 페이지 로드 시작 (v3.2)")
+        println("[DaddyLive] 메인 페이지 로드 시도")
         val doc = app.get(mainUrl).document
         val schedule = doc.select(".schedule__category").map {
             val sectionTitle = it.select(".card__meta").text()
@@ -51,7 +50,6 @@ class DaddyLiveScheduleProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        println("[DaddyLive] 상세 페이지 로드: $url")
         val doc = app.get(mainUrl).document
         val dataTitle = url.removePrefix("$mainUrl/")
         val event = doc.select(".schedule__event").first { it.select("div.schedule__eventHeader").attr("data-title") == dataTitle }
@@ -63,21 +61,17 @@ class DaddyLiveScheduleProvider : MainAPI() {
     }
 
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
-        println("[DaddyLive] loadLinks v3.2 상위 1개 채널 전수 조사 모드 가동")
+        println("[DaddyLive] v2.22 상위 1개 채널 정밀 추출 시작")
         val channels = AppUtils.tryParseJson<List<Channel>>(data) ?: return false
-        
-        // 6가지 모든 플레이어 요소 정의
         val allPlayers = listOf("stream", "cast", "watch", "plus", "casting", "player")
         
-        // [핵심] 상위 1개 채널만 선택하여 모든 요소(6종) 조합 생성
+        // 1개 채널의 6개 모든 요소를 병렬 분석 대상으로 설정
         val targetLinks = channels.take(1).flatMap { ch ->
             allPlayers.map { p -> ch.channelName + " - $p" to ch.channelId.format(p) }
         }
 
-        println("[DaddyLive] 상위 1개 채널의 총 ${targetLinks.size}개 경로를 분석합니다.")
         DaddyLiveExtractor().getUrl(targetLinks.toJson(), null, subtitleCallback, callback)
         return true
     }
-
     data class Channel(val channelName: String, val channelId: String)
 }
