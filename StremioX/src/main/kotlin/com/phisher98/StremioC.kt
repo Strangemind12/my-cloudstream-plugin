@@ -37,6 +37,7 @@ import com.lagradost.cloudstream3.utils.USER_PROVIDER_API
 import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.*
+import com.phisher98.BuildConfig
 import com.phisher98.StremioC.Companion.TRACKER_LIST_URLS
 import com.phisher98.SubsExtractors.invokeOpenSubs
 import com.phisher98.SubsExtractors.invokeWatchsomuch
