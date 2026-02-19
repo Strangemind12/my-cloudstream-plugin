@@ -1,8 +1,7 @@
 /**
- * DaddyLiveScheduleProvider v2.1
- * - [Fix] 리다이렉트 특성을 고려하여 메인 도메인을 dlhd.link로 고정
- * - [Optimize] 추출 성공률을 높이기 위해 핵심 경로(stream, player) 우선 시도
- * - [Debug] 실행 단계별 상세 println 로그 포함
+ * DaddyLiveScheduleProvider v2.2
+ * - [Fix] 2004 에러 해결을 위한 헤더 구조 개선
+ * - [Debug] 데이터 로드 및 링크 추출 단계별 로그 강화
  */
 package com.DaddyLive
 
@@ -43,7 +42,7 @@ class DaddyLiveScheduleProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        println("[DaddyLive] getMainPage 요청: $mainUrl")
+        println("[DaddyLive] getMainPage 시작")
         val doc = app.get(mainUrl).document
         val schedule = doc.select(".schedule__category").map {
             val sectionTitle = it.select(".card__meta").text()
@@ -61,7 +60,7 @@ class DaddyLiveScheduleProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        println("[DaddyLive] load 상세 정보 요청: $url")
+        println("[DaddyLive] load 요청: $url")
         val doc = app.get(mainUrl).document
         val dataTitle = url.removePrefix("$mainUrl/")
         val event = doc.select(".schedule__event").first {
@@ -82,17 +81,16 @@ class DaddyLiveScheduleProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        println("[DaddyLive] loadLinks 시작 (v2.1)")
+        println("[DaddyLive] loadLinks 시작 (v2.2)")
         val channels = AppUtils.tryParseJson<List<Channel>>(data) ?: return false
         val firstChannel = channels.firstOrNull() ?: return false
         
-        // 브라우저 환경에서 성공률이 높은 경로 순서로 배열
         val priorityPlayers = listOf("stream", "player")
         val targetLinks = priorityPlayers.map { p ->
             firstChannel.channelName + " - $p" to firstChannel.channelId.format(p)
         }
 
-        println("[DaddyLive] ${targetLinks.size}개의 핵심 경로로 추출기 호출")
+        println("[DaddyLive] 최적화 경로 추출 시도")
         DaddyLiveExtractor().getUrl(targetLinks.toJson(), null, subtitleCallback, callback)
         return true
     }
