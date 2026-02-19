@@ -8,7 +8,6 @@ import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.plugins.PluginData
 import com.lagradost.cloudstream3.plugins.PluginManager
-import com.phisher98.settings.SettingsBottomFragment
 import org.json.JSONArray
 
 @CloudstreamPlugin
