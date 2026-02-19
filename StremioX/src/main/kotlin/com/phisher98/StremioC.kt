@@ -1,3 +1,4 @@
+// v1.5
 package com.phisher98
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -76,6 +77,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
+        println("[v1.5 Debug] getMainPage 실행 (홈 화면 로드) - page: $page")
         if (mainUrl.isEmpty()) {
             throw IllegalArgumentException("Configure in Extension Settings\n")
         }
@@ -90,7 +92,9 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
         val lists = mutableListOf<HomePageList>()
 
-        manifest?.catalogs?.amap { catalog ->
+        // v1.5: 검색이 "필수(isRequired)"인 전용 카탈로그는 홈 화면 일반 목록에서 제외하여 오류 방지
+        manifest?.catalogs?.filter { !it.isSearchRequired() }?.amap { catalog ->
+            println("[v1.5 Debug] 일반 카탈로그 로드 허용됨: ${catalog.name ?: catalog.id}")
             catalog.toHomePageList(
                 provider = this,
                 skip = skip
@@ -109,16 +113,25 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
 
     override suspend fun search(query: String): List<SearchResponse> {
+        println("[v1.5 Debug] search 실행 (검색창) - query: $query")
         mainUrl = mainUrl.fixSourceUrl()
         val res = app.get(buildUrl("/manifest.json")).parsedSafe<Manifest>()
         val list = mutableListOf<SearchResponse>()
-        res?.catalogs?.amap { catalog ->
+        
+        // v1.5: extra 속성을 통해 명시적으로 'search' 기능을 지원하는 카탈로그만 필터링 (쓰레기 데이터 유입 차단)
+        val targetCatalogs = res?.catalogs?.filter { it.supportsSearch() } ?: emptyList()
+        println("[v1.5 Debug] 검색을 지원하는 카탈로그 개수: ${targetCatalogs.size}")
+
+        targetCatalogs.amap { catalog ->
             list.addAll(catalog.search(query, this))
         }
+        
+        println("[v1.5 Debug] 검색 완료 - 총 반환 아이템 수: ${list.distinct().size}")
         return list.distinct()
     }
 
     override suspend fun load(url: String): LoadResponse {
+        println("[v1.5 Debug] load 실행 - url: $url")
         val res: CatalogEntry = if (url.startsWith("{")) {
             parseJson(url)
         } else {
@@ -155,6 +168,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        println("[v1.5 Debug] loadLinks 실행")
         val loadData = parseJson<LoadData>(data)
         val encodedId = URLEncoder.encode(loadData.id, "UTF-8")
         val request = app.get(buildUrl("/stream/${loadData.type}/$encodedId.json"))
@@ -249,21 +263,45 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
 
     private data class Manifest(val catalogs: List<Catalog>)
+    
+    // v1.5: Stremio Extra 속성 파싱 데이터 클래스
+    private data class Extra(
+        @JsonProperty("name") val name: String?,
+        @JsonProperty("isRequired") val isRequired: Boolean? = false
+    )
+
     private data class Catalog(
         var name: String?,
         val id: String,
         val type: String?,
-        val types: MutableList<String> = mutableListOf()
+        val types: MutableList<String> = mutableListOf(),
+        @JsonProperty("extra") val extra: List<Extra>? = null, // v1.5 추가
+        @JsonProperty("extraSupported") val extraSupported: List<String>? = null // v1.5 추가
     ) {
         init {
             if (type != null) types.add(type)
         }
 
+        // v1.5: 오직 검색만이 필수 목적인 카탈로그인지 확인 (홈 화면 제외용)
+        fun isSearchRequired(): Boolean {
+            val hasRequiredSearch = extra?.any { it.name == "search" && it.isRequired == true } == true
+            return hasRequiredSearch
+        }
+
+        // v1.5: 어떤 형태든 'search' 파라미터를 지원하는 카탈로그인지 확인 (검색 요청 승인용)
+        fun supportsSearch(): Boolean {
+            val hasSearchInExtra = extra?.any { it.name == "search" } == true
+            val hasSearchInExtraSupported = extraSupported?.contains("search") == true
+            return hasSearchInExtra || hasSearchInExtraSupported
+        }
+
         suspend fun search(query: String, provider: StremioC): List<SearchResponse> {
             val entries = mutableListOf<SearchResponse>()
             types.forEach { type ->
+                val searchUrl = provider.buildUrl("/catalog/${type}/${id}/search=${query}.json")
+                println("[v1.5 Debug] 검색 API 호출 대상: $searchUrl")
                 val res = app.get(
-                    provider.buildUrl("/catalog/${type}/${id}/search=${query}.json"),
+                    searchUrl,
                     timeout = 120L
                 ).parsedSafe<CatalogResponse>()
                 res?.metas?.forEach { entry ->
@@ -287,6 +325,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 }
 
                 val url = provider.buildUrl(path)
+                println("[v1.5 Debug] 홈 화면 카탈로그 호출 대상: $url")
 
                 val res = app.get(
                     url,
