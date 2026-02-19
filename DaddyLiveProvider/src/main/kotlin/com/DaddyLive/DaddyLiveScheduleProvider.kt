@@ -1,8 +1,3 @@
-/**
- * DaddyLiveScheduleProvider v2.14
- * - [Optimize] 상위 3개 채널 x "player" 소스만 집중 추출 (성공률 최우선)
- * - [Debug] 추출 경로 요약 정보 로그 출력
- */
 package com.DaddyLive
 
 import com.lagradost.cloudstream3.*
@@ -22,7 +17,6 @@ class DaddyLiveScheduleProvider : MainAPI() {
     @Suppress("ConstPropertyName")
     companion object {
         private const val posterUrl = "https://raw.githubusercontent.com/hsp1020/TestPlugins/refs/heads/master/DaddyLiveProvider/daddylive.jpg"
-
         fun convertGMTToLocalTime(gmtTime: String): String {
             return try {
                 val gmtFormat = SimpleDateFormat("HH:mm", Locale.getDefault()).apply { timeZone = TimeZone.getTimeZone("GMT") }
@@ -39,9 +33,7 @@ class DaddyLiveScheduleProvider : MainAPI() {
             val events = it.select(".schedule__event").map { e ->
                 val dataTitle = e.select(".schedule__eventHeader").attr("data-title")
                 val formattedTime = convertGMTToLocalTime(e.select(".schedule__time").text())
-                newLiveSearchResponse("$formattedTime - ${e.select(".schedule__eventTitle").text()}", dataTitle) {
-                    this.posterUrl = Companion.posterUrl
-                }
+                newLiveSearchResponse("$formattedTime - ${e.select(".schedule__eventTitle").text()}", dataTitle) { this.posterUrl = Companion.posterUrl }
             }
             HomePageList(it.select(".card__meta").text(), events, false)
         }
@@ -61,15 +53,13 @@ class DaddyLiveScheduleProvider : MainAPI() {
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         val channels = AppUtils.tryParseJson<List<Channel>>(data) ?: return false
         
-        // [Fix] 상위 3개 채널의 "player" 소스만 타겟팅
-        val targetLinks = channels.take(3).map { ch ->
-            ch.channelName + " - player" to ch.channelId.format("player")
+        // [Fix] 성공률 높은 player와 이번에 확인된 stream 요소를 병행 추출
+        val targetLinks = channels.take(3).flatMap { ch ->
+            listOf("player", "stream").map { p -> ch.channelName + " - $p" to ch.channelId.format(p) }
         }
 
-        println("[DaddyLive] v2.14 추출 시작: ${targetLinks.size}개 'player' 소스 분석 중")
         DaddyLiveExtractor().getUrl(targetLinks.toJson(), null, subtitleCallback, callback)
         return true
     }
-
     data class Channel(val channelName: String, val channelId: String)
 }
