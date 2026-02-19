@@ -1,7 +1,8 @@
 /**
- * DaddyLiveExtractor v2.15
- * - [Fix] 위장된 스트림 패턴(.css) 감시 추가: dvalna.ru 등의 신규 서버 대응
- * - [Fix] S3 및 위장 서버의 403 에러 방지를 위한 헤더/쿠키 로직 최적화
+ * DaddyLiveExtractor v2.20
+ * - [Fix] 인터셉트 성공 로그에 소스 명칭(요소 타입 포함) 출력하도록 개선
+ * - [Fix] mono.css 및 mizhls 등 변칙 패턴 감지 유지
+ * - [Optimize] 3개씩 병렬 처리하여 타임아웃 및 자원 부족 방지
  */
 package com.DaddyLive
 
@@ -22,47 +23,55 @@ class DaddyLiveExtractor : ExtractorApi() {
 
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val links = AppUtils.tryParseJson<List<Pair<String, String>>>(url) ?: return
+        println("[DaddyLiveExt] v2.20 전수 추출 가동")
         
         coroutineScope {
-            links.amap { (name, link) ->
-                val result = runWebViewInterceptor(link)
-                if (result != null) {
-                    processSource(name, result, callback)
+            links.chunked(3).forEach { chunk ->
+                chunk.amap { (name, link) ->
+                    // [핵심] 요소 이름(name)을 인터셉터에 전달하여 로그 식별
+                    val result = runWebViewInterceptor(name, link)
+                    if (result != null) {
+                        processFinalResult(name, result, callback)
+                    }
                 }
             }
         }
     }
 
-    private suspend fun processSource(name: String, result: String, callback: (ExtractorLink) -> Unit) {
+    private suspend fun processFinalResult(name: String, result: String, callback: (ExtractorLink) -> Unit) {
         val fixedReferer = "https://dlhd.link/"
         val cookies = CookieManager.getInstance().getCookie(result)
         
-        // [Fix] .css 위장 주소일 경우 강제로 M3U8 타입으로 지정하여 재생 유도
-        val isM3U8 = result.contains(".m3u8") || result.contains("mono.css")
         val is1080 = result.contains("/1080p/")
         val is720 = result.contains("/720p/")
 
         suspend fun push(n: String, u: String, q: Int) {
+            println("[DaddyLiveExt] [${name}] 최종 리스트 추가 완료")
             callback(newExtractorLink(n, name, u, type = ExtractorLinkType.M3U8) {
                 this.quality = q
                 this.referer = fixedReferer
-                this.headers = mutableMapOf("User-Agent" to userAgent, "Referer" to fixedReferer, "Origin" to "https://dlhd.link").apply {
+                this.headers = mutableMapOf(
+                    "User-Agent" to userAgent,
+                    "Referer" to fixedReferer,
+                    "Origin" to "https://dlhd.link",
+                    "Accept" to "*/*"
+                ).apply {
                     if (!cookies.isNullOrEmpty()) put("Cookie", cookies)
                 }
             })
         }
 
-        val baseQual = if(is1080) Qualities.P1080.value else if(is720) Qualities.P720.value else Qualities.Unknown.value
-        push("$name ${if(is1080) "(1080p)" else if(is720) "(720p)" else ""}", result, baseQual)
+        val baseQual = if (is1080) Qualities.P1080.value else if (is720) Qualities.P720.value else Qualities.Unknown.value
+        push(name, result, baseQual)
 
-        // 화질 재조립 (CSS 위장 주소는 경로 규칙이 다를 수 있어 S3인 경우에만 우선 적용)
+        // S3 도메인이 포함된 경우에만 화질 재조립 시도
         if (result.contains("amazonaws.com")) {
             if (is1080) push("$name (720p - 재조립)", result.replace("/1080p/", "/720p/"), Qualities.P720.value)
             else if (is720) push("$name (1080p - 재조립)", result.replace("/720p/", "/1080p/"), Qualities.P1080.value)
         }
     }
 
-    private suspend fun runWebViewInterceptor(targetUrl: String): String? = suspendCancellableCoroutine { cont ->
+    private suspend fun runWebViewInterceptor(sourceName: String, targetUrl: String): String? = suspendCancellableCoroutine { cont ->
         val handler = Handler(Looper.getMainLooper())
         handler.post {
             try {
@@ -85,21 +94,48 @@ class DaddyLiveExtractor : ExtractorApi() {
                         val reqUrl = request?.url?.toString() ?: ""
                         val lower = reqUrl.lowercase()
                         
-                        // [핵심] 감시 패턴에 .css (위장 스트림) 추가
+                        // .m3u8, mono.css, mizhls 등 모든 스트림 패턴 감지
                         val isMatch = lower.contains(".m3u8") || lower.contains("mono.css") || lower.contains("mizhls")
                         
                         if (isMatch && !lower.contains("topembed.pw") && !isFinished) {
                             isFinished = true
-                            println("[DaddyLiveExt] ★인터셉트 성공: $reqUrl")
+                            // [Fix] 로그에 어떤 요소(sourceName)에서 가로챘는지 출력
+                            println("[DaddyLiveExt] [${sourceName}] ★인터셉트 성공: $reqUrl")
                             handler.post { webView.destroy() }
                             if (cont.isActive) cont.resume(reqUrl)
                         }
                         return super.shouldInterceptRequest(webViewParam, request)
                     }
+
+                    override fun onPageFinished(webViewParam: WebView?, url: String?) {
+                        if (!isFinished) {
+                            webViewParam?.evaluateJavascript(
+                                "(function(){var s=document.getElementsByTagName('script');for(var i=0;i<s.length;i++){var m=s[i].innerHTML.match(/file\\s*:\\s*[\"']([^\"']+(?:\\.m3u8|mono\\.css|mizhls)[^\"']*)[\"']/);if(m)return m[1];}return null;})();"
+                            ) { r ->
+                                val clean = r?.trim('"')?.takeIf { it != "null" && it.isNotEmpty() }
+                                if (clean != null && !isFinished) {
+                                    isFinished = true
+                                    println("[DaddyLiveExt] [${sourceName}] ★JS 추출 성공: $clean")
+                                    handler.post { webView.destroy() }
+                                    if (cont.isActive) cont.resume(clean)
+                                }
+                            }
+                        }
+                    }
                 }
+                println("[DaddyLiveExt] [${sourceName}] 웹뷰 로딩 시작")
                 webView.loadUrl(targetUrl, mapOf("Referer" to "https://dlhd.link/"))
-                handler.postDelayed({ if (!isFinished && cont.isActive) { isFinished = true; webView.destroy(); cont.resume(null) } }, 20000)
-            } catch (e: Exception) { if (cont.isActive) cont.resume(null) }
+
+                handler.postDelayed({ 
+                    if (!isFinished && cont.isActive) { 
+                        isFinished = true
+                        webView.destroy()
+                        cont.resume(null) 
+                    } 
+                }, 25000)
+            } catch (e: Exception) { 
+                if (cont.isActive) cont.resume(null) 
+            }
         }
     }
 }
