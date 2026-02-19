@@ -1,7 +1,7 @@
 /**
- * DaddyLiveScheduleProvider v2.2
- * - [Fix] 2004 에러 해결을 위한 헤더 구조 개선
- * - [Debug] 데이터 로드 및 링크 추출 단계별 로그 강화
+ * DaddyLiveScheduleProvider v2.3
+ * - [Fix] 2004 에러 해결을 위한 링크 전달 로직 안정화
+ * - [Debug] 상세 실행 로그 포함
  */
 package com.DaddyLive
 
@@ -42,7 +42,7 @@ class DaddyLiveScheduleProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        println("[DaddyLive] getMainPage 시작")
+        println("[DaddyLive] getMainPage 요청 시작")
         val doc = app.get(mainUrl).document
         val schedule = doc.select(".schedule__category").map {
             val sectionTitle = it.select(".card__meta").text()
@@ -60,7 +60,7 @@ class DaddyLiveScheduleProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        println("[DaddyLive] load 요청: $url")
+        println("[DaddyLive] load 정보 로드: $url")
         val doc = app.get(mainUrl).document
         val dataTitle = url.removePrefix("$mainUrl/")
         val event = doc.select(".schedule__event").first {
@@ -81,16 +81,14 @@ class DaddyLiveScheduleProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        println("[DaddyLive] loadLinks 시작 (v2.2)")
+        println("[DaddyLive] loadLinks 시작 (v2.3)")
         val channels = AppUtils.tryParseJson<List<Channel>>(data) ?: return false
         val firstChannel = channels.firstOrNull() ?: return false
         
-        val priorityPlayers = listOf("stream", "player")
-        val targetLinks = priorityPlayers.map { p ->
+        val targetLinks = listOf("stream", "player").map { p ->
             firstChannel.channelName + " - $p" to firstChannel.channelId.format(p)
         }
 
-        println("[DaddyLive] 최적화 경로 추출 시도")
         DaddyLiveExtractor().getUrl(targetLinks.toJson(), null, subtitleCallback, callback)
         return true
     }
