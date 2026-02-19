@@ -1,4 +1,4 @@
-package it.dogior.hadEnough
+package com.DaddyLive
 
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.api.Log
