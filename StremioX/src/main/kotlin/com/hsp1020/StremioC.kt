@@ -366,6 +366,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
     private data class TrailerStream(
         @JsonProperty("ytId") val ytId: String?
+        @JsonProperty("title") val title: String? = null
     )
 
     private data class CatalogEntry(
