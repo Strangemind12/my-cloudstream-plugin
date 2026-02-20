@@ -1,4 +1,3 @@
-// v1.7
 package com.phisher98
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -47,11 +46,10 @@ import java.util.Locale
 class StremioC(override var mainUrl: String, override var name: String) : MainAPI() {
     override val supportedTypes = setOf(TvType.Others)
     override val hasMainPage = true
-
-    // v1.7: 로딩 속도 극대화를 위한 Manifest 메모리 캐싱 변수
+     
     private var cachedManifest: Manifest? = null
     private var lastManifestUrl: String = ""
-
+    
     companion object {
         private const val cinemeta = "https://aiometadata.elfhosted.com/stremio/b7cb164b-074b-41d5-b458-b3a834e197bb"
         val TRACKER_LIST_URLS = listOf(
@@ -60,6 +58,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         )
         private const val TRACKER_LIST_URL = "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt"
     }
+
 
     private fun baseUrl(): String {
         return mainUrl.substringBefore("?").trimEnd('/')
@@ -76,14 +75,11 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         return "${baseUrl()}$path${querySuffix()}"
     }
 
-    // v1.7: 중복 네트워크 요청을 제거하는 스마트 캐싱 로직 구현
     private suspend fun getManifest(): Manifest? {
         val currentUrl = buildUrl("/manifest.json")
         if (cachedManifest != null && lastManifestUrl == currentUrl) {
-            println("[v1.7 Debug] 캐시된 Manifest 사용 (네트워크 지연 시간 단축 완료)")
             return cachedManifest
         }
-        println("[v1.7 Debug] Manifest 새로 다운로드: $currentUrl")
         cachedManifest = app.get(currentUrl).parsedSafe<Manifest>()
         lastManifestUrl = currentUrl
         return cachedManifest
@@ -93,7 +89,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-        println("[v1.7 Debug] getMainPage 실행 - page: $page")
         if (mainUrl.isEmpty()) {
             throw IllegalArgumentException("Configure in Extension Settings\n")
         }
@@ -107,7 +102,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val targetCatalogs = manifest?.catalogs?.filter { !it.isSearchRequired() } ?: emptyList()
 
         val lists = targetCatalogs.amap { catalog ->
-            println("[v1.7 Debug] 일반 카탈로그 병렬 로드 시작: ${catalog.name ?: catalog.id}")
             catalog.toHomePageList(
                 provider = this,
                 skip = skip
@@ -121,7 +115,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        println("[v1.7 Debug] search 실행 - query: $query")
         mainUrl = mainUrl.fixSourceUrl()
         
         val manifest = getManifest()
@@ -132,12 +125,10 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         }.flatten()
         
         val distinctList = list.distinctBy { it.url }
-        println("[v1.7 Debug] 검색 완료 - 총 반환 아이템 수: ${distinctList.size}")
         return distinctList
     }
 
     override suspend fun load(url: String): LoadResponse {
-        println("[v1.7 Debug] load 실행 - url: $url")
         val res: CatalogEntry = if (url.startsWith("{")) {
             parseJson(url)
         } else {
@@ -174,7 +165,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("[v1.7 Debug] loadLinks 실행")
         val loadData = parseJson<LoadData>(data)
         val encodedId = URLEncoder.encode(loadData.id, "UTF-8")
         val request = app.get(buildUrl("/stream/${loadData.type}/$encodedId.json"))
@@ -258,6 +248,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         @JsonProperty("lang") val lang: String,
     )
 
+    // check if id is imdb/tmdb cause stremio addons like torrentio works base on imdbId
     private fun isImdborTmdb(url: String?): Boolean {
         return imdbUrlToIdNullable(url) != null || url?.startsWith("tmdb:") == true
     }
@@ -266,7 +257,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         return imdbUrlToIdNullable(url) != null
     }
 
-    private data class Manifest(val catalogs: List<Catalog>)
+
+   private data class Manifest(val catalogs: List<Catalog>)
     
     private data class Extra(
         @JsonProperty("name") val name: String?,
@@ -296,10 +288,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         }
 
         suspend fun search(query: String, provider: StremioC): List<SearchResponse> {
-            // v1.7: 단일 카탈로그 내의 다중 type(movie, series 등) 요청을 순차(forEach)에서 병렬(amap)로 업그레이드하여 속도 향상
             val allMetas = types.amap { type ->
                 val searchUrl = provider.buildUrl("/catalog/${type}/${id}/search=${query}.json")
-                println("[v1.7 Debug] 검색 API 병렬 호출 대상: $searchUrl")
                 val res = app.get(searchUrl, timeout = 120L).parsedSafe<CatalogResponse>()
                 res?.metas ?: emptyList()
             }.flatten()
@@ -311,7 +301,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             provider: StremioC,
             skip: Int
         ): HomePageList {
-            // v1.7: 카탈로그 내부 아이템 조회 속도 극대화를 위해 forEach를 amap 비동기 다중 스레드로 교체
             val allMetas = types.amap { type ->
                 val path = if (skip > 0) {
                     "/catalog/$type/$id/skip=$skip.json"
@@ -319,7 +308,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     "/catalog/$type/$id.json"
                 }
                 val url = provider.buildUrl(path)
-                println("[v1.7 Debug] 홈 화면 카탈로그 병렬 호출: $url")
 
                 val res = app.get(url, timeout = 120L).parsedSafe<CatalogResponse>()
                 res?.metas ?: emptyList()
@@ -340,6 +328,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val source: String?,
         val type: String?
     )
+
 
     private data class CatalogEntry(
         @JsonProperty("name") val name: String,
@@ -366,6 +355,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             }
         }
 
+
+
         suspend fun toLoadResponse(provider: StremioC, imdbId: String?): LoadResponse {
             if (videos.isNullOrEmpty()) {
                 return provider.newMovieLoadResponse(
@@ -382,7 +373,11 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     tags = genre ?: genres
                     addActors(cast)
                     addTrailer(trailersSources.map { "https://www.youtube.com/watch?v=${it.source}" })
-                    addImdbId(imdbId)
+                    if (imdbId?.startsWith("tt") == true) {
+                        addImdbId(imdbId)
+                    } else {
+                        println("Kitsu or TMDB ID: $imdbId")
+                    }
                 }
             } else {
                 return provider.newTvSeriesLoadResponse(
@@ -402,9 +397,14 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     addActors(cast)
                     addTrailer(trailersSources.map { "https://www.youtube.com/watch?v=${it.source}" }
                         .randomOrNull())
-                    addImdbId(imdbId)
+                    if (imdbId?.startsWith("tt") == true) {
+                        addImdbId(imdbId)
+                    } else {
+                        println("Kitsu or TMDB ID: $imdbId")
+                    }
                 }
             }
+
         }
     }
 
