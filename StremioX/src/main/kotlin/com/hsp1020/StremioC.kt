@@ -46,10 +46,17 @@ import java.util.Locale
 class StremioC(override var mainUrl: String, override var name: String) : MainAPI() {
     override val supportedTypes = setOf(TvType.Others)
     override val hasMainPage = true
-     
+
     private var cachedManifest: Manifest? = null
     private var lastManifestUrl: String = ""
     private var lastCacheTime: Long = 0
+
+    // v1.19: 카탈로그별로 이미 보낸 아이템을 기록 (줄 내부 중복 방지)
+    private val catalogSentIds = mutableMapOf<String, MutableSet<String>>()
+
+    // v1.19: 페이지네이션 데이터 캐시 (다른 화면 갔다 와도 즉시 로드)
+    // Key: "카탈로그ID_skip값"
+    private val pageContentCache = mutableMapOf<String, List<SearchResponse>>()
     
     // v1.15: 페이지네이션(page 1, 2...) 시 중복 아이템을 걸러내기 위한 고유 ID 저장소
     // v1.16: 카탈로그 ID별로 각각의 중복 저장소를 관리 (Map<카탈로그ID, 중복Set>)
@@ -122,28 +129,39 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         if (mainUrl.isEmpty()) throw IllegalArgumentException("Configure in Extension Settings\n")
         mainUrl = mainUrl.fixSourceUrl()
 
-        // v1.16: 첫 페이지 로드 시 모든 카탈로그의 중복 기록 초기화
+        // 1페이지 로드 시(새로고침 등) 해당 세션의 중복 기록은 초기화 (데이터 캐시는 유지)
         if (page <= 1) {
             catalogSentIds.clear()
-            println("[v1.16 Debug] 첫 페이지 로드 - 카탈로그별 중복 저장소 초기화 완료")
         }
 
-        val pageSize = 100
-        val skip = (page - 1) * pageSize
+        val skip = (page - 1) * 100
         val manifest = getManifest()
         val targetCatalogs = manifest?.catalogs?.filter { !it.isSearchRequired() } ?: emptyList()
 
+        // v1.16 방식 롤백: 모든 카탈로그 줄을 동시에 처리
         val lists = targetCatalogs.amap { catalog ->
-            // 1. 먼저 해당 카탈로그의 데이터를 가져옵니다.
-            val row = catalog.toHomePageList(provider = this, skip = skip)
-            
-            // 2. 이 카탈로그(줄) 전용 중복 저장소를 가져오거나 새로 만듭니다.
             val catalogKey = catalog.id ?: catalog.name ?: "default"
-            val seenForThisCatalog = catalogSentIds.getOrPut(catalogKey) { mutableSetOf() }
+            val cacheKey = "${catalogKey}_$skip"
+
+            // A. 해당 페이지 데이터가 캐시에 있는지 확인
+            val cachedItems = pageContentCache[cacheKey]
             
-            // 3. 해당 카탈로그 저장소 내에서만 중복을 체크합니다.
+            val row = if (cachedItems != null) {
+                // 캐시가 있으면 서버 요청 없이 즉시 사용
+                HomePageList(catalog.name ?: catalog.id, cachedItems)
+            } else {
+                // 캐시가 없으면 서버에서 가져와서 캐시에 저장
+                val freshRow = catalog.toHomePageList(provider = this, skip = skip)
+                if (freshRow.list.isNotEmpty()) {
+                    pageContentCache[cacheKey] = freshRow.list
+                }
+                freshRow
+            }
+            
+            // B. 카탈로그(줄)별 독립 중복 제거 적용
+            val seenForThisCatalog = catalogSentIds.getOrPut(catalogKey) { mutableSetOf() }
             val filteredItems = row.list.filter { item ->
-                seenForThisCatalog.add(item.url) // 이 줄에 이미 나온 아이템이면 false 반환
+                seenForThisCatalog.add(item.url) // 이미 해당 줄에 나온 아이템이면 제외
             }
             
             row.copy(list = filteredItems)
@@ -154,7 +172,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             hasNext = true
         )
     }
-
+    
     override suspend fun search(query: String): List<SearchResponse> {
         mainUrl = mainUrl.fixSourceUrl()
         
