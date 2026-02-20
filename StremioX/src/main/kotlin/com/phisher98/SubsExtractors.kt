@@ -1,3 +1,4 @@
+// v1.8
 package com.phisher98
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -16,6 +17,13 @@ object SubsExtractors {
         episode: Int? = null,
         subtitleCallback: (SubtitleFile) -> Unit,
     ) {
+        // v1.8: OpenSubtitles API는 kitsu, tmdb 등의 슬러그를 자체 지원하므로 빈 값만 방어
+        if (imdbId.isNullOrBlank()) {
+            println("[v1.8 Debug] invokeOpenSubs: imdbId가 비어 있어 실행 중단")
+            return
+        }
+        println("[v1.8 Debug] invokeOpenSubs 실행 - imdbId: $imdbId")
+
         val slug = if(season == null) {
             "movie/$imdbId"
         } else {
@@ -38,7 +46,14 @@ object SubsExtractors {
         episode: Int? = null,
         subtitleCallback: (SubtitleFile) -> Unit,
     ) {
-        val id = imdbId?.removePrefix("tt")
+        // v1.8: Watchsomuch는 순수 숫자형 IMDb ID를 기반으로 통신하므로 tt 검증이 필수
+        if (imdbId?.startsWith("tt") != true) {
+            println("[v1.8 Debug] invokeWatchsomuch: 올바른 IMDb ID 형식이 아니므로 실행 중단 - $imdbId")
+            return
+        }
+        println("[v1.8 Debug] invokeWatchsomuch 실행 - imdbId: $imdbId")
+
+        val id = imdbId.removePrefix("tt")
         val epsId = app.post(
             "${watchSomuchAPI}/Watch/ajMovieTorrents.aspx", data = mapOf(
                 "index" to "0",
