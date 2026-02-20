@@ -48,12 +48,13 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     override val hasMainPage = true
     // v1.17: 카탈로그를 각각 독립된 페이지네이션 단위로 분리하여 등록
     // get()을 써야 getManifest()로 받아온 캐시 데이터를 실시간으로 반영함
-    override val mainPage: List<MainPageRequest>
+    // v1.18: MainPageRequest -> MainPageData로 변경 및 horizontalImages 파라미터 추가
+    override val mainPage: List<MainPageData>
         get() = cachedManifest?.catalogs?.filter { !it.isSearchRequired() }?.map { 
-            // 각 카탈로그의 정보를 JSON으로 담아 request.data로 넘김
-            MainPageRequest(it.name ?: it.id, it.toJson()) 
-        } ?: listOf(MainPageRequest(name, ""))
-       
+            // 생성자 마지막에 horizontalImages = false 추가 (빌드 에러 해결 핵심)
+            MainPageData(it.name ?: it.id, it.toJson(), false) 
+        } ?: listOf(MainPageData(name, "", false))
+
     private var cachedManifest: Manifest? = null
     private var lastManifestUrl: String = ""
     private var lastCacheTime: Long = 0
@@ -124,20 +125,20 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
     override suspend fun getMainPage(
         page: Int,
-        request: MainPageRequest
+        request: MainPageData // v1.18: MainPageRequest에서 MainPageData로 변경
     ): HomePageResponse {
-        println("[v1.17 Debug] getMainPage 실행 - 카탈로그: ${request.name}, 페이지: $page")
+        println("[v1.18 Debug] getMainPage 실행 - 카탈로그: ${request.name}, 페이지: $page")
         if (mainUrl.isEmpty()) throw IllegalArgumentException("Configure in Extension Settings\n")
         mainUrl = mainUrl.fixSourceUrl()
 
-        // 1. 매니페스트 로드 (24시간 캐시 로직 작동)
+        // 1. 매니페스트 로드 (24시간 캐시 로직)
         val manifest = getManifest() ?: throw RuntimeException("Manifest 로드 실패")
 
         // 2. 현재 요청된 특정 카탈로그 데이터만 추출
         val catalog = try {
             parseJson<Catalog>(request.data)
         } catch (e: Exception) {
-            // 초기 로딩이나 전체 로딩 시 대응
+            // 초기 로딩 시 대응
             manifest.catalogs.firstOrNull { !it.isSearchRequired() }
         }
 
@@ -146,10 +147,10 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         // 3. 해당 '줄'의 페이지네이션만 수행 (100개 단위)
         val skip = (page - 1) * 100
         
-        // 4. 오직 이 카탈로그 하나만 서버에 접속 (사용자님 분석 정답 반영)
+        // 4. 오직 이 카탈로그 하나만 서버에 접속 (속도 최적화)
         val row = catalog.toHomePageList(provider = this, skip = skip)
 
-        // 5. 카탈로그별 독립 중복 제거 (v1.16 유지)
+        // 5. 카탈로그별 독립 중복 제거
         val catalogKey = catalog.id ?: catalog.name ?: "default"
         val seenForThisCatalog = catalogSentIds.getOrPut(catalogKey) { mutableSetOf() }
         if (page <= 1) seenForThisCatalog.clear()
@@ -157,14 +158,12 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val filteredItems = row.list.filter { item -> seenForThisCatalog.add(item.url) }
         val finalRow = row.copy(list = filteredItems)
 
-        println("[v1.17 Debug] '${catalog.name}' 로드 완료: ${finalRow.list.size}개 아이템")
-
         return newHomePageResponse(
             listOf(finalRow),
             hasNext = finalRow.list.isNotEmpty()
         )
     }
-
+    
     override suspend fun search(query: String): List<SearchResponse> {
         mainUrl = mainUrl.fixSourceUrl()
         
