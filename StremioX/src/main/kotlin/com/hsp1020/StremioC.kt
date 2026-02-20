@@ -1,4 +1,4 @@
-package com.hsp1020
+package com.phisher98
 
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.AcraApplication
@@ -35,9 +35,9 @@ import com.lagradost.cloudstream3.utils.USER_PROVIDER_API
 import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import com.hsp1020.StremioC.Companion.TRACKER_LIST_URLS
-import com.hsp1020.SubsExtractors.invokeOpenSubs
-import com.hsp1020.SubsExtractors.invokeWatchsomuch
+import com.phisher98.StremioC.Companion.TRACKER_LIST_URLS
+import com.phisher98.SubsExtractors.invokeOpenSubs
+import com.phisher98.SubsExtractors.invokeWatchsomuch
 import org.json.JSONObject
 import java.net.URLEncoder
 import java.util.Locale
@@ -46,20 +46,12 @@ import java.util.Locale
 class StremioC(override var mainUrl: String, override var name: String) : MainAPI() {
     override val supportedTypes = setOf(TvType.Others)
     override val hasMainPage = true
-
+     
     private var cachedManifest: Manifest? = null
     private var lastManifestUrl: String = ""
     private var lastCacheTime: Long = 0
-
-    // v1.19: 카탈로그별로 이미 보낸 아이템을 기록 (줄 내부 중복 방지)
     private val catalogSentIds = mutableMapOf<String, MutableSet<String>>()
-
-    // v1.19: 페이지네이션 데이터 캐시 (다른 화면 갔다 와도 즉시 로드)
-    // Key: "카탈로그ID_skip값"
     private val pageContentCache = mutableMapOf<String, List<SearchResponse>>()
-    
-    // v1.15: 페이지네이션(page 1, 2...) 시 중복 아이템을 걸러내기 위한 고유 ID 저장소
-    // v1.16: 카탈로그 ID별로 각각의 중복 저장소를 관리 (Map<카탈로그ID, 중복Set>)
     
     companion object {
         private const val cinemeta = "https://aiometadata.elfhosted.com/stremio/b7cb164b-074b-41d5-b458-b3a834e197bb"
@@ -90,36 +82,25 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val currentUrl = buildUrl("/manifest.json")
         val now = System.currentTimeMillis()
         val cacheAge = now - lastCacheTime
-        val isExpired = cacheAge > 24 * 60 * 60 * 1000 // 24시간 체크
+        val isExpired = cacheAge > 24 * 60 * 60 * 1000 // 24Hour
 
-        // v1.14 캐시 사용 조건: 
-        // 1. 캐시가 존재하고 2. URL이 같으며 3. 24시간 이내이고 4. 카탈로그 목록이 비어있지 않을 때
         if (cachedManifest != null && 
             lastManifestUrl == currentUrl && 
             !isExpired && 
             !cachedManifest?.catalogs.isNullOrEmpty()) {
-            println("[v1.14 Debug] 24시간 미만 캐시 데이터 반환 (Age: ${cacheAge / 3600000}시간)")
             return cachedManifest
         }
 
-        // 위의 조건 중 하나라도 실패하면(재설치, 빈 데이터, 만료 등) 새로 다운로드
-        println("[v1.14 Debug] Manifest 새로 로드 시도 (사유: 데이터 부재, 만료 또는 재설치)")
-        
-        // v1.13에서 검증된 120초 타임아웃 적용 (NiceHttp 버그 방지)
         val res = app.get(currentUrl, timeout = 120L).parsedSafe<Manifest>()
-        
-        // 새로 받아온 데이터가 정상(Null이 아니고 카탈로그가 존재)일 때만 캐시 갱신
+
         if (res != null && !res.catalogs.isNullOrEmpty()) {
             cachedManifest = res
             lastManifestUrl = currentUrl
             lastCacheTime = now
             pageContentCache.clear()
             catalogSentIds.clear()
-            println("[v1.14 Debug] Manifest 캐시 갱신 완료 (${res.catalogs.size}개 카탈로그)")
         } else {
-            println("[v1.14 Debug] 서버 응답이 없거나 카탈로그가 비어있어 캐시를 갱신하지 않음")
-        }
-        
+        }        
         return res ?: cachedManifest
     }
 
@@ -130,7 +111,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         if (mainUrl.isEmpty()) throw IllegalArgumentException("Configure in Extension Settings\n")
         mainUrl = mainUrl.fixSourceUrl()
 
-        // 1페이지 로드 시(새로고침 등) 해당 세션의 중복 기록은 초기화 (데이터 캐시는 유지)
         if (page <= 1) {
             catalogSentIds.clear()
         }
@@ -139,19 +119,15 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val manifest = getManifest()
         val targetCatalogs = manifest?.catalogs?.filter { !it.isSearchRequired() } ?: emptyList()
 
-        // v1.16 방식 롤백: 모든 카탈로그 줄을 동시에 처리
         val lists = targetCatalogs.amap { catalog ->
             val catalogKey = catalog.id ?: catalog.name ?: "default"
             val cacheKey = "${catalogKey}_$skip"
 
-            // A. 해당 페이지 데이터가 캐시에 있는지 확인
             val cachedItems = pageContentCache[cacheKey]
             
             val row = if (cachedItems != null) {
-                // 캐시가 있으면 서버 요청 없이 즉시 사용
                 HomePageList(catalog.name ?: catalog.id, cachedItems)
             } else {
-                // 캐시가 없으면 서버에서 가져와서 캐시에 저장
                 val freshRow = catalog.toHomePageList(provider = this, skip = skip)
                 if (freshRow.list.isNotEmpty()) {
                     pageContentCache[cacheKey] = freshRow.list
@@ -159,10 +135,9 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 freshRow
             }
             
-            // B. 카탈로그(줄)별 독립 중복 제거 적용
             val seenForThisCatalog = catalogSentIds.getOrPut(catalogKey) { mutableSetOf() }
             val filteredItems = row.list.filter { item ->
-                seenForThisCatalog.add(item.url) // 이미 해당 줄에 나온 아이템이면 제외
+                seenForThisCatalog.add(item.url)
             }
             
             row.copy(list = filteredItems)
@@ -173,7 +148,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             hasNext = true
         )
     }
-    
+
     override suspend fun search(query: String): List<SearchResponse> {
         mainUrl = mainUrl.fixSourceUrl()
         
@@ -225,7 +200,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("[v1.9 Debug] loadLinks 실행")
         val loadData = parseJson<LoadData>(data)
         val encodedId = URLEncoder.encode(loadData.id, "UTF-8")
         val request = app.get(buildUrl("/stream/${loadData.type}/$encodedId.json"), timeout = 120L)
@@ -233,7 +207,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val res = if (request.isSuccessful)
             request.parsedSafe<StreamsResponse>()
         else
-            null        
+            null
 
         if (!res?.streams.isNullOrEmpty()) {
             res.streams.forEach { stream ->
