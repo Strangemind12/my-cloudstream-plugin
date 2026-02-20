@@ -52,7 +52,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     private var lastCacheTime: Long = 0
     
     // v1.15: 페이지네이션(page 1, 2...) 시 중복 아이템을 걸러내기 위한 고유 ID 저장소
-    private val sentIds = mutableSetOf<String>()
+    // v1.16: 카탈로그 ID별로 각각의 중복 저장소를 관리 (Map<카탈로그ID, 중복Set>)
+    private val catalogSentIds = mutableMapOf<String, MutableSet<String>>()
     
     companion object {
         private const val cinemeta = "https://aiometadata.elfhosted.com/stremio/b7cb164b-074b-41d5-b458-b3a834e197bb"
@@ -121,9 +122,10 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         if (mainUrl.isEmpty()) throw IllegalArgumentException("Configure in Extension Settings\n")
         mainUrl = mainUrl.fixSourceUrl()
 
-        // v1.15: 첫 페이지 로드 시 중복 체크 저장소 초기화
+        // v1.16: 첫 페이지 로드 시 모든 카탈로그의 중복 기록 초기화
         if (page <= 1) {
-            sentIds.clear()
+            catalogSentIds.clear()
+            println("[v1.16 Debug] 첫 페이지 로드 - 카탈로그별 중복 저장소 초기화 완료")
         }
 
         val pageSize = 100
@@ -132,18 +134,24 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val targetCatalogs = manifest?.catalogs?.filter { !it.isSearchRequired() } ?: emptyList()
 
         val lists = targetCatalogs.amap { catalog ->
-            catalog.toHomePageList(provider = this, skip = skip)
-        }.map { row ->
-            // v1.15 핵심: 각 줄(Row)을 돌며 이미 보낸 아이템(ID/URL)은 제거
+            // 1. 먼저 해당 카탈로그의 데이터를 가져옵니다.
+            val row = catalog.toHomePageList(provider = this, skip = skip)
+            
+            // 2. 이 카탈로그(줄) 전용 중복 저장소를 가져오거나 새로 만듭니다.
+            val catalogKey = catalog.id ?: catalog.name ?: "default"
+            val seenForThisCatalog = catalogSentIds.getOrPut(catalogKey) { mutableSetOf() }
+            
+            // 3. 해당 카탈로그 저장소 내에서만 중복을 체크합니다.
             val filteredItems = row.list.filter { item ->
-                sentIds.add(item.url) // 신규 아이템이면 Set에 추가하고 true 반환, 중복이면 false 반환
+                seenForThisCatalog.add(item.url) // 이 줄에 이미 나온 아이템이면 false 반환
             }
+            
             row.copy(list = filteredItems)
         }.filter { it.list.isNotEmpty() }
 
         return newHomePageResponse(
             lists,
-            hasNext = true // 이제 서버가 똑같은걸 또 줘도 위 필터 로직이 다 쳐냅니다.
+            hasNext = true
         )
     }
 
