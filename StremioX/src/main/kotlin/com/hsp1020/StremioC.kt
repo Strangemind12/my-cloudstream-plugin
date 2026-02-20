@@ -113,6 +113,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             cachedManifest = res
             lastManifestUrl = currentUrl
             lastCacheTime = now
+            pageContentCache.clear()
+            catalogSentIds.clear()
             println("[v1.14 Debug] Manifest 캐시 갱신 완료 (${res.catalogs.size}개 카탈로그)")
         } else {
             println("[v1.14 Debug] 서버 응답이 없거나 카탈로그가 비어있어 캐시를 갱신하지 않음")
