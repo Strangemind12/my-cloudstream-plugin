@@ -5,7 +5,7 @@ import java.util.Properties
 version = 13
 
 android {
-    namespace = "com.phisher98" // Gradle 8.0+ 필수 추가 (이 코드가 없으면 BuildConfig가 생성되지 않음)
+    namespace = "com.hsp1020" // Gradle 8.0+ 필수 추가 (이 코드가 없으면 BuildConfig가 생성되지 않음)
 
     buildFeatures {
         buildConfig = true
