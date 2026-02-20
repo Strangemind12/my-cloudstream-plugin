@@ -1,4 +1,4 @@
-// v1.7
+// v1.8
 package com.phisher98
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -382,7 +382,13 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     tags = genre ?: genres
                     addActors(cast)
                     addTrailer(trailersSources.map { "https://www.youtube.com/watch?v=${it.source}" })
-                    addImdbId(imdbId)
+                    // v1.8: kitsu id 등으로 인한 Cloudstream 내부 NumberFormatException 방지
+                    if (imdbId?.startsWith("tt") == true) {
+                        println("[v1.8 Debug] 정상적인 IMDb ID 감지, Cloudstream 코어에 등록: $imdbId")
+                        addImdbId(imdbId)
+                    } else {
+                        println("[v1.8 Debug] IMDb ID가 아니므로(또는 null) 코어 자막 연동 생략: $imdbId")
+                    }
                 }
             } else {
                 return provider.newTvSeriesLoadResponse(
@@ -402,7 +408,13 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     addActors(cast)
                     addTrailer(trailersSources.map { "https://www.youtube.com/watch?v=${it.source}" }
                         .randomOrNull())
-                    addImdbId(imdbId)
+                    // v1.8: kitsu id 등으로 인한 Cloudstream 내부 NumberFormatException 방지
+                    if (imdbId?.startsWith("tt") == true) {
+                        println("[v1.8 Debug] 정상적인 IMDb ID 감지, Cloudstream 코어에 등록: $imdbId")
+                        addImdbId(imdbId)
+                    } else {
+                        println("[v1.8 Debug] IMDb ID가 아니므로(또는 null) 코어 자막 연동 생략: $imdbId")
+                    }
                 }
             }
         }
