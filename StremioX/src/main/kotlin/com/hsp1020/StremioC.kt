@@ -165,14 +165,16 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        println("[v1.9 Debug] loadLinks 실행")
         val loadData = parseJson<LoadData>(data)
         val encodedId = URLEncoder.encode(loadData.id, "UTF-8")
-        val request = app.get(buildUrl("/stream/${loadData.type}/$encodedId.json"))
+        // v1.9: 외부 스트림 제공자의 응답 지연 시 Cloudstream 코어가 연결을 끊지 않도록 120초 대기 시간 명시
+        val request = app.get(buildUrl("/stream/${loadData.type}/$encodedId.json"), timeout = 120L)
 
         val res = if (request.isSuccessful)
             request.parsedSafe<StreamsResponse>()
         else
-            null
+            null        
 
         if (!res?.streams.isNullOrEmpty()) {
             res.streams.forEach { stream ->
