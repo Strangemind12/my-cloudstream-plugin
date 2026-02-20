@@ -49,6 +49,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
      
     private var cachedManifest: Manifest? = null
     private var lastManifestUrl: String = ""
+    private var lastCacheTime: Long = 0
     
     companion object {
         private const val cinemeta = "https://aiometadata.elfhosted.com/stremio/b7cb164b-074b-41d5-b458-b3a834e197bb"
@@ -77,14 +78,39 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
     private suspend fun getManifest(): Manifest? {
         val currentUrl = buildUrl("/manifest.json")
-        if (cachedManifest != null && lastManifestUrl == currentUrl) {
+        val now = System.currentTimeMillis()
+        val cacheAge = now - lastCacheTime
+        val isExpired = cacheAge > 24 * 60 * 60 * 1000 // 24시간 체크
+
+        // v1.14 캐시 사용 조건: 
+        // 1. 캐시가 존재하고 2. URL이 같으며 3. 24시간 이내이고 4. 카탈로그 목록이 비어있지 않을 때
+        if (cachedManifest != null && 
+            lastManifestUrl == currentUrl && 
+            !isExpired && 
+            !cachedManifest?.catalogs.isNullOrEmpty()) {
+            println("[v1.14 Debug] 24시간 미만 캐시 데이터 반환 (Age: ${cacheAge / 3600000}시간)")
             return cachedManifest
         }
-        cachedManifest = app.get(currentUrl).parsedSafe<Manifest>()
-        lastManifestUrl = currentUrl
-        return cachedManifest
-    }
 
+        // 위의 조건 중 하나라도 실패하면(재설치, 빈 데이터, 만료 등) 새로 다운로드
+        println("[v1.14 Debug] Manifest 새로 로드 시도 (사유: 데이터 부재, 만료 또는 재설치)")
+        
+        // v1.13에서 검증된 120초 타임아웃 적용 (NiceHttp 버그 방지)
+        val res = app.get(currentUrl, timeout = 120L).parsedSafe<Manifest>()
+        
+        // 새로 받아온 데이터가 정상(Null이 아니고 카탈로그가 존재)일 때만 캐시 갱신
+        if (res != null && !res.catalogs.isNullOrEmpty()) {
+            cachedManifest = res
+            lastManifestUrl = currentUrl
+            lastCacheTime = now
+            println("[v1.14 Debug] Manifest 캐시 갱신 완료 (${res.catalogs.size}개 카탈로그)")
+        } else {
+            println("[v1.14 Debug] 서버 응답이 없거나 카탈로그가 비어있어 캐시를 갱신하지 않음")
+        }
+        
+        return res ?: cachedManifest
+    }
+    
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
