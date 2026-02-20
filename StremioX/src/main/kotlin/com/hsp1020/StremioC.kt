@@ -165,79 +165,49 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("[v1.12 Debug] loadLinks 실행")
+        println("[v1.9 Debug] loadLinks 실행")
         val loadData = parseJson<LoadData>(data)
         val encodedId = URLEncoder.encode(loadData.id, "UTF-8")
-        val targetUrl = buildUrl("/stream/${loadData.type}/$encodedId.json")
-        
-        var res: StreamsResponse? = null
-        
-        // v1.12: Cloudstream 내장 app.get()이 10초 만에 강제 타임아웃내는 버그를 우회하기 위해 OkHttp 직접 통신
-        try {
-            println("[v1.12 Debug] 메인 aiostreams API 요청 시도 (OkHttp 직접 호출 120초): $targetUrl")
-            
-            // baseClient 복제 후 읽기/연결 대기시간을 물리적으로 120초 강제 할당
-            val customClient = app.baseClient.newBuilder()
-                .connectTimeout(120, java.util.concurrent.TimeUnit.SECONDS)
-                .readTimeout(120, java.util.concurrent.TimeUnit.SECONDS)
-                .writeTimeout(120, java.util.concurrent.TimeUnit.SECONDS)
-                .build()
-                
-            val request = okhttp3.Request.Builder().url(targetUrl).build()
-            val response = customClient.newCall(request).execute() // 동기 호출로 확실히 응답 대기
-            
-            if (response.isSuccessful) {
-                val body = response.body?.string()
-                if (!body.isNullOrBlank()) {
-                    res = parseJson<StreamsResponse>(body)
-                    println("[v1.12 Debug] 메인 API 응답 성공, 반환된 스트림 개수: ${res?.streams?.size ?: 0}")
-                }
-            } else {
-                println("[v1.12 Debug] 메인 API 응답 실패: HTTP ${response.code}")
-            }
-        } catch (e: Exception) {
-            // 120초를 꽉 채우거나 서버 오류가 나더라도 앱이 죽지 않고 백업 로직으로 넘어가도록 방어
-            println("[v1.12 Debug] 메인 API 요청 중 예외 발생 (Crash 방어 성공): ${e.message}")
-        }
+        val request = app.get(buildUrl("/stream/${loadData.type}/$encodedId.json"), timeout = 120L)
+
+        val res = if (request.isSuccessful)
+            request.parsedSafe<StreamsResponse>()
+        else
+            null        
 
         if (!res?.streams.isNullOrEmpty()) {
-            res!!.streams.forEach { stream ->
+            res.streams.forEach { stream ->
                 stream.runCallback(subtitleCallback, callback)
             }
         } else {
-            println("[v1.12 Debug] 메인 스트림 확보 실패. 백업 병렬 스크래핑(runAllAsync) 진입")
-            // v1.12: 한 스크래퍼가 뻗더라도 연쇄 취소(Cancel)되지 않게 각 항목별 예외 격리
             runAllAsync(
-                {
-                    try {
+                    {
                         invokeStremioX(loadData.type, loadData.id, subtitleCallback, callback)
-                    } catch (e: Exception) { println("[v1.12 Debug] StremioX 에러: ${e.message}") }
-                },
-                {
-                    try {
+                    },{
                         invokeTorrentio(loadData.imdbId, loadData.season, loadData.episode, callback)
-                    } catch (e: Exception) { println("[v1.12 Debug] Torrentio 에러: ${e.message}") }
-                },
-                {
-                    try {
-                        invokeKnaben(loadData.imdbId, loadData.year, loadData.season, loadData.episode, callback)
-                    } catch (e: Exception) { println("[v1.12 Debug] Knaben 에러: ${e.message}") }
-                },
-                {
-                    try {
-                        invokeUindex(loadData.imdbId, loadData.year, loadData.season, loadData.episode, callback)
-                    } catch (e: Exception) { println("[v1.12 Debug] Uindex 에러: ${e.message}") }
-                },
-                {
-                    try {
-                        invokeWatchsomuch(loadData.imdbId, loadData.season, loadData.episode, subtitleCallback)
-                    } catch (e: Exception) { println("[v1.12 Debug] Watchsomuch 자막 에러: ${e.message}") }
-                },
-                {
-                    try {
-                        invokeOpenSubs(loadData.imdbId, loadData.season, loadData.episode, subtitleCallback)
-                    } catch (e: Exception) { println("[v1.12 Debug] OpenSubs 자막 에러: ${e.message}") }
-                }
+                    },
+                    {
+                        invokeKnaben(loadData.imdbId, loadData.year,loadData.season, loadData.episode, callback)
+                    },
+                    {
+                        invokeUindex(loadData.imdbId, loadData.year,loadData.season, loadData.episode, callback)
+                    },
+                    {
+                        invokeWatchsomuch(
+                            loadData.imdbId,
+                            loadData.season,
+                            loadData.episode,
+                            subtitleCallback
+                        )
+                    },
+                    {
+                        invokeOpenSubs(
+                            loadData.imdbId,
+                            loadData.season,
+                            loadData.episode,
+                            subtitleCallback
+                        )
+                    }
             )
         }
 
