@@ -171,21 +171,21 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             hasNext = true
         )
     }
-
-    suspend fun search(query: String, provider: StremioC): List<SearchResponse> {
-            val allMetas = types.amap { type ->
-                val searchUrl = provider.buildUrl("/catalog/${type}/${id}/search=${query}.json")
-                val res = app.get(searchUrl, timeout = 120L).parsedSafe<CatalogResponse>()
-                res?.metas ?: emptyList()
-            }.flatten()
-
-            // v1.20: 이름에 "Error" 또는 "❌"가 포함된 서버 에러 알림 아이템 제외
-            return allMetas
-                .filter { !it.name.contains("Error", ignoreCase = true) && !it.name.contains("❌") }
-                .distinctBy { it.id }
-                .map { it.toSearchResponse(provider) }
-        }
     
+    override suspend fun search(query: String): List<SearchResponse> {
+        mainUrl = mainUrl.fixSourceUrl()
+        
+        val manifest = getManifest()
+        val targetCatalogs = manifest?.catalogs?.filter { it.supportsSearch() } ?: emptyList()
+
+        val list = targetCatalogs.amap { catalog ->
+            catalog.search(query, this)
+        }.flatten()
+        
+        val distinctList = list.distinctBy { it.url }
+        return distinctList
+    }
+
     override suspend fun load(url: String): LoadResponse {
         val res: CatalogEntry = if (url.startsWith("{")) {
             parseJson(url)
@@ -371,11 +371,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 val res = app.get(url, timeout = 120L).parsedSafe<CatalogResponse>()
                 res?.metas ?: emptyList()
             }.flatten()
-
-            // v1.20: "[❌] AIOStreams - Error" 등의 더미 데이터를 실제 아이템으로 변환하기 전 필터링
-            val filteredMetas = allMetas.filter { entry ->
-                !entry.name.contains("Error", ignoreCase = true) && !entry.name.contains("❌")
-            }
 
             val distinctEntries = allMetas.distinctBy { it.id }.map { it.toSearchResponse(provider) }
 
