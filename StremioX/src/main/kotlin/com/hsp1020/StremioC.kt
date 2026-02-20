@@ -51,6 +51,9 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     private var lastManifestUrl: String = ""
     private var lastCacheTime: Long = 0
     
+    // v1.15: 페이지네이션(page 1, 2...) 시 중복 아이템을 걸러내기 위한 고유 ID 저장소
+    private val sentIds = mutableSetOf<String>()
+    
     companion object {
         private const val cinemeta = "https://aiometadata.elfhosted.com/stremio/b7cb164b-074b-41d5-b458-b3a834e197bb"
         val TRACKER_LIST_URLS = listOf(
@@ -110,33 +113,37 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         
         return res ?: cachedManifest
     }
-    
+
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-        if (mainUrl.isEmpty()) {
-            throw IllegalArgumentException("Configure in Extension Settings\n")
-        }
+        if (mainUrl.isEmpty()) throw IllegalArgumentException("Configure in Extension Settings\n")
         mainUrl = mainUrl.fixSourceUrl()
+
+        // v1.15: 첫 페이지 로드 시 중복 체크 저장소 초기화
+        if (page <= 1) {
+            sentIds.clear()
+        }
 
         val pageSize = 100
         val skip = (page - 1) * pageSize
-
         val manifest = getManifest()
-
         val targetCatalogs = manifest?.catalogs?.filter { !it.isSearchRequired() } ?: emptyList()
 
         val lists = targetCatalogs.amap { catalog ->
-            catalog.toHomePageList(
-                provider = this,
-                skip = skip
-            )
+            catalog.toHomePageList(provider = this, skip = skip)
+        }.map { row ->
+            // v1.15 핵심: 각 줄(Row)을 돌며 이미 보낸 아이템(ID/URL)은 제거
+            val filteredItems = row.list.filter { item ->
+                sentIds.add(item.url) // 신규 아이템이면 Set에 추가하고 true 반환, 중복이면 false 반환
+            }
+            row.copy(list = filteredItems)
         }.filter { it.list.isNotEmpty() }
 
         return newHomePageResponse(
             lists,
-            hasNext = true
+            hasNext = true // 이제 서버가 똑같은걸 또 줘도 위 필터 로직이 다 쳐냅니다.
         )
     }
 
