@@ -60,7 +60,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     
     // v1.15: 페이지네이션(page 1, 2...) 시 중복 아이템을 걸러내기 위한 고유 ID 저장소
     // v1.16: 카탈로그 ID별로 각각의 중복 저장소를 관리 (Map<카탈로그ID, 중복Set>)
-    private val catalogSentIds = mutableMapOf<String, MutableSet<String>>()
     
     companion object {
         private const val cinemeta = "https://aiometadata.elfhosted.com/stremio/b7cb164b-074b-41d5-b458-b3a834e197bb"
