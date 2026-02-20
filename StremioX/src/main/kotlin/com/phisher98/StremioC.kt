@@ -1,4 +1,4 @@
-package com.phisher98
+package com.hsp1020
 
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.AcraApplication
