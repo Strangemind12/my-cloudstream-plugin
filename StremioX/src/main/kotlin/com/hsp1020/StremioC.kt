@@ -46,15 +46,7 @@ import java.util.Locale
 class StremioC(override var mainUrl: String, override var name: String) : MainAPI() {
     override val supportedTypes = setOf(TvType.Others)
     override val hasMainPage = true
-    // v1.17: 카탈로그를 각각 독립된 페이지네이션 단위로 분리하여 등록
-    // get()을 써야 getManifest()로 받아온 캐시 데이터를 실시간으로 반영함
-    // v1.18: MainPageRequest -> MainPageData로 변경 및 horizontalImages 파라미터 추가
-    override val mainPage: List<MainPageData>
-        get() = cachedManifest?.catalogs?.filter { !it.isSearchRequired() }?.map { 
-            // 생성자 마지막에 horizontalImages = false 추가 (빌드 에러 해결 핵심)
-            MainPageData(it.name ?: it.id, it.toJson(), false) 
-        } ?: listOf(MainPageData(name, "", false))
-
+     
     private var cachedManifest: Manifest? = null
     private var lastManifestUrl: String = ""
     private var lastCacheTime: Long = 0
@@ -125,45 +117,44 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
     override suspend fun getMainPage(
         page: Int,
-        request: MainPageData // v1.18: MainPageRequest에서 MainPageData로 변경
+        request: MainPageRequest
     ): HomePageResponse {
-        println("[v1.18 Debug] getMainPage 실행 - 카탈로그: ${request.name}, 페이지: $page")
         if (mainUrl.isEmpty()) throw IllegalArgumentException("Configure in Extension Settings\n")
         mainUrl = mainUrl.fixSourceUrl()
 
-        // 1. 매니페스트 로드 (24시간 캐시 로직)
-        val manifest = getManifest() ?: throw RuntimeException("Manifest 로드 실패")
-
-        // 2. 현재 요청된 특정 카탈로그 데이터만 추출
-        val catalog = try {
-            parseJson<Catalog>(request.data)
-        } catch (e: Exception) {
-            // 초기 로딩 시 대응
-            manifest.catalogs.firstOrNull { !it.isSearchRequired() }
+        // v1.16: 첫 페이지 로드 시 모든 카탈로그의 중복 기록 초기화
+        if (page <= 1) {
+            catalogSentIds.clear()
+            println("[v1.16 Debug] 첫 페이지 로드 - 카탈로그별 중복 저장소 초기화 완료")
         }
 
-        if (catalog == null) return newHomePageResponse(emptyList(), hasNext = false)
+        val pageSize = 100
+        val skip = (page - 1) * pageSize
+        val manifest = getManifest()
+        val targetCatalogs = manifest?.catalogs?.filter { !it.isSearchRequired() } ?: emptyList()
 
-        // 3. 해당 '줄'의 페이지네이션만 수행 (100개 단위)
-        val skip = (page - 1) * 100
-        
-        // 4. 오직 이 카탈로그 하나만 서버에 접속 (속도 최적화)
-        val row = catalog.toHomePageList(provider = this, skip = skip)
-
-        // 5. 카탈로그별 독립 중복 제거
-        val catalogKey = catalog.id ?: catalog.name ?: "default"
-        val seenForThisCatalog = catalogSentIds.getOrPut(catalogKey) { mutableSetOf() }
-        if (page <= 1) seenForThisCatalog.clear()
-
-        val filteredItems = row.list.filter { item -> seenForThisCatalog.add(item.url) }
-        val finalRow = row.copy(list = filteredItems)
+        val lists = targetCatalogs.amap { catalog ->
+            // 1. 먼저 해당 카탈로그의 데이터를 가져옵니다.
+            val row = catalog.toHomePageList(provider = this, skip = skip)
+            
+            // 2. 이 카탈로그(줄) 전용 중복 저장소를 가져오거나 새로 만듭니다.
+            val catalogKey = catalog.id ?: catalog.name ?: "default"
+            val seenForThisCatalog = catalogSentIds.getOrPut(catalogKey) { mutableSetOf() }
+            
+            // 3. 해당 카탈로그 저장소 내에서만 중복을 체크합니다.
+            val filteredItems = row.list.filter { item ->
+                seenForThisCatalog.add(item.url) // 이 줄에 이미 나온 아이템이면 false 반환
+            }
+            
+            row.copy(list = filteredItems)
+        }.filter { it.list.isNotEmpty() }
 
         return newHomePageResponse(
-            listOf(finalRow),
-            hasNext = finalRow.list.isNotEmpty()
+            lists,
+            hasNext = true
         )
     }
-    
+
     override suspend fun search(query: String): List<SearchResponse> {
         mainUrl = mainUrl.fixSourceUrl()
         
