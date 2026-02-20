@@ -364,6 +364,9 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val type: String?
     )
 
+    private data class TrailerStream(
+        @JsonProperty("ytId") val ytId: String?
+    )
 
     private data class CatalogEntry(
         @JsonProperty("name") val name: String,
@@ -378,6 +381,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         @JsonProperty("genres") val genres: List<String> = emptyList(),
         @JsonProperty("cast") val cast: List<String> = emptyList(),
         @JsonProperty("trailers") val trailersSources: List<Trailer> = emptyList(),
+        @JsonProperty("trailerStreams") val trailerStreams: List<TrailerStream> = emptyList(),
         @JsonProperty("year") val yearNum: String? = null
     ) {
         fun toSearchResponse(provider: StremioC): SearchResponse {
@@ -393,6 +397,10 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
 
         suspend fun toLoadResponse(provider: StremioC, imdbId: String?): LoadResponse {
+            val allTrailers = (trailersSources.mapNotNull { it.source } + trailerStreams.mapNotNull { it.ytId })
+                .distinct()
+                .map { "https://www.youtube.com/watch?v=$it" }
+
             if (videos.isNullOrEmpty()) {
                 return provider.newMovieLoadResponse(
                     name,
@@ -407,7 +415,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     year = yearNum?.toIntOrNull()
                     tags = genre ?: genres
                     addActors(cast)
-                    addTrailer(trailersSources.map { "https://www.youtube.com/watch?v=${it.source}" })
+                    addTrailer(allTrailers)
                     if (imdbId?.startsWith("tt") == true) {
                         addImdbId(imdbId)
                     } else {
@@ -430,11 +438,10 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     year = yearNum?.toIntOrNull()
                     tags = genre ?: genres
                     addActors(cast)
-                    addTrailer(trailersSources.map { "https://www.youtube.com/watch?v=${it.source}" }
-                        .randomOrNull())
+                    addTrailer(allTrailers.randomOrNull())
                     if (imdbId?.startsWith("tt") == true) {
                         addImdbId(imdbId)
-                    } else {
+                    } else {                    
                         println("Kitsu or TMDB ID: $imdbId")
                     }
                 }
