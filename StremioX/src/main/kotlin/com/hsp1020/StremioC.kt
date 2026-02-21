@@ -406,7 +406,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             var fetchedRecommendations: List<SearchResponse>? = null
 
             // API 키 누락을 방지하기 위한 예비(Fallback) 공개 키 할당
-            val tmdbApiKey = BuildConfig.TMDB_API.takeIf { !it.isNullOrBlank() && it != "null" } ?: "109f29bf6312a149c4033af724fc46bc"
+            val tmdbApiKey = BuildConfig.TMDB_API.takeIf { !it.isNullOrBlank() && it != "null" } ?: "cc9982c4801545a1481d167137ea7b53"
 
             try {
                 val isMovie = type == "movie" || videos.isNullOrEmpty()
