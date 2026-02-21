@@ -1,7 +1,4 @@
-// v1.8 - 업데이트 내역: 
-// 1. 불필요한 ShowStatus 절대 경로 하드코딩 제거 및 정상 Import 복구
-// 2. MovieLoadResponse에서 에러를 유발하던 showStatus 할당 로직만 정확히 제거
-package com.phisher98
+package com.hsp1020
 
 import android.util.Log
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -42,9 +39,9 @@ import com.lagradost.cloudstream3.utils.USER_PROVIDER_API
 import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import com.phisher98.StremioC.Companion.TRACKER_LIST_URLS
-import com.phisher98.SubsExtractors.invokeOpenSubs
-import com.phisher98.SubsExtractors.invokeWatchsomuch
+import com.hsp1020.StremioC.Companion.TRACKER_LIST_URLS
+import com.hsp1020.SubsExtractors.invokeOpenSubs
+import com.hsp1020.SubsExtractors.invokeWatchsomuch
 import org.json.JSONObject
 import java.net.URLEncoder
 import java.util.Locale
