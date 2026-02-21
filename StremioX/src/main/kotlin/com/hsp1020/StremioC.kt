@@ -441,7 +441,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                         val rawMediaType = media.mediaType ?: tmdbMediaType
                         val stremioType = if (rawMediaType == "tv") "series" else "movie"
                         
-                        val fakeEntry = CatalogEntry(
+                        val recommendationEntry = CatalogEntry(
                             name = recTitle,
                             id = "tmdb:${media.id}",
                             type = stremioType, 
@@ -455,7 +455,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                         
                         provider.newMovieSearchResponse(
                             recTitle,
-                            fakeEntry.toJson(),
+                            recommendationEntry.toJson(),
                             if (stremioType == "movie") TvType.Movie else TvType.TvSeries
                         ) {
                             this.posterUrl = posterUrl
