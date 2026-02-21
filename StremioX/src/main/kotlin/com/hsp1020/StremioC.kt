@@ -1,4 +1,4 @@
-package com.phisher98
+package com.hsp1020
 
 import android.util.Log
 import com.fasterxml.jackson.annotation.JsonProperty
