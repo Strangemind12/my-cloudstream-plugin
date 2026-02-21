@@ -1,4 +1,7 @@
-package com.hsp1020
+// v1.8 - 업데이트 내역: 
+// 1. 불필요한 ShowStatus 절대 경로 하드코딩 제거 및 정상 Import 복구
+// 2. MovieLoadResponse에서 에러를 유발하던 showStatus 할당 로직만 정확히 제거
+package com.phisher98
 
 import android.util.Log
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -39,9 +42,9 @@ import com.lagradost.cloudstream3.utils.USER_PROVIDER_API
 import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import com.hsp1020.StremioC.Companion.TRACKER_LIST_URLS
-import com.hsp1020.SubsExtractors.invokeOpenSubs
-import com.hsp1020.SubsExtractors.invokeWatchsomuch
+import com.phisher98.StremioC.Companion.TRACKER_LIST_URLS
+import com.phisher98.SubsExtractors.invokeOpenSubs
+import com.phisher98.SubsExtractors.invokeWatchsomuch
 import org.json.JSONObject
 import java.net.URLEncoder
 import java.util.Locale
@@ -207,7 +210,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val normalizedId = normalizeId(loadData.id)
         val encodedId = URLEncoder.encode(normalizedId, "UTF-8")
         
-        println("디버그 [StremioC v1.6]: loadLinks 실행. 최종 확정된 IMDB ID: ${loadData.imdbId}")
+        println("디버그 [StremioC v1.8]: loadLinks 실행. 최종 확정된 IMDB ID: ${loadData.imdbId}")
         
         val request = app.get(buildUrl("/stream/${loadData.type}/$encodedId.json"), timeout = 120L)
 
@@ -412,7 +415,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 .distinct()
                 .map { "https://www.youtube.com/watch?v=$it" }
             
-            // --- [v1.6 수정] 통합 메타데이터 변수 선언 ---
             var fetchedRecommendations: List<SearchResponse>? = null
             var fetchedActors: List<ActorData>? = null
             var fetchedTags: List<String> = genre ?: genres
@@ -420,7 +422,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             var fetchedBackground: String? = background
             var fetchedPlot: String? = description
             var fetchedScore: Score? = Score.from10(imdbRating)
-            var fetchedStatus: ShowStatus? = null
+            var fetchedStatus: ShowStatus? = null // 정상적인 Enum 객체로 복구
             var fetchedDuration: Int? = null
             var combinedTrailers: List<String> = allTrailers
             
@@ -442,13 +444,11 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     if (tmdbId != null) tmdbIdStr = tmdbId.toString()
                 }
 
-                // [v1.6] Similar, Keywords, Credits, Videos, Images 병합 요청
                 if (tmdbIdStr != null) {
-                    println("디버그 [StremioC v1.6]: TMDB 상세 API 요청 (similar, keywords, credits 등 병합)")
+                    println("디버그 [StremioC v1.8]: TMDB 상세 API 요청 (similar, keywords, credits 등 병합)")
                     val detailUrl = "https://api.themoviedb.org/3/$tmdbMediaType/$tmdbIdStr?api_key=$tmdbApiKey&append_to_response=recommendations,similar,keywords,credits,videos,images&include_image_language=en,null"
                     val detailRes = app.get(detailUrl).parsedSafe<TmdbDetailResponse>()
                     
-                    // 1. Recommendations & Similar 합치기
                     val recs = detailRes?.recommendations?.results.orEmpty()
                     val sims = detailRes?.similar?.results.orEmpty()
                     
@@ -478,12 +478,10 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                         }
                     }
 
-                    // 2. Keywords 병합 (태그)
                     val tmdbKeywords = detailRes?.keywords?.results?.mapNotNull { it.name }.orEmpty()
                         .ifEmpty { detailRes?.keywords?.keywords?.mapNotNull { it.name }.orEmpty() }
                     fetchedTags = (tmdbKeywords + fetchedTags).distinct()
 
-                    // 3. Credits 추출 (배우 및 프로필 사진)
                     val tmdbActors = detailRes?.credits?.cast?.mapNotNull { castItem ->
                         val actorName = castItem.name ?: castItem.originalName ?: return@mapNotNull null
                         val profileUrl = castItem.profilePath?.let { "https://image.tmdb.org/t/p/w500$it" }
@@ -493,15 +491,12 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                         fetchedActors = tmdbActors
                     }
 
-                    // 4. Videos 병합 (트레일러)
                     val tmdbTrailers = detailRes?.videos?.results?.mapNotNull { "https://www.youtube.com/watch?v=${it.key}" }.orEmpty()
                     combinedTrailers = (tmdbTrailers + combinedTrailers).distinct()
 
-                    // 5. Images 추출 (로고)
                     fetchedLogoUrl = detailRes?.images?.logos?.firstOrNull { it.iso == "en" }?.filePath?.let { "https://image.tmdb.org/t/p/original$it" }
                         ?: detailRes?.images?.logos?.firstOrNull()?.filePath?.let { "https://image.tmdb.org/t/p/original$it" }
 
-                    // 6. 기본 상세 정보(Plot, Backdrop, Score, Runtime, Status) 덮어쓰기
                     detailRes?.backdropPath?.let { fetchedBackground = "https://image.tmdb.org/t/p/original$it" }
                     detailRes?.overview?.takeIf { it.isNotBlank() }?.let { fetchedPlot = it }
                     detailRes?.voteAverage?.takeIf { it > 0.0 }?.let { fetchedScore = Score.from10(it.toString()) }
@@ -512,13 +507,12 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                         "Ended", "Canceled" -> ShowStatus.Completed
                         else -> null
                     }
-                    println("디버그 [StremioC v1.6]: 병합 완료 (추천/유사작: ${fetchedRecommendations?.size ?: 0}개, 배우: ${fetchedActors?.size ?: 0}명)")
+                    println("디버그 [StremioC v1.8]: 병합 완료 (추천/유사작: ${fetchedRecommendations?.size ?: 0}개, 배우: ${fetchedActors?.size ?: 0}명)")
                 }
             } catch (e: Exception) {
-                println("디버그 [StremioC v1.6]: TMDB API 호출 중 에러 발생 - ${e.message}")
+                println("디버그 [StremioC v1.8]: TMDB API 호출 중 에러 발생 - ${e.message}")
             }
 
-            // TMDB 정보가 빈 경우 기존 Stremio Cast로 Fallback
             val finalActorsList = fetchedActors ?: cast.map { ActorData(Actor(it)) }
 
             if (type == "movie" || videos.isNullOrEmpty()) {
@@ -538,7 +532,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     actors = finalActorsList
                     recommendations = fetchedRecommendations
                     fetchedDuration?.let { this.duration = it }
-                    fetchedStatus?.let { this.ShowStatus = it }
                     addTrailer(combinedTrailers)
                     
                     tmdbIdStr?.let { addTMDbId(it) }
@@ -563,7 +556,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     actors = finalActorsList
                     recommendations = fetchedRecommendations
                     fetchedDuration?.let { this.duration = it }
-                    fetchedStatus?.let { this.ShowStatus = it }
+                    // 시리즈에서만 방영 상태 적용
+                    fetchedStatus?.let { this.showStatus = it }
                     addTrailer(combinedTrailers)
                     
                     tmdbIdStr?.let { addTMDbId(it) }
@@ -686,7 +680,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     }
 }
 
-// --- [v1.6 수정] 메타데이터 확장을 위한 TMDB DTO 클래스 종합 업데이트 ---
 private data class TmdbFindResponse(
     @JsonProperty("movie_results") val movie_results: List<TmdbFindResult>? = null,
     @JsonProperty("tv_results") val tv_results: List<TmdbFindResult>? = null
@@ -763,7 +756,6 @@ private data class TmdbMedia(
     @JsonProperty("poster_path") val posterPath: String? = null,
     @JsonProperty("overview") val overview: String? = null
 )
-// --- [v1.6 끝] ---
 
 suspend fun invokeUindex(
     title: String? = null,
