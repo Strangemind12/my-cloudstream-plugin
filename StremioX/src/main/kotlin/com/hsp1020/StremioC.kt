@@ -9,6 +9,7 @@ import com.lagradost.cloudstream3.HomePageResponse
 import com.lagradost.cloudstream3.LoadResponse
 import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
 import com.lagradost.cloudstream3.LoadResponse.Companion.addImdbId
+import com.lagradost.cloudstream3.LoadResponse.Companion.addTMDbId // v1.0 추가
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.MainPageRequest
@@ -43,7 +44,6 @@ import org.json.JSONObject
 import java.net.URLEncoder
 import java.util.Locale
 
-
 class StremioC(override var mainUrl: String, override var name: String) : MainAPI() {
     override val supportedTypes = setOf(TvType.Others)
     override val hasMainPage = true
@@ -62,7 +62,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         )
         private const val TRACKER_LIST_URL = "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt"
     }
-
 
     private fun baseUrl(): String {
         return mainUrl.substringBefore("?").trimEnd('/')
@@ -295,7 +294,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         return imdbUrlToIdNullable(url) != null
     }
 
-
    private data class Manifest(val catalogs: List<Catalog>)
     
     private data class Extra(
@@ -398,13 +396,68 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             }
         }
 
-
-
         suspend fun toLoadResponse(provider: StremioC, imdbId: String?): LoadResponse {
             val allTrailers = (trailersSources.mapNotNull { it.source } + trailerStreams.mapNotNull { it.ytId })
                 .distinct()
                 .map { "https://www.youtube.com/watch?v=$it" }
             
+            // --- [v1.0 추가] TMDB 연쇄 2단계 호출 및 동기화 식별자 할당 로직 ---
+            var tmdbIdStr: String? = null
+            var fetchedRecommendations: List<SearchResponse>? = null
+
+            if (imdbId?.startsWith("tt") == true) {
+                try {
+                    println("디버그 [StremioC v1.0]: IMDB ID $imdbId 에 대한 TMDB ID 검색 1단계 시작")
+                    val findUrl = "https://api.themoviedb.org/3/find/$imdbId?api_key=${BuildConfig.TMDB_API}&external_source=imdb_id"
+                    val findRes = app.get(findUrl).parsedSafe<TmdbFindResponse>()
+                    
+                    val isMovie = type == "movie" || videos.isNullOrEmpty()
+                    val tmdbMediaType = if (isMovie) "movie" else "tv"
+                    val tmdbId = if (isMovie) findRes?.movie_results?.firstOrNull()?.id else findRes?.tv_results?.firstOrNull()?.id
+                    
+                    if (tmdbId != null) {
+                        tmdbIdStr = tmdbId.toString()
+                        println("디버그 [StremioC v1.0]: TMDB ID $tmdbIdStr 획득 성공. 추천 데이터 요청 2단계 시작")
+                        
+                        val detailUrl = "https://api.themoviedb.org/3/$tmdbMediaType/$tmdbId?api_key=${BuildConfig.TMDB_API}&append_to_response=recommendations"
+                        val detailRes = app.get(detailUrl).parsedSafe<TmdbDetailResponse>()
+                        
+                        fetchedRecommendations = detailRes?.recommendations?.results?.mapNotNull { media ->
+                            val recTitle = media.title ?: media.name ?: media.originalTitle ?: return@mapNotNull null
+                            val posterUrl = if (media.posterPath?.startsWith("/") == true) "https://image.tmdb.org/t/p/original${media.posterPath}" else media.posterPath
+                            val recMediaType = media.mediaType ?: tmdbMediaType
+                            
+                            // StremioC 시스템이 요구하는 규격에 맞게 JSON 직접 작성 (오류 방지)
+                            val fakeEntry = CatalogEntry(
+                                name = recTitle,
+                                id = "tmdb:${media.id}",
+                                type = recMediaType,
+                                poster = posterUrl,
+                                background = null,
+                                description = media.overview,
+                                imdbRating = null,
+                                videos = null,
+                                genre = null
+                            )
+                            
+                            provider.newMovieSearchResponse(
+                                recTitle,
+                                fakeEntry.toJson(),
+                                if (recMediaType == "movie") TvType.Movie else TvType.TvSeries
+                            ) {
+                                this.posterUrl = posterUrl
+                            }
+                        }
+                        println("디버그 [StremioC v1.0]: 추천 목록 ${fetchedRecommendations?.size ?: 0} 개 매핑 완료")
+                    } else {
+                        println("디버그 [StremioC v1.0]: TMDB 검색 결과 없음 (TMDB ID = null)")
+                    }
+                } catch (e: Exception) {
+                    println("디버그 [StremioC v1.0]: TMDB API 호출 중 에러 발생 - ${e.message}")
+                }
+            }
+            // --- [v1.0 끝] ---
+
             if (type == "movie" || videos.isNullOrEmpty()) {
                 return provider.newMovieLoadResponse(
                     name,
@@ -419,11 +472,19 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     year = yearNum?.toIntOrNull()
                     tags = genre ?: genres
                     addActors(cast)
-                    addTrailer(allTrailers)                    
+                    addTrailer(allTrailers)
+                    
+                    // [v1.0 추가] 추천 및 동기화 ID(TMDB/IMDB) 할당 처리
+                    this.recommendations = fetchedRecommendations
+                    if (tmdbIdStr != null) {
+                        println("디버그 [StremioC v1.0]: 트래커 동기화를 위한 TMDB ID ($tmdbIdStr) 등록")
+                        addTMDbId(tmdbIdStr)
+                    }
                     if (imdbId?.startsWith("tt") == true) {
+                        println("디버그 [StremioC v1.0]: 트래커 동기화를 위한 IMDB ID ($imdbId) 등록")
                         addImdbId(imdbId)
                     } else {
-                        println("Kitsu or TMDB ID: $imdbId")
+                        println("디버그 [StremioC v1.0]: Kitsu or TMDB ID: $imdbId")
                     }
                 }
             } else {
@@ -443,14 +504,21 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     tags = genre ?: genres
                     addActors(cast)
                     addTrailer(allTrailers.randomOrNull())
+                    
+                    // [v1.0 추가] 추천 및 동기화 ID(TMDB/IMDB) 할당 처리
+                    this.recommendations = fetchedRecommendations
+                    if (tmdbIdStr != null) {
+                        println("디버그 [StremioC v1.0]: 트래커 동기화를 위한 TMDB ID ($tmdbIdStr) 등록")
+                        addTMDbId(tmdbIdStr)
+                    }
                     if (imdbId?.startsWith("tt") == true) {
+                        println("디버그 [StremioC v1.0]: 트래커 동기화를 위한 IMDB ID ($imdbId) 등록")
                         addImdbId(imdbId)
                     } else {
-                        println("Kitsu or TMDB ID: $imdbId")
+                        println("디버그 [StremioC v1.0]: Kitsu or TMDB ID: $imdbId")
                     }
                 }
             }
-
         }
     }
 
@@ -566,6 +634,36 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         }
     }
 }
+
+// --- [v1.0 추가] TMDB JSON 파싱을 위한 내부 DTO 클래스 ---
+private data class TmdbFindResponse(
+    @JsonProperty("movie_results") val movie_results: List<TmdbFindResult>? = null,
+    @JsonProperty("tv_results") val tv_results: List<TmdbFindResult>? = null
+)
+
+private data class TmdbFindResult(
+    @JsonProperty("id") val id: Int? = null,
+    @JsonProperty("media_type") val media_type: String? = null
+)
+
+private data class TmdbDetailResponse(
+    @JsonProperty("recommendations") val recommendations: TmdbRecommendations? = null
+)
+
+private data class TmdbRecommendations(
+    @JsonProperty("results") val results: List<TmdbMedia>? = null
+)
+
+private data class TmdbMedia(
+    @JsonProperty("id") val id: Int? = null,
+    @JsonProperty("name") val name: String? = null,
+    @JsonProperty("title") val title: String? = null,
+    @JsonProperty("original_title") val originalTitle: String? = null,
+    @JsonProperty("media_type") val mediaType: String? = null,
+    @JsonProperty("poster_path") val posterPath: String? = null,
+    @JsonProperty("overview") val overview: String? = null
+)
+// --- [v1.0 끝] ---
 
 suspend fun invokeUindex(
     title: String? = null,
