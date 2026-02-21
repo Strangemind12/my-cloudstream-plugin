@@ -369,9 +369,16 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         @JsonProperty("title") val title: String? = null
     )
 
+    private data class Link(
+        @JsonProperty("name") val name: String? = null,
+        @JsonProperty("category") val category: String? = null,
+        @JsonProperty("url") val url: String? = null
+    )
+    
     private data class CatalogEntry(
         @JsonProperty("name") val name: String,
         @JsonProperty("id") val id: String,
+        @JsonProperty("links") val links: List<Link> = emptyList(),
         @JsonProperty("poster") val poster: String?,
         @JsonProperty("background") val background: String?,
         @JsonProperty("description") val description: String?,
@@ -395,19 +402,24 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             }
         }
 
-
-
-        suspend fun toLoadResponse(provider: StremioC, imdbId: String?): LoadResponse {
+        suspend fun toLoadResponse(provider: StremioC, requestId: String?): LoadResponse {
             val allTrailers = (trailersSources.mapNotNull { it.source } + trailerStreams.mapNotNull { it.ytId })
                 .distinct()
                 .map { "https://www.youtube.com/watch?v=$it" }
+
+            val extractedImdbId = links.firstOrNull { it.category == "imdb" }?.url?.substringAfterLast("/")?.takeIf { it.startsWith("tt") }
+            val extractedTmdbId = if (this.id.startsWith("tmdb:")) this.id.removePrefix("tmdb:") else null
+            val finalImdbId = extractedImdbId ?: (if (this.id.startsWith("tt")) this.id else null)
+
+            if (extractedTmdbId != null) {
+            }
 
             if (type == "movie" || videos.isNullOrEmpty()) {
                 return provider.newMovieLoadResponse(
                     name,
                     "${provider.mainUrl}/meta/${type}/${id}.json",
                     TvType.Movie,
-                    LoadData(type, id, imdbId = imdbId, year = yearNum?.toIntOrNull())
+                    LoadData(type, id, imdbId = finalImdbId, year = yearNum?.toIntOrNull())
                 ) {
                     posterUrl = poster
                     backgroundPosterUrl = background
@@ -417,10 +429,14 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     tags = genre ?: genres
                     addActors(cast)
                     addTrailer(allTrailers)
-                    if (imdbId?.startsWith("tt") == true) {
-                        addImdbId(imdbId)
-                    } else {
-                        println("Kitsu or TMDB ID: $imdbId")
+                    
+                    finalImdbId?.let { 
+                        if (it.startsWith("tt")) {
+                            addImdbId(it)
+                        }
+                    }
+                    extractedTmdbId?.let { 
+                        addTMDbId(it) 
                     }
                 }
             } else {
@@ -429,7 +445,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     "${provider.mainUrl}/meta/${type}/${id}.json",
                     TvType.TvSeries,
                     videos.map {
-                        it.toEpisode(provider, type, imdbId)
+                        it.toEpisode(provider, type, finalImdbId)
                     }
                 ) {
                     posterUrl = poster
@@ -440,14 +456,17 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     tags = genre ?: genres
                     addActors(cast)
                     addTrailer(allTrailers.randomOrNull())
-                    if (imdbId?.startsWith("tt") == true) {
-                        addImdbId(imdbId)
-                    } else {                    
-                        println("Kitsu or TMDB ID: $imdbId")
+                    
+                    finalImdbId?.let { 
+                        if (it.startsWith("tt")) {
+                            addImdbId(it)
+                        }
+                    }
+                    extractedTmdbId?.let { 
+                        addTMDbId(it) 
                     }
                 }
             }
-
         }
     }
 
