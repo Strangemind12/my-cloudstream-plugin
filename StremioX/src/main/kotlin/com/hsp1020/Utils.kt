@@ -1,4 +1,4 @@
-package com.phisher98
+package com.hsp1020
 
 import com.google.gson.annotations.SerializedName
 import com.lagradost.cloudstream3.APIHolder.unixTimeMS
