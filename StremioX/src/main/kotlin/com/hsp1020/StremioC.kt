@@ -538,7 +538,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     actors = finalActorsList
                     recommendations = fetchedRecommendations
                     fetchedDuration?.let { this.duration = it }
-                    fetchedStatus?.let { this.showStatus = it }
+                    fetchedStatus?.let { this.ShowStatus = it }
                     addTrailer(combinedTrailers)
                     
                     tmdbIdStr?.let { addTMDbId(it) }
@@ -563,7 +563,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     actors = finalActorsList
                     recommendations = fetchedRecommendations
                     fetchedDuration?.let { this.duration = it }
-                    fetchedStatus?.let { this.showStatus = it }
+                    fetchedStatus?.let { this.ShowStatus = it }
                     addTrailer(combinedTrailers)
                     
                     tmdbIdStr?.let { addTMDbId(it) }
