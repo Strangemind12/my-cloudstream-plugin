@@ -1,5 +1,6 @@
-package com.hsp1020
+package com.phisher98
 
+import android.util.Log
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.AcraApplication
 import com.lagradost.cloudstream3.Episode
@@ -35,9 +36,9 @@ import com.lagradost.cloudstream3.utils.USER_PROVIDER_API
 import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import com.hsp1020.StremioC.Companion.TRACKER_LIST_URLS
-import com.hsp1020.SubsExtractors.invokeOpenSubs
-import com.hsp1020.SubsExtractors.invokeWatchsomuch
+import com.phisher98.StremioC.Companion.TRACKER_LIST_URLS
+import com.phisher98.SubsExtractors.invokeOpenSubs
+import com.phisher98.SubsExtractors.invokeWatchsomuch
 import org.json.JSONObject
 import java.net.URLEncoder
 import java.util.Locale
@@ -93,13 +94,14 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
         val res = app.get(currentUrl, timeout = 120L).parsedSafe<Manifest>()
 
-        if (res != null && !res.catalogs.isNullOrEmpty()) {
+        if (res != null && res.catalogs.isNotEmpty()) {
             cachedManifest = res
             lastManifestUrl = currentUrl
             lastCacheTime = now
             pageContentCache.clear()
             catalogSentIds.clear()
         } else {
+            Log.d("Error:","Null")
         }        
         return res ?: cachedManifest
     }
@@ -120,7 +122,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val targetCatalogs = manifest?.catalogs?.filter { !it.isSearchRequired() } ?: emptyList()
 
         val lists = targetCatalogs.amap { catalog ->
-            val catalogKey = catalog.id ?: catalog.name ?: "default"
+            val catalogKey = catalog.id
             val cacheKey = "${catalogKey}_$skip"
 
             val cachedItems = pageContentCache[cacheKey]
@@ -171,8 +173,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             val metaJson = JSONObject(json).getJSONObject("meta").toString()
             parseJson(metaJson)
         }
-
-        val encodedId = URLEncoder.encode(res.id, "UTF-8")
+        val normalizedId = normalizeId(res.id)
+        val encodedId = URLEncoder.encode(normalizedId, "UTF-8")
         val response = app.get(buildUrl("/meta/${res.type}/$encodedId.json"))
             .parsedSafe<CatalogResponse>()
             ?: throw RuntimeException("Failed to load meta")
@@ -201,7 +203,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val loadData = parseJson<LoadData>(data)
-        val encodedId = URLEncoder.encode(loadData.id, "UTF-8")
+        val normalizedId = normalizeId(loadData.id)
+        val encodedId = URLEncoder.encode(normalizedId, "UTF-8")
         val request = app.get(buildUrl("/stream/${loadData.type}/$encodedId.json"), timeout = 120L)
 
         val res = if (request.isSuccessful)
@@ -366,7 +369,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
     private data class TrailerStream(
         @JsonProperty("ytId") val ytId: String?,
-        @JsonProperty("title") val title: String? = null
+        @JsonProperty("title") val title: String? = null        
     )
 
     private data class CatalogEntry(
@@ -401,7 +404,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             val allTrailers = (trailersSources.mapNotNull { it.source } + trailerStreams.mapNotNull { it.ytId })
                 .distinct()
                 .map { "https://www.youtube.com/watch?v=$it" }
-
+            
             if (type == "movie" || videos.isNullOrEmpty()) {
                 return provider.newMovieLoadResponse(
                     name,
@@ -416,7 +419,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     year = yearNum?.toIntOrNull()
                     tags = genre ?: genres
                     addActors(cast)
-                    addTrailer(allTrailers)
+                    addTrailer(allTrailers)                    
                     if (imdbId?.startsWith("tt") == true) {
                         addImdbId(imdbId)
                     } else {
@@ -442,7 +445,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     addTrailer(allTrailers.randomOrNull())
                     if (imdbId?.startsWith("tt") == true) {
                         addImdbId(imdbId)
-                    } else {                    
+                    } else {
                         println("Kitsu or TMDB ID: $imdbId")
                     }
                 }
