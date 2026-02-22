@@ -1,3 +1,4 @@
+// v1.10
 package com.hsp1020
 
 import android.util.Log
@@ -442,7 +443,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 if (tmdbIdStr != null) {
                     val detailAppend = if (isMovie) "recommendations,release_dates,credits,images" else "recommendations,content_ratings,credits,images"
                     val detailUrl = "$tmdbAPI/$tmdbMediaType/$tmdbIdStr?api_key=$apiKey&language=ko-KR&append_to_response=$detailAppend&include_image_language=ko,null"
-                    println("DEBUG [StremioC v1.9]: TMDB 단일 메인 호출 URL = $detailUrl")
+                    println("DEBUG [StremioC v1.10]: TMDB 단일 메인 호출 URL = $detailUrl")
                     
                     val detailRes = app.get(detailUrl).parsedSafe<TmdbDetailResponse>()
                     
@@ -492,13 +493,11 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             if (it.startsWith("/")) "https://image.tmdb.org/t/p/original$it" else it
                         }
                         
-                        // v1.9: 감독/작가를 완벽하게 정렬 (우선순위: Director, Writer > Director > Writer)
                         val crewList = detailRes.credits?.crew?.filter { 
                             it.job == "Director" || it.job == "Writer" 
                         }?.groupBy { it.name ?: it.originalName }?.mapNotNull { (name, roles) ->
                             if (name == null) return@mapNotNull null
                             
-                            // 병합 시 직책 자체도 Director가 먼저 오도록 정렬
                             val sortedJobs = roles.mapNotNull { it.job }.distinct().sortedBy { 
                                 if (it == "Director") 1 else 2 
                             }
@@ -509,15 +508,13 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             }
                             ActorData(Actor(name, img), roleString = combinedJobs)
                         }?.sortedBy { actorData ->
-                            // 인물 정렬: 가중치를 주어 1등, 2등, 3등 명확히 구분
                             when {
-                                actorData.roleString?.contains("Director, Writer") == true -> 1 // 공동 역임
-                                actorData.roleString?.contains("Director") == true -> 2 // 단독 감독
-                                else -> 3 // 단독 작가
+                                actorData.roleString?.contains("Director, Writer") == true -> 1 
+                                actorData.roleString?.contains("Director") == true -> 2 
+                                else -> 3 
                             }
                         } ?: emptyList()
 
-                        // 기존 출연진(Cast) 추출
                         val castList = detailRes.credits?.cast?.mapNotNull { cast ->
                             val actorName = cast.name ?: cast.originalName ?: return@mapNotNull null
                             val profileImg = cast.profilePath?.let { 
@@ -526,16 +523,15 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             ActorData(Actor(actorName, profileImg), roleString = cast.character)
                         } ?: emptyList()
 
-                        // 합쳐진 감독/작가를 출연진 맨 앞에 병합
                         fetchedActors = crewList + castList
 
-                        println("DEBUG [StremioC v1.9]: 메인 데이터 확보 성공 - Runtime: $fetchedRuntime, Age Rating: $fetchedAgeRating, Logo 유무: ${fetchedLogo != null}, 배우/제작진 수: ${fetchedActors?.size}")
+                        println("DEBUG [StremioC v1.10]: 메인 데이터 확보 성공 - Runtime: $fetchedRuntime, Age Rating: $fetchedAgeRating, Logo 유무: ${fetchedLogo != null}, 배우/제작진 수: ${fetchedActors?.size}")
                     }
                     
                     if (!isMovie && !videos.isNullOrEmpty()) {
                         val requiredSeasons = videos.mapNotNull { it.seasonNumber }.distinct().filter { it > 0 }
                         if (requiredSeasons.isNotEmpty()) {
-                            println("DEBUG [StremioC v1.9]: TV 시즌 상세 데이터 병렬 호출 시작 (대상 시즌: $requiredSeasons)")
+                            println("DEBUG [StremioC v1.10]: TV 시즌 상세 데이터 병렬 호출 시작 (대상 시즌: $requiredSeasons)")
                             requiredSeasons.amap { seasonNum ->
                                 try {
                                     val seasonUrl = "$tmdbAPI/tv/$tmdbIdStr/season/$seasonNum?api_key=$apiKey&language=ko-KR"
@@ -546,18 +542,22 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                                         }
                                     }
                                 } catch (e: Exception) {
-                                    println("DEBUG [StremioC v1.9]: 시즌 $seasonNum 호출 실패 - ${e.message}")
+                                    println("DEBUG [StremioC v1.10]: 시즌 $seasonNum 호출 실패 - ${e.message}")
                                 }
                             }
-                            println("DEBUG [StremioC v1.9]: TV 시즌 파싱 완료. 에피소드 ${episodeTmdbMeta.size}개 메타데이터 확보")
+                            println("DEBUG [StremioC v1.10]: TV 시즌 파싱 완료. 에피소드 ${episodeTmdbMeta.size}개 메타데이터 확보")
                         }
                     }
                 }
             } catch (e: Exception) {
-                 println("DEBUG [StremioC v1.9]: TMDB 파싱 중 에러 발생 - ${e.message}")
+                 println("DEBUG [StremioC v1.10]: TMDB 파싱 중 에러 발생 - ${e.message}")
             }
 
-            if (videos.isNullOrEmpty()) {
+            // v1.10: 타입이 movie이면서, videos 배열의 요소가 딱 1개이고 시즌/에피소드가 1인 단일 영화 형태일 경우 식별
+            val isSingleMovieVideo = type == "movie" && videos?.size == 1 && videos[0].seasonNumber == 1 && (videos[0].episode == 1 || videos[0].number == 1)
+
+            // v1.10: 기존 videos.isNullOrEmpty() 조건에 isSingleMovieVideo 조건 추가
+            if (videos.isNullOrEmpty() || isSingleMovieVideo) {
                 return provider.newMovieLoadResponse(
                     name,
                     "${provider.mainUrl}/meta/${type}/${id}.json",
