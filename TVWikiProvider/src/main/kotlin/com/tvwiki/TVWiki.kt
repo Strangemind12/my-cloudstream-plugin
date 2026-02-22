@@ -14,8 +14,12 @@ import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
 
 /**
- * TVWiki Provider v1.5
- * [v1.5 수정 사항]
+ * TVWiki Provider v1.6
+ * [v1.6 수정 사항]
+ * - 상세 페이지 포스터 Fallback 정규식 강화 (tvwiki숫자.net 형태의 메인 URL 무효화 처리)
+ * - 플롯(줄거리) 추출 시 빈 값(Empty)일 경우 "다시보기" 텍스트로 치환되도록 방어 로직 추가
+ * - 주요 실행 흐름 추적을 위한 디버깅 로그 추가
+ * * [v1.5 수정 사항]
  * - 상세 페이지 포스터 Fallback 로직 강화 (애니/예능 포스터 누락 수정)
  * - 사이트가 og:image에 메인 URL이나 'no_image'를 넣을 경우, 이를 무효 처리하고 터널링된 포스터 사용.
  * - toSearchResponse에서 포스터 절대 경로 변환 로직 추가.
@@ -166,7 +170,7 @@ class TVWiki : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        println("[TVWiki v1.5] load 시작 - URL: $url")
+        println("[TVWiki v1.6] load 시작 - URL: $url")
 
         // 1. URL 파라미터(cw_poster) 복원
         var passedPoster: String? = null
@@ -182,7 +186,7 @@ class TVWiki : MainAPI() {
                 if (realUrl.endsWith("?") || realUrl.endsWith("&")) {
                     realUrl = realUrl.dropLast(1)
                 }
-                // println("[TVWiki] 터널링 포스터 복원: $passedPoster")
+                println("[TVWiki v1.6] 터널링 포스터 복원 완료: $passedPoster")
             }
         } catch (e: Exception) {
             e.printStackTrace()
@@ -215,17 +219,19 @@ class TVWiki : MainAPI() {
             ?: doc.selectFirst("meta[property='og:image']")?.attr("content")
             ?: ""
 
-        // [v1.5 핵심 수정] 포스터 유효성 검사 (애니/예능 등에서 사이트 주소가 들어오는 경우 방지)
+        // [v1.6 핵심 수정] 포스터 유효성 검사 (정규식 기반 와일드카드 도메인 차단)
+        val tvwikiMainUrlRegex = Regex("""^https?://tvwiki\d*\.net/?$""")
         val isInvalidPoster = poster.isEmpty() 
             || poster.contains("no3.png") 
             || poster.contains("no_image")
-            || poster == mainUrl // "https://tvwiki5.net" 과 완전히 같으면 가짜
-            || poster == "$mainUrl/" // "https://tvwiki5.net/"
+            || tvwikiMainUrlRegex.matches(poster)
             || poster.endsWith("/") // 디렉토리 경로만 있는 경우
+
+        println("[TVWiki v1.6] 포스터 유효성 검사 - 추출된포스터: $poster / 무효판정여부: $isInvalidPoster")
 
         if (isInvalidPoster) {
             if (passedPoster != null) {
-                // println("[TVWiki] 상세페이지 포스터 무효 -> 목록 포스터 사용")
+                println("[TVWiki v1.6] 상세페이지 포스터 무효 확인. 터널링된 포스터 우선 적용 진행.")
                 poster = passedPoster
             }
         }
@@ -266,7 +272,12 @@ class TVWiki : MainAPI() {
             ?: doc.selectFirst("meta[name='description']")?.attr("content")
             ?: "다시보기"
 
-        if (story.contains("다시보기") && story.contains("무료")) story = "다시보기"
+        // [v1.6 핵심 수정] 줄거리가 빈 문자열인 경우 또는 쓸모없는 텍스트일 경우 확실히 처리
+        if (story.isEmpty() || (story.contains("다시보기") && story.contains("무료"))) {
+            story = "다시보기"
+        }
+        
+        println("[TVWiki v1.6] 최종 적용된 줄거리(Plot) 텍스트 길이: ${story.length}")
         
         val episodes = doc.select("#other_list ul li").mapNotNull { li ->
             val aTag = li.selectFirst("a.ep-link") ?: return@mapNotNull null
