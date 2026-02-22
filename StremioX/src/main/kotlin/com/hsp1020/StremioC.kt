@@ -68,7 +68,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         )
         private const val TRACKER_LIST_URL = "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt"
         private const val tmdbAPI = "https://api.themoviedb.org/3"
-        private const val apiKey = BuildConfig.TMDB_API
+        private const val apiKey = "cc9982c4801545a1481d167137ea7b53"
     }
 
     private fun baseUrl(): String {
