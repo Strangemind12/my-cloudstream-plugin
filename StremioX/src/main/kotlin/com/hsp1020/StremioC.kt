@@ -1,4 +1,4 @@
-// v1.5
+// v1.7
 package com.hsp1020
 
 import android.util.Log
@@ -443,7 +443,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 if (tmdbIdStr != null) {
                     val detailAppend = if (isMovie) "recommendations,release_dates,credits,images" else "recommendations,content_ratings,credits,images"
                     val detailUrl = "$tmdbAPI/$tmdbMediaType/$tmdbIdStr?api_key=$apiKey&language=ko-KR&append_to_response=$detailAppend&include_image_language=ko,null"
-                    println("DEBUG [StremioC v1.5]: TMDB 단일 메인 호출 URL = $detailUrl")
+                    println("DEBUG [StremioC v1.7]: TMDB 단일 메인 호출 URL = $detailUrl")
                     
                     val detailRes = app.get(detailUrl).parsedSafe<TmdbDetailResponse>()
                     
@@ -493,21 +493,40 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             if (it.startsWith("/")) "https://image.tmdb.org/t/p/original$it" else it
                         }
                         
-                        fetchedActors = detailRes.credits?.cast?.mapNotNull { cast ->
+                        // v1.7: 감독(Director)과 작가(Writer)만 추출하고, 한 인물이 두 역할을 맡은 경우 합치기
+                        val crewList = detailRes.credits?.crew?.filter { 
+                            it.job == "Director" || it.job == "Writer" 
+                        }?.groupBy { it.name ?: it.originalName }?.mapNotNull { (name, roles) ->
+                            if (name == null) return@mapNotNull null
+                            
+                            // 동일 인물의 역할을 중복 없이 추출하고 쉼표로 연결
+                            val combinedJobs = roles.mapNotNull { it.job }.distinct().joinToString(", ")
+                            // 프로필 이미지는 해당 인물 데이터 중 존재하는 첫 번째 이미지 사용
+                            val img = roles.firstNotNullOfOrNull { it.profilePath }?.let { 
+                                if (it.startsWith("/")) "https://image.tmdb.org/t/p/original$it" else it 
+                            }
+                            ActorData(Actor(name, img), roleString = combinedJobs)
+                        } ?: emptyList()
+
+                        // 기존 출연진(Cast) 추출
+                        val castList = detailRes.credits?.cast?.mapNotNull { cast ->
                             val actorName = cast.name ?: cast.originalName ?: return@mapNotNull null
                             val profileImg = cast.profilePath?.let { 
                                 if (it.startsWith("/")) "https://image.tmdb.org/t/p/original$it" else it 
                             }
                             ActorData(Actor(actorName, profileImg), roleString = cast.character)
-                        }
+                        } ?: emptyList()
 
-                        println("DEBUG [StremioC v1.5]: 메인 데이터 확보 성공 - Runtime: $fetchedRuntime, Age Rating: $fetchedAgeRating, Logo 유무: ${fetchedLogo != null}, 배우 수: ${fetchedActors?.size}")
+                        // v1.7: 합쳐진 감독/작가를 출연진 맨 앞에 병합
+                        fetchedActors = crewList + castList
+
+                        println("DEBUG [StremioC v1.7]: 메인 데이터 확보 성공 - Runtime: $fetchedRuntime, Age Rating: $fetchedAgeRating, Logo 유무: ${fetchedLogo != null}, 배우/제작진 수: ${fetchedActors?.size}")
                     }
                     
                     if (!isMovie && !videos.isNullOrEmpty()) {
                         val requiredSeasons = videos.mapNotNull { it.seasonNumber }.distinct().filter { it > 0 }
                         if (requiredSeasons.isNotEmpty()) {
-                            println("DEBUG [StremioC v1.5]: TV 시즌 상세 데이터 병렬 호출 시작 (대상 시즌: $requiredSeasons)")
+                            println("DEBUG [StremioC v1.7]: TV 시즌 상세 데이터 병렬 호출 시작 (대상 시즌: $requiredSeasons)")
                             requiredSeasons.amap { seasonNum ->
                                 try {
                                     val seasonUrl = "$tmdbAPI/tv/$tmdbIdStr/season/$seasonNum?api_key=$apiKey&language=ko-KR"
@@ -518,15 +537,15 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                                         }
                                     }
                                 } catch (e: Exception) {
-                                    println("DEBUG [StremioC v1.5]: 시즌 $seasonNum 호출 실패 - ${e.message}")
+                                    println("DEBUG [StremioC v1.7]: 시즌 $seasonNum 호출 실패 - ${e.message}")
                                 }
                             }
-                            println("DEBUG [StremioC v1.5]: TV 시즌 파싱 완료. 에피소드 ${episodeTmdbMeta.size}개 메타데이터 확보")
+                            println("DEBUG [StremioC v1.7]: TV 시즌 파싱 완료. 에피소드 ${episodeTmdbMeta.size}개 메타데이터 확보")
                         }
                     }
                 }
             } catch (e: Exception) {
-                 println("DEBUG [StremioC v1.5]: TMDB 파싱 중 에러 발생 - ${e.message}")
+                 println("DEBUG [StremioC v1.7]: TMDB 파싱 중 에러 발생 - ${e.message}")
             }
 
             if (videos.isNullOrEmpty()) {
@@ -632,7 +651,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 
                 tmdbEp?.airDate?.takeIf { it.isNotBlank() }?.let { this.addDate(it) }
                 tmdbEp?.voteAverage?.takeIf { it > 0.0 }?.let { this.score = Score.from10(it) }
-                // v1.5: 런타임 매핑 추가 (Cloudstream 버전에 따라 보일 수 있음)
                 tmdbEp?.runtime?.let { this.runTime = it }
             }
         }
@@ -766,13 +784,23 @@ private data class TmdbReleaseDate(@JsonProperty("certification") val certificat
 private data class TmdbContentRatings(@JsonProperty("results") val results: List<TmdbContentRatingResult>?)
 private data class TmdbContentRatingResult(@JsonProperty("iso_3166_1") val iso_3166_1: String?, @JsonProperty("rating") val rating: String?)
 
-private data class TmdbCredits(@JsonProperty("cast") val cast: List<TmdbCast>? = null)
+private data class TmdbCredits(
+    @JsonProperty("cast") val cast: List<TmdbCast>? = null,
+    @JsonProperty("crew") val crew: List<TmdbCrew>? = null
+)
 private data class TmdbCast(
     @JsonProperty("name") val name: String?,
     @JsonProperty("original_name") val originalName: String?,
     @JsonProperty("character") val character: String?,
     @JsonProperty("profile_path") val profilePath: String?
 )
+private data class TmdbCrew(
+    @JsonProperty("name") val name: String?,
+    @JsonProperty("original_name") val originalName: String?,
+    @JsonProperty("job") val job: String?,
+    @JsonProperty("profile_path") val profilePath: String?
+)
+
 private data class TmdbImages(@JsonProperty("logos") val logos: List<TmdbLogo>? = null)
 private data class TmdbLogo(@JsonProperty("file_path") val filePath: String?)
 
@@ -783,7 +811,6 @@ private data class TmdbEpisode(
     @JsonProperty("episode_number") val episodeNumber: Int?,
     @JsonProperty("air_date") val airDate: String?,
     @JsonProperty("vote_average") val voteAverage: Double?,
-    // v1.5: 런타임 추출용 파라미터 추가
     @JsonProperty("runtime") val runtime: Int?
 )
 
