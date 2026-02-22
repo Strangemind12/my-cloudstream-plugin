@@ -68,7 +68,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         )
         private const val TRACKER_LIST_URL = "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt"
         private const val tmdbAPI = "https://api.themoviedb.org/3"
-        private const val apiKey = BuildConfig.TMDB_API
+        private const val apiKey = "cc9982c4801545a1481d167137ea7b53"
         
         // v1.20: UI 붕괴 방지용 1x1 투명 픽셀 이미지 (위키미디어 공용 캐시 활용)
         private const val TRANSPARENT_PIXEL = "https://upload.wikimedia.org/wikipedia/commons/c/ca/1x1.png"
