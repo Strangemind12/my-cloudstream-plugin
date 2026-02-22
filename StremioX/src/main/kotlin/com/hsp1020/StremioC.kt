@@ -1,5 +1,5 @@
 // v1.16
-package com.phisher98
+package com.hsp1020
 
 import android.util.Log
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -41,9 +41,9 @@ import com.lagradost.cloudstream3.utils.USER_PROVIDER_API
 import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import com.phisher98.StremioC.Companion.TRACKER_LIST_URLS
-import com.phisher98.SubsExtractors.invokeOpenSubs
-import com.phisher98.SubsExtractors.invokeWatchsomuch
+import com.hsp1020.StremioC.Companion.TRACKER_LIST_URLS
+import com.hsp1020.SubsExtractors.invokeOpenSubs
+import com.hsp1020.SubsExtractors.invokeWatchsomuch
 import org.json.JSONObject
 import java.net.URLEncoder
 import java.util.Locale
