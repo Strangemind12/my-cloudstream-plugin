@@ -703,7 +703,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 this.season = seasonNumber
                 this.episode = this@Video.episode ?: number
 
-                val finalAirDate = tmdbEp?.airDate?.takeIf { it.isNotBlank() } ?: this@Video.firstAired
+                val finalAirDate = tmdbEp?.airDate?.takeIf { it.isNotBlank() } ?: this@Video.released
                 finalAirDate?.takeIf { it.isNotBlank() }?.let { this.addDate(it) }
 
                 tmdbEp?.voteAverage?.takeIf { it > 0.0 }?.let { this.score = Score.from10(it) }
