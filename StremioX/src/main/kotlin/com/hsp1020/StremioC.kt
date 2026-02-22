@@ -536,9 +536,9 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             }
                             val combinedJobs = sortedJobs.joinToString(", ")
                             
-                            // v1.18: 배우 프로필 사진의 OOM(메모리 초과) 방지를 위해 original 대신 w500으로 화질을 낮춰 호출
+                            // v1.18: 배우 프로필 사진의 OOM(메모리 초과) 방지를 위해 original 대신 w300으로 화질을 낮춰 호출
                             val img = roles.firstNotNullOfOrNull { it.profilePath }?.let { 
-                                if (it.startsWith("/")) "https://image.tmdb.org/t/p/w500$it" else it 
+                                if (it.startsWith("/")) "https://image.tmdb.org/t/p/w300$it" else it 
                             }
                             ActorData(Actor(name, img), roleString = combinedJobs)
                         }?.sortedBy { actorData ->
@@ -551,9 +551,9 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
                         val castList = detailRes.credits?.cast?.mapNotNull { cast ->
                             val actorName = cast.name ?: cast.originalName ?: return@mapNotNull null
-                            // v1.18: 배우 프로필 사진의 OOM 방지를 위해 original 대신 w500 적용
+                            // v1.18: 배우 프로필 사진의 OOM 방지를 위해 original 대신 w300 적용
                             val profileImg = cast.profilePath?.let { 
-                                if (it.startsWith("/")) "https://image.tmdb.org/t/p/w500$it" else it 
+                                if (it.startsWith("/")) "https://image.tmdb.org/t/p/w300$it" else it 
                             }
                             ActorData(Actor(actorName, profileImg), roleString = cast.character)
                         } ?: emptyList()
