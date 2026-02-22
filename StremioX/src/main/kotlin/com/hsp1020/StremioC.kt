@@ -702,8 +702,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 this.description = tmdbEp?.overview?.takeIf { it.isNotBlank() } ?: overview ?: this@Video.description
                 this.season = seasonNumber
                 this.episode = this@Video.episode ?: number
-                
-                val finalAirDate = tmdbEp?.airDate?.takeIf { it.isNotBlank() } ?: this@Video.released?.substringBefore("T")
+
+                val finalAirDate = tmdbEp?.airDate?.takeIf { it.isNotBlank() } ?: this@Video.released
                 finalAirDate?.takeIf { it.isNotBlank() }?.let { this.addDate(it) }
 
                 tmdbEp?.voteAverage?.takeIf { it > 0.0 }?.let { this.score = Score.from10(it) }
