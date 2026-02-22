@@ -1,8 +1,11 @@
-package com.hsp1020
+// v1.2
+package com.phisher98
 
 import android.util.Log
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.AcraApplication
+import com.lagradost.cloudstream3.Actor
+import com.lagradost.cloudstream3.ActorData
 import com.lagradost.cloudstream3.Episode
 import com.lagradost.cloudstream3.HomePageList
 import com.lagradost.cloudstream3.HomePageResponse
@@ -17,6 +20,7 @@ import com.lagradost.cloudstream3.Score
 import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
+import com.lagradost.cloudstream3.addDate
 import com.lagradost.cloudstream3.amap
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.imdbUrlToIdNullable
@@ -37,9 +41,9 @@ import com.lagradost.cloudstream3.utils.USER_PROVIDER_API
 import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import com.hsp1020.StremioC.Companion.TRACKER_LIST_URLS
-import com.hsp1020.SubsExtractors.invokeOpenSubs
-import com.hsp1020.SubsExtractors.invokeWatchsomuch
+import com.phisher98.StremioC.Companion.TRACKER_LIST_URLS
+import com.phisher98.SubsExtractors.invokeOpenSubs
+import com.phisher98.SubsExtractors.invokeWatchsomuch
 import org.json.JSONObject
 import java.net.URLEncoder
 import java.util.Locale
@@ -62,7 +66,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         )
         private const val TRACKER_LIST_URL = "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt"
         private const val tmdbAPI = "https://api.themoviedb.org/3"
-        private const val apiKey = "cc9982c4801545a1481d167137ea7b53"
+        private const val apiKey = BuildConfig.TMDB_API
     }
 
     private fun baseUrl(): String {
@@ -410,6 +414,13 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 .map { "https://www.youtube.com/watch?v=$it" }
             
             var fetchedRecommendations: List<SearchResponse>? = null
+            var fetchedRuntime: Int? = null
+            var fetchedAgeRating: String? = null
+            
+            // v1.2: 로고 이미지 및 디테일한 출연진 변수 추가
+            var fetchedLogo: String? = null
+            var fetchedActors: List<ActorData>? = null
+            val episodeTmdbMeta = mutableMapOf<String, TmdbEpisode>()
 
             val extractedImdbId = links.firstOrNull { it.category == "imdb" }?.url?.substringAfterLast("/")?.takeIf { it.startsWith("tt") }
             val extractedTmdbId = if (this.id.startsWith("tmdb:")) this.id.removePrefix("tmdb:") else null
@@ -431,38 +442,96 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 }
 
                 if (tmdbIdStr != null) {
-                    val detailUrl = "$tmdbAPI/$tmdbMediaType/$tmdbIdStr?api_key=$apiKey&append_to_response=recommendations"
+                    // v1.2: API 한번 호출로 credits(출연진), images(로고), recommendations, release_dates 모두 가져옴
+                    val detailAppend = if (isMovie) "recommendations,release_dates,credits,images" else "recommendations,content_ratings,credits,images"
+                    val detailUrl = "$tmdbAPI/$tmdbMediaType/$tmdbIdStr?api_key=$apiKey&append_to_response=$detailAppend&include_image_language=en,null"
+                    println("DEBUG [StremioC v1.2]: TMDB 단일 메인 호출 URL = $detailUrl")
+                    
                     val detailRes = app.get(detailUrl).parsedSafe<TmdbDetailResponse>()
                     
-                    fetchedRecommendations = detailRes?.recommendations?.results?.mapNotNull { media ->
-                        val recTitle = media.title ?: media.name ?: media.originalTitle ?: return@mapNotNull null
-                        val posterUrl = if (media.posterPath?.startsWith("/") == true) "https://image.tmdb.org/t/p/original${media.posterPath}" else media.posterPath
+                    if (detailRes != null) {
+                        fetchedRecommendations = detailRes.recommendations?.results?.mapNotNull { media ->
+                            val recTitle = media.title ?: media.name ?: media.originalTitle ?: return@mapNotNull null
+                            val posterUrl = if (media.posterPath?.startsWith("/") == true) "https://image.tmdb.org/t/p/original${media.posterPath}" else media.posterPath
+                            
+                            val rawMediaType = media.mediaType ?: tmdbMediaType
+                            val stremioType = if (rawMediaType == "tv") "series" else "movie"
+                            
+                            val recommendationEntry = CatalogEntry(
+                                name = recTitle,
+                                id = "tmdb:${media.id}",
+                                type = stremioType, 
+                                poster = posterUrl,
+                                background = null,
+                                description = media.overview,
+                                imdbRating = null,
+                                videos = null,
+                                genre = null
+                            )
+                            
+                            provider.newMovieSearchResponse(
+                                recTitle,
+                                recommendationEntry.toJson(),
+                                if (stremioType == "movie") TvType.Movie else TvType.TvSeries
+                            ) {
+                                this.posterUrl = posterUrl
+                            }
+                        }
+
+                        if (isMovie) {
+                            fetchedRuntime = detailRes.runtime
+                            fetchedAgeRating = detailRes.release_dates?.results
+                                ?.firstOrNull { it.iso_3166_1 == "US" }
+                                ?.release_dates
+                                ?.firstOrNull { !it.certification.isNullOrEmpty() }
+                                ?.certification
+                        } else {
+                            fetchedAgeRating = detailRes.content_ratings?.results
+                                ?.firstOrNull { it.iso_3166_1 == "US" }
+                                ?.rating
+                        }
+
+                        // v1.2: 로고 추출 (가장 첫 번째 이미지 사용)
+                        fetchedLogo = detailRes.images?.logos?.firstOrNull()?.filePath?.let {
+                            if (it.startsWith("/")) "https://image.tmdb.org/t/p/original$it" else it
+                        }
                         
-                        val rawMediaType = media.mediaType ?: tmdbMediaType
-                        val stremioType = if (rawMediaType == "tv") "series" else "movie"
-                        
-                        val recommendationEntry = CatalogEntry(
-                            name = recTitle,
-                            id = "tmdb:${media.id}",
-                            type = stremioType, 
-                            poster = posterUrl,
-                            background = null,
-                            description = media.overview,
-                            imdbRating = null,
-                            videos = null,
-                            genre = null
-                        )
-                        
-                        provider.newMovieSearchResponse(
-                            recTitle,
-                            recommendationEntry.toJson(),
-                            if (stremioType == "movie") TvType.Movie else TvType.TvSeries
-                        ) {
-                            this.posterUrl = posterUrl
+                        // v1.2: 배우 및 배역 상세 추출
+                        fetchedActors = detailRes.credits?.cast?.mapNotNull { cast ->
+                            val actorName = cast.name ?: cast.originalName ?: return@mapNotNull null
+                            val profileImg = cast.profilePath?.let { 
+                                if (it.startsWith("/")) "https://image.tmdb.org/t/p/original$it" else it 
+                            }
+                            ActorData(Actor(actorName, profileImg), roleString = cast.character)
+                        }
+
+                        println("DEBUG [StremioC v1.2]: 메인 데이터 확보 성공 - Runtime: $fetchedRuntime, Age Rating: $fetchedAgeRating, Logo 유무: ${fetchedLogo != null}, 배우 수: ${fetchedActors?.size}")
+                    }
+                    
+                    // v1.2: 에피소드 상세 데이터는 단일 API 호출로 불가하므로, 비동기 병렬 처리(amap)로 시즌 정보 일괄 획득 최적화
+                    if (!isMovie && !videos.isNullOrEmpty()) {
+                        val requiredSeasons = videos.mapNotNull { it.seasonNumber }.distinct().filter { it > 0 }
+                        if (requiredSeasons.isNotEmpty()) {
+                            println("DEBUG [StremioC v1.2]: TV 시즌 상세 데이터 병렬 호출 시작 (대상 시즌: $requiredSeasons)")
+                            requiredSeasons.amap { seasonNum ->
+                                try {
+                                    val seasonUrl = "$tmdbAPI/tv/$tmdbIdStr/season/$seasonNum?api_key=$apiKey"
+                                    val seasonRes = app.get(seasonUrl).parsedSafe<TmdbSeasonDetail>()
+                                    seasonRes?.episodes?.forEach { ep ->
+                                        if (ep.episodeNumber != null) {
+                                            episodeTmdbMeta["${seasonNum}_${ep.episodeNumber}"] = ep
+                                        }
+                                    }
+                                } catch (e: Exception) {
+                                    println("DEBUG [StremioC v1.2]: 시즌 $seasonNum 호출 실패 - ${e.message}")
+                                }
+                            }
+                            println("DEBUG [StremioC v1.2]: TV 시즌 파싱 완료. 에피소드 ${episodeTmdbMeta.size}개 메타데이터 확보")
                         }
                     }
                 }
             } catch (e: Exception) {
+                 println("DEBUG [StremioC v1.2]: TMDB 파싱 중 에러 발생 - ${e.message}")
             }
 
             if (videos.isNullOrEmpty()) {
@@ -478,10 +547,21 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     plot = description
                     year = yearNum?.toIntOrNull()
                     tags = genre ?: genres
-                    addActors(cast)
-                    addTrailer(allTrailers)                    
                     
+                    // v1.2: TMDB 상세 배우 정보 반영 (없으면 기존 텍스트 기반 cast 유지)
+                    if (!fetchedActors.isNullOrEmpty()) {
+                        this.actors = fetchedActors
+                    } else {
+                        addActors(cast)
+                    }
+                    
+                    addTrailer(allTrailers)                    
                     this.recommendations = fetchedRecommendations
+                    this.duration = fetchedRuntime
+                    this.contentRating = fetchedAgeRating
+                    
+                    // v1.2 로고 추가
+                    fetchedLogo?.let { this.logoUrl = it }
                     
                     tmdbIdStr?.let { 
                         addTMDbId(it)
@@ -489,8 +569,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     finalImdbId?.let { 
                         if (it.startsWith("tt")) {
                             addImdbId(it)
-                        } else {
-                            println("Kitsu or TMDB ID: $it")
                         }
                     }
                 }
@@ -500,7 +578,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     "${provider.mainUrl}/meta/${type}/${id}.json",
                     TvType.TvSeries,
                     videos.map {
-                        it.toEpisode(provider, type, finalImdbId)
+                        // v1.2: 병렬로 받아온 episodeTmdbMeta 맵을 넘겨줌
+                        it.toEpisode(provider, type, finalImdbId, episodeTmdbMeta)
                     }
                 ) {
                     posterUrl = poster
@@ -509,10 +588,20 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     plot = description
                     year = yearNum?.toIntOrNull()
                     tags = genre ?: genres
-                    addActors(cast)
-                    addTrailer(allTrailers.randomOrNull())
                     
+                    // v1.2: TMDB 상세 배우 정보 반영
+                    if (!fetchedActors.isNullOrEmpty()) {
+                        this.actors = fetchedActors
+                    } else {
+                        addActors(cast)
+                    }
+                    
+                    addTrailer(allTrailers.randomOrNull())
                     this.recommendations = fetchedRecommendations
+                    this.contentRating = fetchedAgeRating
+                    
+                    // v1.2 로고 추가
+                    fetchedLogo?.let { this.logoUrl = it }
                     
                     tmdbIdStr?.let { 
                         addTMDbId(it)
@@ -520,13 +609,10 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     finalImdbId?.let { 
                         if (it.startsWith("tt")) {
                             addImdbId(it)
-                        } else {
-                            println("Kitsu or TMDB ID: $it")
                         }
                     }
                 }
             }
-
         }
     }
 
@@ -541,15 +627,24 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         @JsonProperty("overview") val overview: String? = null,
         @JsonProperty("description") val description: String? = null,
     ) {
-        fun toEpisode(provider: StremioC, type: String?, imdbId: String?): Episode {
+        // v1.2: tmdbMetaMap 인자 추가 (방영일, 평점 매핑)
+        fun toEpisode(provider: StremioC, type: String?, imdbId: String?, tmdbMetaMap: Map<String, TmdbEpisode>): Episode {
+            val epKey = "${seasonNumber}_${episode ?: number}"
+            val tmdbEp = tmdbMetaMap[epKey]
+            
             return provider.newEpisode(
                 LoadData(type, id, seasonNumber, episode ?: number, imdbId)
             ) {
                 this.name = this@Video.name ?: title
+                // 에피소드 썸네일은 사용자 요청에 따라 애드온에서 제공하는 원본(thumbnail) 유지
                 this.posterUrl = thumbnail
-                this.description = overview ?:  this@Video.description
+                this.description = overview ?: this@Video.description
                 this.season = seasonNumber
-                this.episode =  this@Video.episode ?: number
+                this.episode = this@Video.episode ?: number
+                
+                // v1.2: TMDB 에피소드 방영일 및 평점 적용
+                tmdbEp?.airDate?.takeIf { it.isNotBlank() }?.let { this.addDate(it) }
+                tmdbEp?.voteAverage?.takeIf { it > 0.0 }?.let { this.score = Score.from10(it) }
             }
         }
     }
@@ -653,8 +748,14 @@ private data class TmdbFindResult(
     @JsonProperty("media_type") val media_type: String? = null
 )
 
+// v1.2 신규 파라미터(credits, images) 매핑 구조체 추가
 private data class TmdbDetailResponse(
-    @JsonProperty("recommendations") val recommendations: TmdbRecommendations? = null
+    @JsonProperty("recommendations") val recommendations: TmdbRecommendations? = null,
+    @JsonProperty("runtime") val runtime: Int? = null,
+    @JsonProperty("release_dates") val release_dates: TmdbReleaseDates? = null,
+    @JsonProperty("content_ratings") val content_ratings: TmdbContentRatings? = null,
+    @JsonProperty("credits") val credits: TmdbCredits? = null,
+    @JsonProperty("images") val images: TmdbImages? = null
 )
 
 private data class TmdbRecommendations(
@@ -669,6 +770,31 @@ private data class TmdbMedia(
     @JsonProperty("media_type") val mediaType: String? = null,
     @JsonProperty("poster_path") val posterPath: String? = null,
     @JsonProperty("overview") val overview: String? = null
+)
+
+private data class TmdbReleaseDates(@JsonProperty("results") val results: List<TmdbReleaseDateResult>?)
+private data class TmdbReleaseDateResult(@JsonProperty("iso_3166_1") val iso_3166_1: String?, @JsonProperty("release_dates") val release_dates: List<TmdbReleaseDate>?)
+private data class TmdbReleaseDate(@JsonProperty("certification") val certification: String?)
+private data class TmdbContentRatings(@JsonProperty("results") val results: List<TmdbContentRatingResult>?)
+private data class TmdbContentRatingResult(@JsonProperty("iso_3166_1") val iso_3166_1: String?, @JsonProperty("rating") val rating: String?)
+
+// v1.2 TMDB 추가 데이터 클래스
+private data class TmdbCredits(@JsonProperty("cast") val cast: List<TmdbCast>? = null)
+private data class TmdbCast(
+    @JsonProperty("name") val name: String?,
+    @JsonProperty("original_name") val originalName: String?,
+    @JsonProperty("character") val character: String?,
+    @JsonProperty("profile_path") val profilePath: String?
+)
+private data class TmdbImages(@JsonProperty("logos") val logos: List<TmdbLogo>? = null)
+private data class TmdbLogo(@JsonProperty("file_path") val filePath: String?)
+
+// v1.2 TMDB 시즌 데이터용 클래스
+private data class TmdbSeasonDetail(@JsonProperty("episodes") val episodes: List<TmdbEpisode>? = null)
+private data class TmdbEpisode(
+    @JsonProperty("episode_number") val episodeNumber: Int?,
+    @JsonProperty("air_date") val airDate: String?,
+    @JsonProperty("vote_average") val voteAverage: Double?
 )
 
 suspend fun invokeUindex(
@@ -909,4 +1035,6 @@ suspend fun invokeTorrentio(
             }
         )
     }
+}
+
 }
