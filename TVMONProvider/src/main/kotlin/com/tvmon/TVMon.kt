@@ -4,16 +4,21 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.network.WebViewResolver
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URLDecoder
 import java.net.URLEncoder
+import com.fasterxml.jackson.annotation.JsonProperty
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.RequestBody.Companion.toRequestBody
 
 /**
- * TVMon Provider v1.5
+ * TVMon Provider v1.6
  * [변경 이력]
  * - v1.4: 상세 정보 태그화 도입
  * - v1.5: "공개일" 값이 사라지는 버그 수정 (정규식 정교화 및 태그 정제 로직 보완)
+ * - v1.6: TVWiki와 동일하게 API 기반 세션 처리(create_session.php) 및 WebViewResolver 폴백 적용 (c.html 파싱 실패 오류 수정)
  */
 class TVMon : MainAPI() {
     override var mainUrl = "https://tvmon.site"
@@ -40,8 +45,14 @@ class TVMon : MainAPI() {
         "Upgrade-Insecure-Requests" to "1"
     )
 
-    // [v1.5 수정] 태그 내용 정제용 정규식 (KOTBC와 동일하게 영화/괄호가 포함된 패턴만 타겟팅)
     private val tagCleanRegex = Regex("""\s*(한국|해외)?영화\s*\(\d{4}\).*""")
+
+    data class SessionResponse(
+        @JsonProperty("success") val success: Boolean,
+        @JsonProperty("player_url") val playerUrl: String?,
+        @JsonProperty("t") val t: String?,
+        @JsonProperty("sig") val sig: String?
+    )
 
     override val mainPage = mainPageOf(
         "/kor_movie" to "영화",
@@ -58,7 +69,7 @@ class TVMon : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = "$mainUrl${request.data}?page=$page"
-        println("[TVMon][v1.5] getMainPage 요청: $url")
+        println("[TVMon][v1.6] getMainPage 요청: $url")
         
         return try {
             val doc = app.get(url, headers = commonHeaders).document
@@ -113,7 +124,7 @@ class TVMon : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        println("[TVMon][v1.5] 검색 실행: $query")
+        println("[TVMon][v1.6] 검색 실행: $query")
         val searchUrl = "$mainUrl/search?stx=$query"
         val doc = app.get(searchUrl, headers = commonHeaders).document
         
@@ -125,7 +136,7 @@ class TVMon : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        println("[TVMon][v1.5] 상세 페이지 load 진입: $url")
+        println("[TVMon][v1.6] 상세 페이지 load 진입: $url")
 
         var passedPoster: String? = null
         var realUrl = url
@@ -138,7 +149,6 @@ class TVMon : MainAPI() {
                 passedPoster = URLDecoder.decode(encoded, "UTF-8")
                 realUrl = url.replace(match.value, "")
                 if (realUrl.endsWith("?") || realUrl.endsWith("&")) realUrl = realUrl.dropLast(1)
-                println("[TVMon] 터널링 포스터 주소 복원 성공")
             }
         } catch (e: Exception) { println("[TVMon] 포스터 파라미터 복원 실패: ${e.message}") }
 
@@ -167,29 +177,19 @@ class TVMon : MainAPI() {
         val isInvalidPoster = poster.isEmpty() || poster.contains("no3.png") || poster == mainUrl || poster.endsWith("/")
         if (isInvalidPoster && passedPoster != null) poster = passedPoster
 
-        // --- [v1.5 핵심 수정] 태그 파싱 로직 ---
         val tagsList = mutableListOf<String>()
         
-        // 1. 기본 정보 파싱 (.bo_v_info dd)
         doc.select(".bo_v_info dd").forEach { dd ->
             var text = dd.text().trim()
             if (text.isNotEmpty() && !text.startsWith("제목")) {
-                // 라벨 변경: "개봉년도" -> "공개일"
                 val renamedText = text.replace("개봉년도:", "공개일:")
-                
-                // 데이터 정제: 괄호와 '영화'라는 단어가 포함된 불필요한 패턴만 제거
-                // 예: "장르: 로맨스 한국영화 (2025)" -> "장르: 로맨스"
-                // 예: "공개일: 2024" -> "공개일: 2024" (괄호 없으므로 보존됨)
                 val cleanedText = renamedText.replace(tagCleanRegex, "").trim()
-                
                 if (cleanedText.isNotEmpty()) {
                     tagsList.add(cleanedText)
-                    println("[TVMon] 태그 추가: $cleanedText")
                 }
             }
         }
 
-        // 2. 장르 정보 파싱 (.ctgs dd a)
         val genres = doc.select(".ctgs dd a").filter {
             val txt = it.text()
             !txt.contains("트레일러") && !it.hasClass("btn_watch")
@@ -198,10 +198,8 @@ class TVMon : MainAPI() {
         if (genres.isNotEmpty()) {
             val genreTag = "장르: ${genres.joinToString(", ")}"
             tagsList.add(genreTag)
-            println("[TVMon] 태그 추가: $genreTag")
         }
 
-        // --- 줄거리 파싱 ---
         var story = doc.selectFirst(".story")?.text()?.trim()
             ?: doc.selectFirst(".tmdb-overview")?.text()?.trim()
             ?: doc.selectFirst("meta[name='description']")?.attr("content") ?: "다시보기"
@@ -247,22 +245,50 @@ class TVMon : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("[TVMon][v1.5] loadLinks 진입")
+        println("[TVMon][v1.6] loadLinks 진입")
         val doc = app.get(data, headers = commonHeaders).document
-        val thumbnailHint = extractThumbnailHint(doc)
-        val iframe = doc.selectFirst("iframe#view_iframe")
-        val playerUrl = iframe?.attr("data-player1")?.ifEmpty { null }
-            ?: iframe?.attr("data-player2")?.ifEmpty { null }
-            ?: iframe?.attr("src")
 
-        if (playerUrl != null) {
-            val finalPlayerUrl = fixUrl(playerUrl).replace("&amp;", "&")
-            val extracted = BunnyPoorCdn().extract(finalPlayerUrl, data, subtitleCallback, callback, thumbnailHint)
-            if (extracted) return true
+        // [v1.6 핵심 추가] TVWiki와 동일한 API 세션 파싱 시도
+        if (extractFromApi(doc, data, subtitleCallback, callback)) {
+            return true
         }
 
+        val iframe = doc.selectFirst("iframe#view_iframe")
+        if (iframe != null) {
+            val playerUrl = iframe.attr("data-player1").ifEmpty { iframe.attr("data-player2") }.ifEmpty { iframe.attr("src") }
+            if (playerUrl.contains("player.bunny-frame.online")) {
+                 val extracted = BunnyPoorCdn().extract(fixUrl(playerUrl).replace("&amp;", "&"), data, subtitleCallback, callback, null)
+                 if(extracted) return true
+            }
+        }
+
+        // [v1.6 핵심 추가] WebViewResolver를 통한 동적 Iframe 파싱 시도
+        try {
+            println("[TVMon][v1.6] WebViewResolver를 통한 동적 iframe 추출 시도")
+            val webViewInterceptor = WebViewResolver(
+                Regex("bunny-frame|googleapis"), 
+                timeout = 15000L
+            )
+            val response = app.get(data, headers = commonHeaders, interceptor = webViewInterceptor)
+            val webViewDoc = response.document
+            
+            val wbIframe = webViewDoc.selectFirst("iframe#view_iframe") ?: webViewDoc.selectFirst("iframe[src*='bunny-frame']")
+            if (wbIframe != null) {
+                val playerUrl = wbIframe.attr("src")
+                println("[TVMon][v1.6] WebViewResolver 추출 성공: $playerUrl")
+                if (playerUrl.contains("player.bunny-frame.online")) {
+                     val extracted = BunnyPoorCdn().extract(fixUrl(playerUrl).replace("&amp;", "&"), data, subtitleCallback, callback, null)
+                     if(extracted) return true
+                }
+            }
+        } catch (e: Exception) {
+            println("[TVMon][v1.6] WebViewResolver 추출 예외: ${e.message}")
+        }
+
+        val thumbnailHint = extractThumbnailHint(doc)
         if (thumbnailHint != null) {
             try {
+                println("[TVMon][v1.6] thumbnailHint를 이용한 우회 재생 시도")
                 val pathRegex = Regex("""/v/[a-z]/[a-zA-Z0-9]+""")
                 val pathMatch = pathRegex.find(thumbnailHint)
                 if (pathMatch != null) {
@@ -275,6 +301,40 @@ class TVMon : MainAPI() {
                 }
             } catch (e: Exception) { e.printStackTrace() }
         }
+        return false
+    }
+
+    private suspend fun extractFromApi(
+        doc: Document,
+        refererUrl: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        try {
+            val iframe = doc.selectFirst("iframe#view_iframe") ?: return false
+            val sessionData = iframe.attr("data-session1").ifEmpty { iframe.attr("data-session2") }
+
+            if (sessionData.isNullOrEmpty()) return false
+
+            println("[TVMon][v1.6] 세션 API 요청 시도")
+            val apiUrl = "$mainUrl/api/create_session.php"
+            val headers = commonHeaders.toMutableMap()
+            headers["Content-Type"] = "application/json"
+            headers["X-Requested-With"] = "XMLHttpRequest"
+            headers["Referer"] = refererUrl 
+
+            val requestBody = sessionData.toRequestBody("application/json".toMediaTypeOrNull())
+            val response = app.post(apiUrl, headers = headers, requestBody = requestBody)
+            val json = response.parsedSafe<SessionResponse>()
+
+            if (json != null && json.success && !json.playerUrl.isNullOrEmpty()) {
+                val fullUrl = "${json.playerUrl}?t=${json.t}&sig=${json.sig}"
+                println("[TVMon][v1.6] API 세션 획득 성공. Player URL: $fullUrl")
+                if (fullUrl.contains("player.bunny-frame.online")) {
+                    return BunnyPoorCdn().extract(fullUrl, refererUrl, subtitleCallback, callback, null)
+                }
+            }
+        } catch (e: Exception) { e.printStackTrace() }
         return false
     }
 
