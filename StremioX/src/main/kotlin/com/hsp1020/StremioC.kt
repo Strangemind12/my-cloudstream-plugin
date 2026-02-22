@@ -65,7 +65,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         )
         private const val TRACKER_LIST_URL = "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt"
         private const val tmdbAPI = "https://api.themoviedb.org/3"
-        private const val apiKey = "cc9982c4801545a1481d167137ea7b53"
+        private const val apiKey = BuildConfig.TMDB_API
     }
 
     private fun baseUrl(): String {
@@ -441,7 +441,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
                 if (tmdbIdStr != null) {
                     val detailAppend = if (isMovie) "recommendations,release_dates,credits,images" else "recommendations,content_ratings,credits,images"
-                    val detailUrl = "$tmdbAPI/$tmdbMediaType/$tmdbIdStr?api_key=$apiKey&append_to_response=$detailAppend&include_image_language=ko,null"
+                    val detailUrl = "$tmdbAPI/$tmdbMediaType/$tmdbIdStr?api_key=$apiKey&append_to_response=$detailAppend&include_image_language=en,null"
                     println("DEBUG [StremioC v1.3]: TMDB 단일 메인 호출 URL = $detailUrl")
                     
                     val detailRes = app.get(detailUrl).parsedSafe<TmdbDetailResponse>()
@@ -478,13 +478,13 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                         if (isMovie) {
                             fetchedRuntime = detailRes.runtime
                             fetchedAgeRating = detailRes.release_dates?.results
-                                ?.firstOrNull { it.iso_3166_1 == "KR" }
+                                ?.firstOrNull { it.iso_3166_1 == "US" }
                                 ?.release_dates
                                 ?.firstOrNull { !it.certification.isNullOrEmpty() }
                                 ?.certification
                         } else {
                             fetchedAgeRating = detailRes.content_ratings?.results
-                                ?.firstOrNull { it.iso_3166_1 == "KR" }
+                                ?.firstOrNull { it.iso_3166_1 == "US" }
                                 ?.rating
                         }
 
@@ -809,10 +809,10 @@ suspend fun invokeUindex(
 
     val episodePatterns: List<Regex> = if (isTv && episode != null) {
         val rawPatterns = listOf(
-            String.format(Locale.KR, "S%02dE%02d", season, episode),
+            String.format(Locale.US, "S%02dE%02d", season, episode),
             "S${season}E$episode",
-            String.format(Locale.KR, "S%02dE%d", season, episode),
-            String.format(Locale.KR, "S%dE%02d", season, episode),
+            String.format(Locale.US, "S%02dE%d", season, episode),
+            String.format(Locale.US, "S%dE%02d", season, episode),
         )
 
         rawPatterns.distinct().map {
