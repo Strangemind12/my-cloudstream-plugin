@@ -1,4 +1,4 @@
-// v7.1 - 썸네일 캐시 무효화(Cache Busting) 로직 추가
+// v7.2 - 썸네일 캐시 무효화 및 SSL 인증서 만료(2001) 에러 우회(HTTPS -> HTTP 강제 다운그레이드) 로직 추가
 package com.KingkongTv
 
 import android.net.Uri
@@ -111,7 +111,7 @@ class KingkongTv : MainAPI() {
         val rawRef = uri.getQueryParameter("ref")
         val refererUrl = if (!rawRef.isNullOrBlank()) URLDecoder.decode(rawRef, "UTF-8") else "https://kktv.speed10-1.com/kktv/index.php"
         
-        println("DEBUG [KingkongTv] v7.1: ID=$streamId, Referer=$refererUrl")
+        println("DEBUG [KingkongTv] v7.2: ID=$streamId, Referer=$refererUrl")
 
         val playerPageUrl = "https://kktv.speed10-1.com/kktv/pc_view.php?stream=$streamId"
         
@@ -131,7 +131,7 @@ class KingkongTv : MainAPI() {
             if (m3u8Url == null) {
                 val webrtcMatch = Regex("""['"](webrtc://[^'"]+)['"]""").find(response)?.groupValues?.get(1)
                 if (webrtcMatch != null) {
-                    println("DEBUG [KingkongTv] v7.1: WebRTC 링크 발견 - $webrtcMatch")
+                    println("DEBUG [KingkongTv] v7.2: WebRTC 링크 발견 - $webrtcMatch")
                     m3u8Url = webrtcMatch
                         .replace("webrtc://", "https://")
                         .replace(streamId, "$streamId.m3u8") 
@@ -143,13 +143,22 @@ class KingkongTv : MainAPI() {
                 m3u8Url = "https://play.ogtv3.com/live/$streamId.m3u8?site=kktv"
             }
 
-            println("DEBUG [KingkongTv] v7.1: 최종 M3U8 URL - $m3u8Url")
+            println("DEBUG [KingkongTv] v7.2: 원본 M3U8 URL - $m3u8Url")
+
+            // [추가 로직] v7.2 - SSL 인증서 만료 에러 우회를 위한 다운그레이드 처리
+            val finalUrl = if (m3u8Url != null && m3u8Url!!.contains("play.ogtv3.com") && m3u8Url!!.startsWith("https://")) {
+                val bypassedUrl = m3u8Url!!.replaceFirst("https://", "http://")
+                println("DEBUG [KingkongTv] v7.2: SSL 우회 적용됨 (HTTPS -> HTTP 변경) - $bypassedUrl")
+                bypassedUrl
+            } else {
+                m3u8Url!!
+            }
 
             callback.invoke(
                 newExtractorLink(
                     source = name,
                     name = name,
-                    url = m3u8Url!!,
+                    url = finalUrl,
                     type = ExtractorLinkType.M3U8
                 ) {
                     this.referer = "https://kktv.speed10-1.com/"
@@ -163,7 +172,7 @@ class KingkongTv : MainAPI() {
             )
 
         } catch (e: Exception) {
-            println("DEBUG [KingkongTv] v7.1: 에러 - ${e.message}")
+            println("DEBUG [KingkongTv] v7.2: 에러 - ${e.message}")
             e.printStackTrace()
         }
 
