@@ -1,4 +1,4 @@
-package com.tvwiki
+package com.tvmon
 
 import android.content.Context
 import android.os.Handler
@@ -92,7 +92,7 @@ class BunnyPoorCdn : ExtractorApi() {
                 
                 if (iframeMatch != null) {
                     cleanUrl = iframeMatch.groupValues[1].replace("&amp;", "&").trim()
-                    println("[TVMOM][v1.6] Iframe 링크 발견: $cleanUrl")
+                    println("[TVMON][v1.6] Iframe 링크 발견: $cleanUrl")
                 }
             } catch (e: Exception) { 
                 println("[TVMON][v1.6] Iframe 파싱 중 예외 발생: ${e.message}") 
