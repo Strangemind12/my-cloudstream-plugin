@@ -1,4 +1,3 @@
-// v1.20
 package com.hsp1020
 
 import android.util.Log
