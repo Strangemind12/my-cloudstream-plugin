@@ -1,4 +1,3 @@
-// v1.7
 package com.hsp1020
 
 import android.util.Log
@@ -443,7 +442,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 if (tmdbIdStr != null) {
                     val detailAppend = if (isMovie) "recommendations,release_dates,credits,images" else "recommendations,content_ratings,credits,images"
                     val detailUrl = "$tmdbAPI/$tmdbMediaType/$tmdbIdStr?api_key=$apiKey&language=ko-KR&append_to_response=$detailAppend&include_image_language=ko,null"
-                    println("DEBUG [StremioC v1.7]: TMDB 단일 메인 호출 URL = $detailUrl")
+                    println("DEBUG [StremioC v1.9]: TMDB 단일 메인 호출 URL = $detailUrl")
                     
                     val detailRes = app.get(detailUrl).parsedSafe<TmdbDetailResponse>()
                     
@@ -493,19 +492,29 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             if (it.startsWith("/")) "https://image.tmdb.org/t/p/original$it" else it
                         }
                         
-                        // v1.7: 감독(Director)과 작가(Writer)만 추출하고, 한 인물이 두 역할을 맡은 경우 합치기
+                        // v1.9: 감독/작가를 완벽하게 정렬 (우선순위: Director, Writer > Director > Writer)
                         val crewList = detailRes.credits?.crew?.filter { 
                             it.job == "Director" || it.job == "Writer" 
                         }?.groupBy { it.name ?: it.originalName }?.mapNotNull { (name, roles) ->
                             if (name == null) return@mapNotNull null
                             
-                            // 동일 인물의 역할을 중복 없이 추출하고 쉼표로 연결
-                            val combinedJobs = roles.mapNotNull { it.job }.distinct().joinToString(", ")
-                            // 프로필 이미지는 해당 인물 데이터 중 존재하는 첫 번째 이미지 사용
+                            // 병합 시 직책 자체도 Director가 먼저 오도록 정렬
+                            val sortedJobs = roles.mapNotNull { it.job }.distinct().sortedBy { 
+                                if (it == "Director") 1 else 2 
+                            }
+                            val combinedJobs = sortedJobs.joinToString(", ")
+                            
                             val img = roles.firstNotNullOfOrNull { it.profilePath }?.let { 
                                 if (it.startsWith("/")) "https://image.tmdb.org/t/p/original$it" else it 
                             }
                             ActorData(Actor(name, img), roleString = combinedJobs)
+                        }?.sortedBy { actorData ->
+                            // 인물 정렬: 가중치를 주어 1등, 2등, 3등 명확히 구분
+                            when {
+                                actorData.roleString?.contains("Director, Writer") == true -> 1 // 공동 역임
+                                actorData.roleString?.contains("Director") == true -> 2 // 단독 감독
+                                else -> 3 // 단독 작가
+                            }
                         } ?: emptyList()
 
                         // 기존 출연진(Cast) 추출
@@ -517,16 +526,16 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             ActorData(Actor(actorName, profileImg), roleString = cast.character)
                         } ?: emptyList()
 
-                        // v1.7: 합쳐진 감독/작가를 출연진 맨 앞에 병합
+                        // 합쳐진 감독/작가를 출연진 맨 앞에 병합
                         fetchedActors = crewList + castList
 
-                        println("DEBUG [StremioC v1.7]: 메인 데이터 확보 성공 - Runtime: $fetchedRuntime, Age Rating: $fetchedAgeRating, Logo 유무: ${fetchedLogo != null}, 배우/제작진 수: ${fetchedActors?.size}")
+                        println("DEBUG [StremioC v1.9]: 메인 데이터 확보 성공 - Runtime: $fetchedRuntime, Age Rating: $fetchedAgeRating, Logo 유무: ${fetchedLogo != null}, 배우/제작진 수: ${fetchedActors?.size}")
                     }
                     
                     if (!isMovie && !videos.isNullOrEmpty()) {
                         val requiredSeasons = videos.mapNotNull { it.seasonNumber }.distinct().filter { it > 0 }
                         if (requiredSeasons.isNotEmpty()) {
-                            println("DEBUG [StremioC v1.7]: TV 시즌 상세 데이터 병렬 호출 시작 (대상 시즌: $requiredSeasons)")
+                            println("DEBUG [StremioC v1.9]: TV 시즌 상세 데이터 병렬 호출 시작 (대상 시즌: $requiredSeasons)")
                             requiredSeasons.amap { seasonNum ->
                                 try {
                                     val seasonUrl = "$tmdbAPI/tv/$tmdbIdStr/season/$seasonNum?api_key=$apiKey&language=ko-KR"
@@ -537,15 +546,15 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                                         }
                                     }
                                 } catch (e: Exception) {
-                                    println("DEBUG [StremioC v1.7]: 시즌 $seasonNum 호출 실패 - ${e.message}")
+                                    println("DEBUG [StremioC v1.9]: 시즌 $seasonNum 호출 실패 - ${e.message}")
                                 }
                             }
-                            println("DEBUG [StremioC v1.7]: TV 시즌 파싱 완료. 에피소드 ${episodeTmdbMeta.size}개 메타데이터 확보")
+                            println("DEBUG [StremioC v1.9]: TV 시즌 파싱 완료. 에피소드 ${episodeTmdbMeta.size}개 메타데이터 확보")
                         }
                     }
                 }
             } catch (e: Exception) {
-                 println("DEBUG [StremioC v1.7]: TMDB 파싱 중 에러 발생 - ${e.message}")
+                 println("DEBUG [StremioC v1.9]: TMDB 파싱 중 에러 발생 - ${e.message}")
             }
 
             if (videos.isNullOrEmpty()) {
