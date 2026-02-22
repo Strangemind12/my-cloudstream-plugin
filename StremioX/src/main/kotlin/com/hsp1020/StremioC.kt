@@ -71,7 +71,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         private const val apiKey = BuildConfig.TMDB_API
         
         // v1.20: UI 붕괴 방지용 1x1 투명 픽셀 이미지 (위키미디어 공용 캐시 활용)
-        private const val TRANSPARENT_PIXEL = "https://commons.wikimedia.org/wiki/File:1x1.png#/media/File:1x1.png"
+        private const val TRANSPARENT_PIXEL = "https://upload.wikimedia.org/wikipedia/commons/c/ca/1x1.png"
     }
 
     private fun baseUrl(): String {
