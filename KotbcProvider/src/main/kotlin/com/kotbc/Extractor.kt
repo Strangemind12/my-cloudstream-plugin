@@ -50,7 +50,7 @@ class KotbcExtractor : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         // WebView를 통해 최종 M3U8 URL을 획득
-        val capturedUrl = runWebViewHook(url, referer ?: "https://m137.kotbc2.com/")
+        val capturedUrl = runWebViewHook(url, referer ?: "https://m136.kotbc2.com/")
         
         if (capturedUrl != null) {
             println("[Kotbc] WebView 캡처 성공: $capturedUrl")
