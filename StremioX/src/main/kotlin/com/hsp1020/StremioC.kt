@@ -1,3 +1,4 @@
+// v1.5
 package com.hsp1020
 
 import android.util.Log
@@ -441,8 +442,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
                 if (tmdbIdStr != null) {
                     val detailAppend = if (isMovie) "recommendations,release_dates,credits,images" else "recommendations,content_ratings,credits,images"
-                    val detailUrl = "$tmdbAPI/$tmdbMediaType/$tmdbIdStr?api_key=$apiKey&append_to_response=$detailAppend&include_image_language=ko,null"
-                    println("DEBUG [StremioC v1.3]: TMDB 단일 메인 호출 URL = $detailUrl")
+                    val detailUrl = "$tmdbAPI/$tmdbMediaType/$tmdbIdStr?api_key=$apiKey&language=ko-KR&append_to_response=$detailAppend&include_image_language=ko,null"
+                    println("DEBUG [StremioC v1.5]: TMDB 단일 메인 호출 URL = $detailUrl")
                     
                     val detailRes = app.get(detailUrl).parsedSafe<TmdbDetailResponse>()
                     
@@ -500,16 +501,16 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             ActorData(Actor(actorName, profileImg), roleString = cast.character)
                         }
 
-                        println("DEBUG [StremioC v1.3]: 메인 데이터 확보 성공 - Runtime: $fetchedRuntime, Age Rating: $fetchedAgeRating, Logo 유무: ${fetchedLogo != null}, 배우 수: ${fetchedActors?.size}")
+                        println("DEBUG [StremioC v1.5]: 메인 데이터 확보 성공 - Runtime: $fetchedRuntime, Age Rating: $fetchedAgeRating, Logo 유무: ${fetchedLogo != null}, 배우 수: ${fetchedActors?.size}")
                     }
                     
                     if (!isMovie && !videos.isNullOrEmpty()) {
                         val requiredSeasons = videos.mapNotNull { it.seasonNumber }.distinct().filter { it > 0 }
                         if (requiredSeasons.isNotEmpty()) {
-                            println("DEBUG [StremioC v1.3]: TV 시즌 상세 데이터 병렬 호출 시작 (대상 시즌: $requiredSeasons)")
+                            println("DEBUG [StremioC v1.5]: TV 시즌 상세 데이터 병렬 호출 시작 (대상 시즌: $requiredSeasons)")
                             requiredSeasons.amap { seasonNum ->
                                 try {
-                                    val seasonUrl = "$tmdbAPI/tv/$tmdbIdStr/season/$seasonNum?api_key=$apiKey"
+                                    val seasonUrl = "$tmdbAPI/tv/$tmdbIdStr/season/$seasonNum?api_key=$apiKey&language=ko-KR"
                                     val seasonRes = app.get(seasonUrl).parsedSafe<TmdbSeasonDetail>()
                                     seasonRes?.episodes?.forEach { ep ->
                                         if (ep.episodeNumber != null) {
@@ -517,15 +518,15 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                                         }
                                     }
                                 } catch (e: Exception) {
-                                    println("DEBUG [StremioC v1.3]: 시즌 $seasonNum 호출 실패 - ${e.message}")
+                                    println("DEBUG [StremioC v1.5]: 시즌 $seasonNum 호출 실패 - ${e.message}")
                                 }
                             }
-                            println("DEBUG [StremioC v1.3]: TV 시즌 파싱 완료. 에피소드 ${episodeTmdbMeta.size}개 메타데이터 확보")
+                            println("DEBUG [StremioC v1.5]: TV 시즌 파싱 완료. 에피소드 ${episodeTmdbMeta.size}개 메타데이터 확보")
                         }
                     }
                 }
             } catch (e: Exception) {
-                 println("DEBUG [StremioC v1.3]: TMDB 파싱 중 에러 발생 - ${e.message}")
+                 println("DEBUG [StremioC v1.5]: TMDB 파싱 중 에러 발생 - ${e.message}")
             }
 
             if (videos.isNullOrEmpty()) {
@@ -623,14 +624,16 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             return provider.newEpisode(
                 LoadData(type, id, seasonNumber, episode ?: number, imdbId)
             ) {
-                this.name = this@Video.name ?: title
+                this.name = tmdbEp?.name?.takeIf { it.isNotBlank() } ?: this@Video.name ?: title
                 this.posterUrl = thumbnail
-                this.description = overview ?: this@Video.description
+                this.description = tmdbEp?.overview?.takeIf { it.isNotBlank() } ?: overview ?: this@Video.description
                 this.season = seasonNumber
                 this.episode = this@Video.episode ?: number
                 
                 tmdbEp?.airDate?.takeIf { it.isNotBlank() }?.let { this.addDate(it) }
                 tmdbEp?.voteAverage?.takeIf { it > 0.0 }?.let { this.score = Score.from10(it) }
+                // v1.5: 런타임 매핑 추가 (Cloudstream 버전에 따라 보일 수 있음)
+                tmdbEp?.runtime?.let { this.runTime = it }
             }
         }
     }
@@ -775,9 +778,13 @@ private data class TmdbLogo(@JsonProperty("file_path") val filePath: String?)
 
 private data class TmdbSeasonDetail(@JsonProperty("episodes") val episodes: List<TmdbEpisode>? = null)
 private data class TmdbEpisode(
+    @JsonProperty("name") val name: String?,
+    @JsonProperty("overview") val overview: String?,
     @JsonProperty("episode_number") val episodeNumber: Int?,
     @JsonProperty("air_date") val airDate: String?,
-    @JsonProperty("vote_average") val voteAverage: Double?
+    @JsonProperty("vote_average") val voteAverage: Double?,
+    // v1.5: 런타임 추출용 파라미터 추가
+    @JsonProperty("runtime") val runtime: Int?
 )
 
 suspend fun invokeUindex(
