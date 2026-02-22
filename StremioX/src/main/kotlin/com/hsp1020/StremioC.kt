@@ -523,7 +523,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                         }
 
                         fetchedLogo = detailRes.images?.logos?.firstOrNull()?.filePath?.let {
-                            if (it.startsWith("/")) "https://image.tmdb.org/t/p/original$it" else it
+                            if (it.startsWith("/")) "https://image.tmdb.org/t/p/w500$it" else it
                         }
                         
                         val crewList = detailRes.credits?.crew?.filter { 
