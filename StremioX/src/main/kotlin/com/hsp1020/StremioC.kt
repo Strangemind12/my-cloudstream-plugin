@@ -1,3 +1,4 @@
+// Version: v1.24
 package com.hsp1020
 
 import android.util.Log
@@ -69,7 +70,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         private const val tmdbAPI = "https://api.themoviedb.org/3"
         private const val apiKey = "cc9982c4801545a1481d167137ea7b53"
         
-        // v1.20: UI 붕괴 방지용 1x1 투명 픽셀 이미지 (위키미디어 공용 캐시 활용)
+        // UI 붕괴 방지용 1x1 투명 픽셀 이미지
         private const val TRANSPARENT_PIXEL = "https://upload.wikimedia.org/wikipedia/commons/c/ca/1x1.png"
     }
 
@@ -206,6 +207,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     }
 
     override suspend fun load(url: String): LoadResponse {
+        println("Kitsu or TMDB ID: $url")
         val res: CatalogEntry = if (url.startsWith("{")) {
             parseJson(url)
         } else {
@@ -477,8 +479,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
                 if (tmdbIdStr != null) {
                     val detailAppend = if (isMovie) "recommendations,release_dates,credits,images" else "recommendations,content_ratings,credits,images"
-                    val detailUrl = "$tmdbAPI/$tmdbMediaType/$tmdbIdStr?api_key=$apiKey&language=ko-KR&append_to_response=$detailAppend&include_image_language=ko"
-                    println("DEBUG [StremioC v1.20]: TMDB 단일 메인 호출 URL = $detailUrl")
+                    val detailUrl = "$tmdbAPI/$tmdbMediaType/$tmdbIdStr?api_key=$apiKey&append_to_response=$detailAppend"
                     
                     val detailRes = app.get(detailUrl).parsedSafe<TmdbDetailResponse>()
                     
@@ -514,13 +515,13 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                         if (isMovie) {
                             fetchedRuntime = detailRes.runtime
                             fetchedAgeRating = detailRes.release_dates?.results
-                                ?.firstOrNull { it.iso_3166_1 == "KR" }
+                                ?.firstOrNull { it.iso_3166_1 == "US" }
                                 ?.release_dates
                                 ?.firstOrNull { !it.certification.isNullOrEmpty() }
                                 ?.certification
                         } else {
                             fetchedAgeRating = detailRes.content_ratings?.results
-                                ?.firstOrNull { it.iso_3166_1 == "KR" }
+                                ?.firstOrNull { it.iso_3166_1 == "US" }
                                 ?.rating
                         }
 
@@ -528,7 +529,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             if (it.startsWith("/")) "https://image.tmdb.org/t/p/original$it" else it
                         }
                         
-                        // v1.20: 제작진 목록 파싱 (기존 우선순위 정렬 유지 + 투명 픽셀 Fallback 적용)
                         val crewList = detailRes.credits?.crew?.filter { 
                             it.job == "Director" || it.job == "Writer" 
                         }?.groupBy { it.name ?: it.originalName }?.mapNotNull { (name, roles) ->
@@ -539,7 +539,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             }
                             val combinedJobs = sortedJobs.joinToString(", ")
                             
-                            // 사진이 없으면 TRANSPARENT_PIXEL 삽입
                             val img = roles.firstNotNullOfOrNull { it.profilePath }?.let { 
                                 if (it.startsWith("/")) "https://image.tmdb.org/t/p/w500$it" else it 
                             } ?: TRANSPARENT_PIXEL
@@ -553,10 +552,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             }
                         } ?: emptyList()
 
-                        // v1.20: 출연진 목록 파싱 (투명 픽셀 Fallback 적용)
                         val castList = detailRes.credits?.cast?.mapNotNull { cast ->
                             val actorName = cast.name ?: cast.originalName ?: return@mapNotNull null
-                            // 사진이 없으면 TRANSPARENT_PIXEL 삽입
                             val profileImg = cast.profilePath?.let { 
                                 if (it.startsWith("/")) "https://image.tmdb.org/t/p/w500$it" else it 
                             } ?: TRANSPARENT_PIXEL
@@ -564,19 +561,16 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             ActorData(Actor(actorName, profileImg), roleString = cast.character)
                         } ?: emptyList()
 
-                        // 순서 섞지 않고 제작진 뒤에 출연진 그대로 병합
                         fetchedActors = crewList + castList
 
-                        println("DEBUG [StremioC v1.20]: 메인 데이터 확보 성공 - Runtime: $fetchedRuntime, Age Rating: $fetchedAgeRating, Logo 유무: ${fetchedLogo != null}, 배우/제작진 수: ${fetchedActors?.size}")
                     }
                     
                     if (!isMovie && !videos.isNullOrEmpty()) {
                         val requiredSeasons = videos.mapNotNull { it.seasonNumber }.distinct().filter { it > 0 }
                         if (requiredSeasons.isNotEmpty()) {
-                            println("DEBUG [StremioC v1.20]: TV 시즌 상세 데이터 병렬 호출 시작 (대상 시즌: $requiredSeasons)")
                             requiredSeasons.amap { seasonNum ->
                                 try {
-                                    val seasonUrl = "$tmdbAPI/tv/$tmdbIdStr/season/$seasonNum?api_key=$apiKey&language=ko-KR"
+                                    val seasonUrl = "$tmdbAPI/tv/$tmdbIdStr/season/$seasonNum?api_key=$apiKey"
                                     val seasonRes = app.get(seasonUrl).parsedSafe<TmdbSeasonDetail>()
                                     seasonRes?.episodes?.forEach { ep ->
                                         if (ep.episodeNumber != null) {
@@ -584,15 +578,12 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                                         }
                                     }
                                 } catch (e: Exception) {
-                                    println("DEBUG [StremioC v1.20]: 시즌 $seasonNum 호출 실패 - ${e.message}")
                                 }
                             }
-                            println("DEBUG [StremioC v1.20]: TV 시즌 파싱 완료. 에피소드 ${episodeTmdbMeta.size}개 메타데이터 확보")
                         }
                     }
                 }
             } catch (e: Exception) {
-                 println("DEBUG [StremioC v1.20]: TMDB 파싱 중 에러 발생 - ${e.message}")
             }
 
             val isSingleMovieVideo = type == "movie" && videos?.size == 1 && videos[0].seasonNumber == 1 && (videos[0].episode == 1 || videos[0].number == 1)
