@@ -113,7 +113,7 @@ class Anilife : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("$TAG [LoadLinks] =================== v84.0 (Ultimate Hybrid Hooking) ===================")
+        println("$TAG [LoadLinks] =================== v86.0 (Blind Proxy) ===================")
         
         var cleanData = data.substringBefore("?poster=")
         var detailReferer = "$mainUrl/"
@@ -146,6 +146,7 @@ class Anilife : MainAPI() {
             val finalCookies = CookieManager.getInstance().getCookie("https://anilife.live") ?: ""
             var xUserSsid: String? = null
             var finalM3u8: String? = null
+            var targetKeyUrl: String? = null
 
             if (sniffedUrl.contains("/m3u8/st/")) {
                 val apiResponse = app.get(
@@ -154,18 +155,34 @@ class Anilife : MainAPI() {
                 )
                 xUserSsid = apiResponse.headers["x-user-ssid"] ?: apiResponse.headers["X-User-Ssid"]
                 val match = Regex("""https://api\.gcdn\.app/v1/manifest/[^"']+""").find(apiResponse.text)
-                if (match != null) finalM3u8 = match.value.replace("\\/", "/")
+                if (match != null) {
+                    finalM3u8 = match.value.replace("\\/", "/")
+                    
+                    // M3U8에서 타겟 키 URL 파싱
+                    try {
+                        val m3u8Txt = app.get(finalM3u8, headers = mapOf("User-Agent" to pcUserAgent, "Referer" to "https://anilife.live/")).text
+                        val kMatch = Regex("""URI="([^"]+)"""").find(m3u8Txt)
+                        if (kMatch != null) {
+                            var kUrl = kMatch.groupValues[1]
+                            if (!kUrl.startsWith("http")) {
+                                kUrl = if (kUrl.startsWith("/")) "https://api.gcdn.app$kUrl" else finalM3u8.substringBeforeLast("/") + "/" + kUrl
+                            }
+                            targetKeyUrl = kUrl
+                        }
+                    } catch (e: Exception) {}
+                }
             } else {
                 finalM3u8 = sniffedUrl
             }
 
             if (finalM3u8 != null) {
                 return AnilifeProxyExtractor().extractWithProxy(
-                    m3u8Url = finalM3u8!!,
+                    m3u8Url = finalM3u8,
                     playerUrl = playerUrl,
                     referer = "https://anilife.live/",
                     ssid = xUserSsid,
                     cookies = finalCookies,
+                    targetKeyUrl = targetKeyUrl, // 키 URL 추가
                     callback = callback
                 )
             }
