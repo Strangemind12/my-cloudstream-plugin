@@ -688,6 +688,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         @JsonProperty("thumbnail") val thumbnail: String? = null,
         @JsonProperty("overview") val overview: String? = null,
         @JsonProperty("description") val description: String? = null,
+        @JsonProperty("firstAired") val firstAired: String? = null,
         @JsonProperty("released") val released: String? = null,
     ) {
         fun toEpisode(provider: StremioC, type: String?, imdbId: String?, tmdbMetaMap: Map<String, TmdbEpisode>): Episode {
@@ -703,7 +704,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 this.season = seasonNumber
                 this.episode = this@Video.episode ?: number
 
-                val finalAirDate = tmdbEp?.airDate?.takeIf { it.isNotBlank() } ?: this@Video.released
+                val finalAirDate = tmdbEp?.airDate?.takeIf { it.isNotBlank() } ?: this@Video.firstAired
                 finalAirDate?.takeIf { it.isNotBlank() }?.let { this.addDate(it) }
 
                 tmdbEp?.voteAverage?.takeIf { it > 0.0 }?.let { this.score = Score.from10(it) }
