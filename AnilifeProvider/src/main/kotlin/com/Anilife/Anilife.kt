@@ -113,7 +113,7 @@ class Anilife : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("$TAG [LoadLinks] =================== v83.0 (TVWiki+MovieKing Architecture) ===================")
+        println("$TAG [LoadLinks] =================== v84.0 (Ultimate Hybrid Hooking) ===================")
         
         var cleanData = data.substringBefore("?poster=")
         var detailReferer = "$mainUrl/"
