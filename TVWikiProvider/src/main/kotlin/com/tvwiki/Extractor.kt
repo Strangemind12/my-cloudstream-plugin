@@ -1,456 +1,178 @@
-package com.tvwiki
+package com.anilife
 
-import android.content.Context
-import android.os.Handler
-import android.os.Looper
-import android.webkit.ConsoleMessage
-import android.webkit.WebChromeClient
-import android.webkit.WebResourceRequest
-import android.webkit.WebResourceResponse
-import android.webkit.WebView
-import android.webkit.WebViewClient
+import android.util.Base64
 import android.webkit.CookieManager
-import com.fasterxml.jackson.annotation.JsonProperty
-import com.lagradost.cloudstream3.SubtitleFile
-import com.lagradost.cloudstream3.app
-import com.lagradost.cloudstream3.AcraApplication
-import com.lagradost.cloudstream3.utils.ExtractorApi
-import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.mapper
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.suspendCancellableCoroutine
-import java.io.BufferedReader
-import java.io.InputStreamReader
-import java.net.HttpURLConnection
-import java.net.URL
-import java.net.ServerSocket
-import java.net.Socket
-import java.net.URI
-import java.net.URLDecoder
-import java.util.Collections
-import javax.crypto.Cipher
-import javax.crypto.spec.IvParameterSpec
-import javax.crypto.spec.SecretKeySpec
-import kotlin.concurrent.thread
-import kotlin.coroutines.resume
+import com.lagradost.cloudstream3.network.WebViewResolver
+import org.jsoup.nodes.Document
 
-/**
- * Version: v1.6 (Hybrid Proxy)
- * Modification:
- * 1. [PERF] 무거운 프록시 방식에서 하이브리드 프록시로 전환.
- * 2. [PERF] /seg 중계 엔드포인트 제거. TS 세그먼트는 ExoPlayer가 원본 CDN에서 직접 다운로드.
- * 3. [FIX] M3U8 리라이팅 시 세그먼트를 직접 링크로 주입하고, Key만 /key.bin으로 로컬 프록시 서빙.
- */
-class BunnyPoorCdn : ExtractorApi() {
-    override val name = "TVWiki"
-    override val mainUrl = "https://player.bunny-frame.online"
-    override val requiresReferer = true
-    
-    private val DESKTOP_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+class Anilife : MainAPI() {
+    override var mainUrl = "https://anilife.live"
+    override var name = "Anilife"
+    override val hasMainPage = true
+    override var lang = "ko"
+    override val supportedTypes = setOf(TvType.Anime)
 
-    companion object {
-        @Volatile private var currentProxyServer: ProxyWebServer? = null
+    private val TAG = "[Anilife]"
+    private val pcUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
+
+    private val commonHeaders = mapOf(
+        "User-Agent" to pcUserAgent,
+        "Referer" to "$mainUrl/"
+    )
+
+    override val mainPage = mainPageOf(
+        "/top20" to "실시간 TOP 20",
+        "/vodtype/categorize/TV/1" to "TV 애니메이션",
+        "/vodtype/categorize/OVA/1" to "OVA",
+        "/vodtype/categorize/ONA/1" to "ONA",
+        "/vodtype/categorize/Web/1" to "Web",
+        "/vodtype/categorize/SP/1" to "SP",
+        "/vodtype/categorize/Movie/1" to "극장판"
+    )
+
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        val url = if (request.name.contains("TOP 20")) "$mainUrl${request.data}" 
+                  else "$mainUrl${request.data.substringBeforeLast("/")}/$page"
+        
+        return try {
+            val doc = app.get(url, headers = commonHeaders).document
+            newHomePageResponse(request.name, parseCommonList(doc))
+        } catch (e: Exception) {
+            newHomePageResponse(request.name, emptyList())
+        }
     }
 
-    override suspend fun getUrl(
-        url: String,
-        referer: String?,
+    private fun parseCommonList(doc: Document): List<SearchResponse> {
+        return doc.select(".listupd > article.bs").mapNotNull { element ->
+            try {
+                val aTag = element.selectFirst("div.bsx > a") ?: return@mapNotNull null
+                val rawHref = fixUrl(aTag.attr("href"))
+                val title = (element.selectFirst(".tt h2") ?: element.selectFirst(".tt"))?.text()?.trim() ?: "Unknown"
+                val imgTag = element.selectFirst("img")
+                var poster = imgTag?.attr("src") ?: imgTag?.attr("data-src") ?: ""
+                poster = fixUrl(poster)
+                val finalHref = if (poster.isNotEmpty()) {
+                    val encoded = Base64.encodeToString(poster.toByteArray(), Base64.NO_WRAP)
+                    if (rawHref.contains("?")) "$rawHref&poster=$encoded" else "$rawHref?poster=$encoded"
+                } else rawHref
+                newAnimeSearchResponse(title, finalHref, TvType.Anime) {
+                    this.posterUrl = poster
+                    this.posterHeaders = commonHeaders
+                }
+            } catch (e: Exception) { null }
+        }
+    }
+
+    override suspend fun search(query: String): List<SearchResponse> {
+        return parseCommonList(app.get("$mainUrl/search?keyword=$query", headers = commonHeaders).document)
+    }
+
+    override suspend fun load(url: String): LoadResponse {
+        var tunnelingPoster: String? = null
+        val cleanUrl = if (url.contains("poster=")) {
+            val posterParam = url.substringAfter("poster=")
+            tunnelingPoster = String(Base64.decode(posterParam.substringBefore("&"), Base64.NO_WRAP))
+            url.substringBefore("?poster=")
+        } else url
+
+        val response = app.get(cleanUrl, headers = commonHeaders)
+        val doc = response.document
+        val finalUrl = response.url
+        val encodedRef = Base64.encodeToString(finalUrl.toByteArray(), Base64.NO_WRAP)
+
+        val title = doc.selectFirst(".entry-title")?.text()?.trim() ?: "Unknown"
+        val plot = doc.selectFirst(".synp .entry-content")?.text()?.trim()
+        val tags = doc.select(".genxed a").map { it.text() }
+
+        val episodes = doc.select(".eplister > ul > li > a").mapNotNull { element ->
+            val rawHref = fixUrl(element.attr("href"))
+            val numText = element.selectFirst(".epl-num")?.text()?.trim() ?: ""
+            val epTitle = element.selectFirst(".epl-title")?.text()?.trim() ?: ""
+            val fullName = if (numText.isNotEmpty()) "${numText}화 - $epTitle" else epTitle
+            val finalHref = if (rawHref.contains("?")) "$rawHref&ref=$encodedRef" else "$rawHref?ref=$encodedRef"
+            newEpisode(finalHref) {
+                this.name = fullName
+                this.episode = numText.toIntOrNull()
+            }
+        }.reversed()
+
+        return newAnimeLoadResponse(title, cleanUrl, TvType.Anime) {
+            this.posterUrl = doc.selectFirst(".thumb img")?.attr("src") ?: tunnelingPoster
+            this.posterHeaders = commonHeaders
+            this.plot = plot
+            this.tags = tags
+            addEpisodes(DubStatus.Subbed, episodes)
+        }
+    }
+
+    override suspend fun loadLinks(
+        data: String,
+        isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
-    ) {
-        println("[TVWiki][v1.6] getUrl 호출됨. URL: $url")
-        extract(url, referer, subtitleCallback, callback)
-    }
-
-    suspend fun extract(
-        url: String,
-        referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit,
-        thumbnailHint: String? = null,
     ): Boolean {
-        synchronized(this) {
-            if (currentProxyServer != null) {
-                println("[TVWiki][v1.6] 기존 실행 중인 프록시 서버 종료 시도.")
-                currentProxyServer?.stop()
-                currentProxyServer = null
-            }
-        }
-
-        println("[TVWiki][v1.6] extract() 로직 시작.")
-        var cleanUrl = url.replace(Regex("[\\r\\n\\s]"), "").trim()
-        val cleanReferer = referer?.replace(Regex("[\\r\\n\\s]"), "")?.trim() ?: "https://tvwiki5.net/"
+        println("$TAG [LoadLinks] =================== v83.0 (TVWiki+MovieKing Architecture) ===================")
         
-        if (!cleanUrl.contains("v/f/") && !cleanUrl.contains("v/e/") && !cleanUrl.contains("v/d/")) {
-            println("[TVWiki][v1.6] Referer 페이지($cleanReferer)에서 iframe 링크 탐색 시도.")
+        var cleanData = data.substringBefore("?poster=")
+        var detailReferer = "$mainUrl/"
+        if (cleanData.contains("ref=")) {
             try {
-                val refRes = app.get(cleanReferer, headers = mapOf("User-Agent" to DESKTOP_UA))
-                val iframeMatch = Regex("""src=['"](https://player\.bunny-frame\.online/[^"']+)['"]""").find(refRes.text)
-                    ?: Regex("""data-player\d*=['"](https://player\.bunny-frame\.online/[^"']+)['"]""").find(refRes.text)
-                
-                if (iframeMatch != null) {
-                    cleanUrl = iframeMatch.groupValues[1].replace("&amp;", "&").trim()
-                    println("[TVWiki][v1.6] Iframe 링크 발견: $cleanUrl")
-                }
-            } catch (e: Exception) { 
-                println("[TVWiki][v1.6] Iframe 파싱 중 예외 발생: ${e.message}") 
-            }
+                val refEncoded = cleanData.substringAfter("ref=").substringBefore("&")
+                detailReferer = String(Base64.decode(refEncoded, Base64.NO_WRAP))
+                cleanData = cleanData.substringBefore("?ref=").substringBefore("&ref=")
+            } catch (e: Exception) { }
         }
 
-        var capturedUrl: String? = cleanUrl
-        val currentSessionKeys = Collections.synchronizedSet(mutableSetOf<String>())
-
-        if (!cleanUrl.contains("/c.html")) {
-            println("[TVWiki][v1.6] WebView 훅 실행 필요. runWebViewHook 호출.")
-            val webViewResult = runWebViewHook(cleanUrl, cleanReferer, currentSessionKeys)
-            if (webViewResult != null) {
-                capturedUrl = webViewResult
-                println("[TVWiki][v1.6] WebView 훅 성공. 캡처된 URL: $capturedUrl")
-            }
-        }
-
-        if (capturedUrl != null) {
-            val cookie = CookieManager.getInstance().getCookie(capturedUrl)
-            val headers = mutableMapOf(
-                "User-Agent" to DESKTOP_UA,
-                "Referer" to "https://player.bunny-frame.online/",
-                "Origin" to "https://player.bunny-frame.online"
+        try {
+            val webResponse = app.get(
+                cleanData, 
+                headers = mapOf("Referer" to detailReferer, "User-Agent" to pcUserAgent), 
+                interceptor = WebViewResolver(Regex(".*"))
             )
-            if (!cookie.isNullOrEmpty()) headers["Cookie"] = cookie
 
-            try {
-                println("[TVWiki][v1.6] M3U8 플레이리스트 분석 시작.")
-                var requestUrl = capturedUrl!!.substringBefore("#")
-                
-                var response = app.get(requestUrl, headers = headers)
-                var content = response.text.trim()
+            val playerUrl = AnilifeProxyExtractor().extractPlayerUrl(webResponse.text, mainUrl) ?: return false
+            println("$TAG [Step 2] 원본 플레이어 URL: $playerUrl")
 
-                if (!content.startsWith("#EXTM3U")) {
-                    Regex("""(https?://[^"']+\.m3u8[^"']*)""").find(content)?.let {
-                        requestUrl = it.groupValues[1]
-                        content = app.get(requestUrl, headers = headers).text.trim()
-                    }
-                }
+            val gcdnInterceptor = WebViewResolver(Regex(""".*api\.gcdn\.app.*"""))
+            val gcdnResponse = app.get(
+                playerUrl,
+                headers = mapOf("User-Agent" to pcUserAgent, "Referer" to webResponse.url),
+                interceptor = gcdnInterceptor
+            )
+            val sniffedUrl = gcdnResponse.url
 
-                if (content.contains("#EXT-X-STREAM-INF")) {
-                    val subUrlLine = content.lines().lastOrNull { it.isNotBlank() && !it.startsWith("#") }
-                    if (subUrlLine != null) {
-                        val originalUri = try { URI(requestUrl) } catch (e: Exception) { null }
-                        requestUrl = resolveUrl(originalUri, requestUrl, subUrlLine)
-                        content = app.get(requestUrl, headers = headers).text.trim()
-                    }
-                }
+            val finalCookies = CookieManager.getInstance().getCookie("https://anilife.live") ?: ""
+            var xUserSsid: String? = null
+            var finalM3u8: String? = null
 
-                val isKey7 = content.lines().any { it.startsWith("#EXT-X-KEY") && it.contains("/v/key7") }
-
-                if (isKey7) {
-                    println("[TVWiki][v1.6] 암호화 감지됨. 하이브리드 로컬 프록시 구성 시작.")
-                    val newProxy = ProxyWebServer(currentSessionKeys).apply { 
-                        start()
-                        updateSession(headers) 
-                    }
-                    currentProxyServer = newProxy
-
-                    val videoId = Regex("""/v/[ef]/([^/]+)""").find(capturedUrl!!)?.groupValues?.get(1) ?: "video"
-                    val ivMatch = Regex("""IV=("?)(0x[0-9a-fA-F]+)\1""").find(content)
-                    val ivHex = ivMatch?.groupValues?.get(2) ?: "0x00000000000000000000000000000000"
-                    val parsedIv = ivHex.removePrefix("0x").hexToByteArray()
-                    
-                    newProxy.setIv(parsedIv)
-
-                    val baseUri = try { URI(requestUrl) } catch (e: Exception) { null }
-                    val sb = StringBuilder()
-                    
-                    println("[TVWiki][v1.6] 하이브리드 M3U8 라인 리라이팅 시작.")
-                    content.lines().forEach { line ->
-                        val trimmed = line.trim()
-                        if (trimmed.isEmpty()) return@forEach
-                        if (trimmed.startsWith("#")) {
-                            if (trimmed.startsWith("#EXT-X-KEY") && trimmed.contains("/v/key7")) {
-                                val match = Regex("""URI="([^"]+)"""").find(trimmed)
-                                if (match != null) {
-                                    // 하이브리드 핵심 1: Key는 로컬 프록시에서 서빙
-                                    val newKeyLine = trimmed.replace(match.groupValues[1], "http://127.0.0.1:${newProxy.port}/key.bin")
-                                    sb.append(newKeyLine).append("\n")
-                                } else sb.append(trimmed).append("\n")
-                            } else sb.append(trimmed).append("\n")
-                        } else {
-                            // 하이브리드 핵심 2: 세그먼트는 절대 프록시를 거치지 않고 원본 다이렉트 링크 주입
-                            val absSeg = resolveUrl(baseUri, requestUrl, trimmed)
-                            newProxy.setTestSegment(absSeg) // 첫 세그먼트는 키 검증용 샘플로만 사용
-                            sb.append(absSeg).append("\n")
-                        }
-                    }
-                    
-                    newProxy.setPlaylist(sb.toString())
-                    
-                    val finalUrl = "http://127.0.0.1:${newProxy.port}/$videoId/playlist.m3u8"
-                    println("[TVWiki][v1.6] 하이브리드 URL 반환: $finalUrl")
-                    
-                    callback(newExtractorLink(name, name, finalUrl, ExtractorLinkType.M3U8) {
-                        this.referer = "https://player.bunny-frame.online/"; this.headers = headers
-                    })
-                    return true
-                } else {
-                    println("[TVWiki][v1.6] 일반 영상 다이렉트 링크 반환.")
-                    callback(newExtractorLink(name, name, requestUrl, ExtractorLinkType.M3U8) {
-                        this.referer = "https://player.bunny-frame.online/"; this.headers = headers
-                    })
-                    return true
-                }
-            } catch (e: Exception) { 
-                println("[TVWiki][v1.6] 분석 치명적 오류: ${e.message}")
+            if (sniffedUrl.contains("/m3u8/st/")) {
+                val apiResponse = app.get(
+                    sniffedUrl,
+                    headers = mapOf("User-Agent" to pcUserAgent, "Referer" to "https://anilife.live/", "Cookie" to finalCookies)
+                )
+                xUserSsid = apiResponse.headers["x-user-ssid"] ?: apiResponse.headers["X-User-Ssid"]
+                val match = Regex("""https://api\.gcdn\.app/v1/manifest/[^"']+""").find(apiResponse.text)
+                if (match != null) finalM3u8 = match.value.replace("\\/", "/")
+            } else {
+                finalM3u8 = sniffedUrl
             }
+
+            if (finalM3u8 != null) {
+                return AnilifeProxyExtractor().extractWithProxy(
+                    m3u8Url = finalM3u8!!,
+                    playerUrl = playerUrl,
+                    referer = "https://anilife.live/",
+                    ssid = xUserSsid,
+                    cookies = finalCookies,
+                    callback = callback
+                )
+            }
+
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
         return false
     }
-
-    private suspend fun runWebViewHook(url: String, referer: String, sessionKeys: MutableSet<String>) = suspendCancellableCoroutine<String?> { cont ->
-        val handler = Handler(Looper.getMainLooper())
-        val hookScript = """
-            (function() {
-                window.G = false;
-                if (window.crypto && window.crypto.subtle) {
-                    const originalImportKey = window.crypto.subtle.importKey;
-                    Object.defineProperty(window.crypto.subtle, 'importKey', {
-                        value: function(format, keyData, algorithm, extractable, keyUsages) {
-                            if (format === 'raw' && (keyData.byteLength === 16 || keyData.length === 16)) {
-                                try {
-                                    let bytes = new Uint8Array(keyData);
-                                    let hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
-                                    console.log("CapturedKeyHex:[CRYPTO]" + hex);
-                                } catch(e) {}
-                            }
-                            return originalImportKey.apply(this, arguments);
-                        },
-                        configurable: true,
-                        writable: true
-                    });
-                }
-                const originalSet = Uint8Array.prototype.set;
-                Uint8Array.prototype.set = function(source, offset) {
-                    if (source && source.length === 16) {
-                        try {
-                            let hex = Array.from(source).map(b => b.toString(16).padStart(2, '0')).join('');
-                            console.log("CapturedKeyHex:[SET]" + hex);
-                        } catch(e) {}
-                    }
-                    return originalSet.apply(this, arguments);
-                };
-            })();
-        """.trimIndent()
-
-        handler.post {
-            try {
-                var detectedCUrl: String? = null
-                val context: Context = (AcraApplication.context ?: app) as Context
-                val webView = WebView(context)
-                
-                webView.settings.apply {
-                    javaScriptEnabled = true; domStorageEnabled = true; userAgentString = DESKTOP_UA
-                }
-
-                val discoveryTimeout = Runnable {
-                    if (cont.isActive) {
-                        try { webView.destroy() } catch (e: Exception) {}
-                        cont.resume(null)
-                    }
-                }
-                handler.postDelayed(discoveryTimeout, 15000)
-
-                webView.webChromeClient = object : WebChromeClient() {
-                    override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
-                        val msg = consoleMessage?.message() ?: ""
-                        if (msg.startsWith("CapturedKeyHex:")) {
-                            val key = msg.substringAfter("CapturedKeyHex:").removePrefix("[SET]").removePrefix("[CRYPTO]")
-                            if (sessionKeys.add(key)) { 
-                                println("[TVWiki][v1.6] 키 캡처 성공! Key: $key")
-                            }
-                        }
-                        return true
-                    }
-                }
-
-                webView.webViewClient = object : WebViewClient() {
-                    override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
-                        super.onPageStarted(view, url, favicon); view?.evaluateJavascript(hookScript, null)
-                    }
-
-                    override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
-                        val reqUrl = request?.url?.toString() ?: ""
-                        
-                        if (reqUrl.contains("/c.html") && reqUrl.contains("token=")) {
-                            detectedCUrl = reqUrl
-                            handler.removeCallbacks(discoveryTimeout)
-                            view?.post { view.evaluateJavascript(hookScript, null) }
-                            
-                            thread {
-                                try {
-                                    runBlocking {
-                                        val checkRes = app.get(reqUrl, headers = mapOf("User-Agent" to DESKTOP_UA, "Referer" to "https://player.bunny-frame.online/"))
-                                        if (!checkRes.text.contains("/v/key7")) {
-                                            handler.post {
-                                                if (cont.isActive) {
-                                                    try { webView.destroy() } catch (e: Exception) {}
-                                                    cont.resume(detectedCUrl)
-                                                }
-                                            }
-                                        } else {
-                                            handler.postDelayed({
-                                                if (cont.isActive) {
-                                                    try { webView.destroy() } catch (e: Exception) {}
-                                                    cont.resume(detectedCUrl)
-                                                }
-                                            }, 7000) 
-                                        }
-                                    }
-                                } catch (e: Exception) {}
-                            }
-                        }
-                        return super.shouldInterceptRequest(view, request)
-                    }
-
-                    override fun onPageFinished(view: WebView?, url: String?) {
-                        super.onPageFinished(view, url); view?.evaluateJavascript(hookScript, null)
-                    }
-                }
-                webView.loadUrl(url, mapOf("Referer" to referer))
-            } catch (e: Exception) {
-                if (cont.isActive) cont.resume(null)
-            }
-        }
-    }
-
-    private fun resolveUrl(baseUri: URI?, baseUrlStr: String, target: String): String {
-        if (target.startsWith("http")) return target
-        return try { baseUri?.resolve(target).toString() } catch (e: Exception) {
-            if (target.startsWith("/")) "${baseUrlStr.substringBefore("/", "https://")}//${baseUrlStr.split("/")[2]}$target"
-            else "${baseUrlStr.substringBeforeLast("/")}/$target"
-        }
-    }
-
-    class ProxyWebServer(private val sessionKeys: MutableSet<String>) {
-        private var serverSocket: ServerSocket? = null
-        private var isRunning = false
-        var port: Int = 0
-        
-        @Volatile private var currentHeaders: Map<String, String> = emptyMap()
-        @Volatile private var currentPlaylist: String = ""
-        @Volatile private var verifiedKey: ByteArray? = null
-        @Volatile private var currentIv: ByteArray? = null
-        @Volatile private var testSegmentUrl: String? = null
-
-        fun start() {
-            try {
-                serverSocket = ServerSocket(0).also { port = it.localPort }
-                isRunning = true
-                println("[TVWiki][v1.6] 초경량 하이브리드 프록시 서버 시작. Port: $port")
-                
-                thread(isDaemon = true) {
-                    while (isRunning) { 
-                        try { handleClient(serverSocket!!.accept()) } catch (e: Exception) {} 
-                    } 
-                }
-            } catch (e: Exception) { println("[TVWiki][v1.6] 프록시 시작 실패: ${e.message}") }
-        }
-
-        fun stop() { 
-            isRunning = false
-            try { serverSocket?.close() } catch(e: Exception) {} 
-        }
-        
-        fun updateSession(h: Map<String, String>) { currentHeaders = h }
-        fun setPlaylist(p: String) { currentPlaylist = p }
-        fun setIv(iv: ByteArray) { currentIv = iv }
-        fun setTestSegment(url: String) { 
-            if (testSegmentUrl == null) testSegmentUrl = url 
-        }
-
-        private fun handleClient(socket: Socket) {
-            try {
-                val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
-                val line = reader.readLine() ?: return
-                val parts = line.split(" ")
-                if (parts.size < 2) return
-                
-                val path = parts[1]
-                val output = socket.getOutputStream()
-
-                when {
-                    path.contains("playlist.m3u8") -> {
-                        println("[TVWiki][v1.6] 플레이어가 하이브리드 M3U8을 요청함")
-                        output.write("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nAccess-Control-Allow-Origin: *\r\n\r\n".toByteArray())
-                        output.write(currentPlaylist.toByteArray())
-                    }
-                    path.contains("/key.bin") -> {
-                        println("[TVWiki][v1.6] 플레이어가 복호화 Key를 요청함")
-                        if (verifiedKey == null) {
-                            verifiedKey = verifyMultipleKeys()
-                        }
-                        
-                        output.write("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nAccess-Control-Allow-Origin: *\r\n\r\n".toByteArray())
-                        output.write(verifiedKey ?: ByteArray(16))
-                    }
-                    // 하이브리드 버전에서는 /seg 엔드포인트가 호출되지 않으므로 로직 삭제됨
-                }
-                output.flush(); socket.close()
-            } catch (e: Exception) { try { socket.close() } catch(e2: Exception) {} }
-        }
-
-        private fun verifyMultipleKeys(): ByteArray? = runBlocking {
-            val url = testSegmentUrl ?: return@runBlocking null
-            val targetIv = currentIv ?: ByteArray(16)
-            
-            println("[TVWiki][v1.6] 키 1회 선행 검증 시작. 대상 URL: $url")
-            
-            try {
-                val responseData = app.get(url, headers = currentHeaders).body.bytes()
-                val checkSize = 1024 
-                val safeCheckSize = if (responseData.size < checkSize) responseData.size else checkSize
-
-                synchronized(sessionKeys) {
-                    for ((index, hexKey) in sessionKeys.withIndex()) {
-                        try {
-                            val keyBytes = hexKey.hexToByteArray()
-                            for (offset in 0..512) {
-                                if (responseData.size < offset + safeCheckSize) break
-                                val testChunk = responseData.copyOfRange(offset, offset + safeCheckSize)
-                                val decrypted = decryptAES(testChunk, keyBytes, targetIv)
-                                
-                                if (decrypted.size >= 377 && decrypted[0] == 0x47.toByte() && decrypted[188] == 0x47.toByte() && decrypted[376] == 0x47.toByte()) {
-                                    println("[TVWiki][v1.6] 정답 키 매칭 성공! Key: $hexKey")
-                                    return@synchronized keyBytes
-                                }
-                            }
-                        } catch (e: Exception) {}
-                    }
-                    println("[TVWiki][v1.6] 키 매칭 실패")
-                    null
-                }
-            } catch (e: Exception) { 
-                null 
-            }
-        }
-
-        private fun decryptAES(data: ByteArray, key: ByteArray, iv: ByteArray): ByteArray {
-            return try {
-                val cipher = Cipher.getInstance("AES/CBC/NoPadding")
-                cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
-                cipher.doFinal(data)
-            } catch (e: Exception) { ByteArray(0) }
-        }
-    }
-}
-
-fun String.hexToByteArray(): ByteArray {
-    val len = length
-    val data = ByteArray(len / 2)
-    var i = 0
-    while (i < len) {
-        data[i / 2] = ((Character.digit(this[i], 16) shl 4) + Character.digit(this[i+1], 16)).toByte()
-        i += 2
-    }
-    return data
 }
