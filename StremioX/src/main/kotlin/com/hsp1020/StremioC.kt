@@ -1,4 +1,4 @@
-// Version: v1.24
+// Version: v1.25
 package com.hsp1020
 
 import android.util.Log
@@ -69,8 +69,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         private const val TRACKER_LIST_URL = "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt"
         private const val tmdbAPI = "https://api.themoviedb.org/3"
         private const val apiKey = "cc9982c4801545a1481d167137ea7b53"
-        
-        // UI 붕괴 방지용 1x1 투명 픽셀 이미지
         private const val TRANSPARENT_PIXEL = "https://upload.wikimedia.org/wikipedia/commons/c/ca/1x1.png"
     }
 
@@ -89,11 +87,26 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         return "${baseUrl()}$path${querySuffix()}"
     }
 
+    private fun getActorUrl(link: String?): String? {
+        if (link == null) return null
+        return if (link.startsWith("/")) "https://image.tmdb.org/t/p/w300$link" else link
+    }
+
+    private fun getLogoUrl(link: String?): String? {
+        if (link == null) return null
+        return if (link.startsWith("/")) "https://image.tmdb.org/t/p/w500$link" else link
+    }
+
+    private fun getOriImageUrl(link: String?): String? {
+        if (link == null) return null
+        return if (link.startsWith("/")) "https://image.tmdb.org/t/p/original$link" else link
+    }
+
     private suspend fun getManifest(): Manifest? {
         val currentUrl = buildUrl("/manifest.json")
         val now = System.currentTimeMillis()
         val cacheAge = now - lastCacheTime
-        val isExpired = cacheAge > 24 * 60 * 60 * 1000 // 24Hour
+        val isExpired = cacheAge > 24 * 60 * 60 * 1000 
 
         if (cachedManifest != null && 
             lastManifestUrl == currentUrl && 
@@ -207,7 +220,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     }
 
     override suspend fun load(url: String): LoadResponse {
-        println("Kitsu or TMDB ID: $url")
         val res: CatalogEntry = if (url.startsWith("{")) {
             parseJson(url)
         } else {
@@ -486,7 +498,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     if (detailRes != null) {
                         fetchedRecommendations = detailRes.recommendations?.results?.mapNotNull { media ->
                             val recTitle = media.title ?: media.name ?: media.originalTitle ?: return@mapNotNull null
-                            val posterUrl = if (media.posterPath?.startsWith("/") == true) "https://image.tmdb.org/t/p/original${media.posterPath}" else media.posterPath
+                            val posterUrl = provider.getOriImageUrl(media.posterPath)
                             
                             val rawMediaType = media.mediaType ?: tmdbMediaType
                             val stremioType = if (rawMediaType == "tv") "series" else "movie"
@@ -525,9 +537,13 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                                 ?.rating
                         }
 
-                        fetchedLogo = detailRes.images?.logos?.firstOrNull()?.filePath?.let {
-                            if (it.startsWith("/")) "https://image.tmdb.org/t/p/original$it" else it
-                        }
+                        val originalLang = detailRes.original_language
+                        val logos = detailRes.images?.logos ?: emptyList()
+                        val bestLogo = logos.firstOrNull { it.iso_639_1 == "en" }
+                            ?: logos.firstOrNull { it.iso_639_1 == originalLang }
+                            ?: logos.firstOrNull()
+
+                        fetchedLogo = bestLogo?.filePath?.let { provider.getLogoUrl(it) }
                         
                         val crewList = detailRes.credits?.crew?.filter { 
                             it.job == "Director" || it.job == "Writer" 
@@ -540,7 +556,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             val combinedJobs = sortedJobs.joinToString(", ")
                             
                             val img = roles.firstNotNullOfOrNull { it.profilePath }?.let { 
-                                if (it.startsWith("/")) "https://image.tmdb.org/t/p/w500$it" else it 
+                                provider.getActorUrl(it)
                             } ?: TRANSPARENT_PIXEL
                             
                             ActorData(Actor(name, img), roleString = combinedJobs)
@@ -555,7 +571,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                         val castList = detailRes.credits?.cast?.mapNotNull { cast ->
                             val actorName = cast.name ?: cast.originalName ?: return@mapNotNull null
                             val profileImg = cast.profilePath?.let { 
-                                if (it.startsWith("/")) "https://image.tmdb.org/t/p/w500$it" else it 
+                                provider.getActorUrl(it)
                             } ?: TRANSPARENT_PIXEL
                             
                             ActorData(Actor(actorName, profileImg), roleString = cast.character)
@@ -621,8 +637,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     finalImdbId?.let { 
                         if (it.startsWith("tt")) {
                             addImdbId(it)
-                        } else {
-                            println("Kitsu or TMDB ID: $it")
                         }
                     }
                 }
@@ -660,8 +674,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     finalImdbId?.let { 
                         if (it.startsWith("tt")) {
                             addImdbId(it)
-                        } else {
-                            println("Kitsu or TMDB ID: $it")
                         }
                     }
                 }
@@ -689,13 +701,13 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             return provider.newEpisode(
                 LoadData(type, id, seasonNumber, episode ?: number, imdbId)
             ) {
-                this.name = tmdbEp?.name?.takeIf { it.isNotBlank() } ?: this@Video.name ?: title
+                this.name = this@Video.name ?: title ?: "Episode ${this@Video.episode ?: number}"
                 this.posterUrl = thumbnail
-                this.description = tmdbEp?.overview?.takeIf { it.isNotBlank() } ?: overview ?: this@Video.description
+                this.description = overview ?: this@Video.description
                 this.season = seasonNumber
                 this.episode = this@Video.episode ?: number
 
-                val finalAirDate = tmdbEp?.airDate?.takeIf { it.isNotBlank() } ?: this@Video.firstAired
+                val finalAirDate = tmdbEp?.airDate?.takeIf { it.isNotBlank() } ?: this@Video.firstAired ?: this@Video.released
                 finalAirDate?.takeIf { it.isNotBlank() }?.let { this.addDate(it) }
 
                 tmdbEp?.voteAverage?.takeIf { it > 0.0 }?.let { this.score = Score.from10(it) }
@@ -809,7 +821,8 @@ private data class TmdbDetailResponse(
     @JsonProperty("release_dates") val release_dates: TmdbReleaseDates? = null,
     @JsonProperty("content_ratings") val content_ratings: TmdbContentRatings? = null,
     @JsonProperty("credits") val credits: TmdbCredits? = null,
-    @JsonProperty("images") val images: TmdbImages? = null
+    @JsonProperty("images") val images: TmdbImages? = null,
+    @JsonProperty("original_language") val original_language: String? = null
 )
 
 private data class TmdbRecommendations(
@@ -826,7 +839,6 @@ private data class TmdbMedia(
     @JsonProperty("overview") val overview: String? = null
 )
 
-//TMDB Search
 data class Results(
     @JsonProperty("results") val results: ArrayList<Media>? = arrayListOf(),
 )
@@ -838,104 +850,6 @@ data class Media(
     @JsonProperty("original_title") val originalTitle: String? = null,
     @JsonProperty("media_type") val mediaType: String? = null,
     @JsonProperty("poster_path") val posterPath: String? = null,
-)
-
-data class Genres(
-    @JsonProperty("id") val id: Int? = null,
-    @JsonProperty("name") val name: String? = null,
-)
-
-data class Keywords(
-    @JsonProperty("id") val id: Int? = null,
-    @JsonProperty("name") val name: String? = null,
-)
-
-data class KeywordResults(
-    @JsonProperty("results") val results: ArrayList<Keywords>? = arrayListOf(),
-    @JsonProperty("keywords") val keywords: ArrayList<Keywords>? = arrayListOf(),
-)
-
-data class Seasons(
-    @JsonProperty("id") val id: Int? = null,
-    @JsonProperty("name") val name: String? = null,
-    @JsonProperty("season_number") val seasonNumber: Int? = null,
-    @JsonProperty("air_date") val airDate: String? = null,
-)
-
-data class Cast(
-    @JsonProperty("id") val id: Int? = null,
-    @JsonProperty("name") val name: String? = null,
-    @JsonProperty("original_name") val originalName: String? = null,
-    @JsonProperty("character") val character: String? = null,
-    @JsonProperty("known_for_department") val knownForDepartment: String? = null,
-    @JsonProperty("profile_path") val profilePath: String? = null,
-)
-
-data class Episodes(
-    @JsonProperty("id") val id: Int? = null,
-    @JsonProperty("name") val name: String? = null,
-    @JsonProperty("overview") val overview: String? = null,
-    @JsonProperty("air_date") val airDate: String? = null,
-    @JsonProperty("still_path") val stillPath: String? = null,
-    @JsonProperty("vote_average") val voteAverage: Double? = null,
-    @JsonProperty("episode_number") val episodeNumber: Int? = null,
-    @JsonProperty("season_number") val seasonNumber: Int? = null,
-)
-
-data class MediaDetailEpisodes(
-    @JsonProperty("episodes") val episodes: ArrayList<Episodes>? = arrayListOf(),
-)
-
-data class Trailers(
-    @JsonProperty("key") val key: String? = null,
-)
-
-data class ResultsTrailer(
-    @JsonProperty("results") val results: ArrayList<Trailers>? = arrayListOf(),
-)
-
-data class ExternalIds(
-    @JsonProperty("imdb_id") val imdb_id: String? = null,
-    @JsonProperty("tvdb_id") val tvdb_id: String? = null,
-)
-
-data class Credits(
-    @JsonProperty("cast") val cast: ArrayList<Cast>? = arrayListOf(),
-)
-
-data class ResultsRecommendations(
-    @JsonProperty("results") val results: ArrayList<Media>? = arrayListOf(),
-)
-
-data class LastEpisodeToAir(
-    @JsonProperty("episode_number") val episode_number: Int? = null,
-    @JsonProperty("season_number") val season_number: Int? = null,
-)
-
-data class MediaDetail(
-    @JsonProperty("id") val id: Int? = null,
-    @JsonProperty("imdb_id") val imdbId: String? = null,
-    @JsonProperty("title") val title: String? = null,
-    @JsonProperty("name") val name: String? = null,
-    @JsonProperty("original_title") val originalTitle: String? = null,
-    @JsonProperty("original_name") val originalName: String? = null,
-    @JsonProperty("poster_path") val posterPath: String? = null,
-    @JsonProperty("backdrop_path") val backdropPath: String? = null,
-    @JsonProperty("release_date") val releaseDate: String? = null,
-    @JsonProperty("first_air_date") val firstAirDate: String? = null,
-    @JsonProperty("overview") val overview: String? = null,
-    @JsonProperty("runtime") val runtime: Int? = null,
-    @JsonProperty("vote_average") val vote_average: Any? = null,
-    @JsonProperty("original_language") val original_language: String? = null,
-    @JsonProperty("status") val status: String? = null,
-    @JsonProperty("genres") val genres: ArrayList<Genres>? = arrayListOf(),
-    @JsonProperty("keywords") val keywords: KeywordResults? = null,
-    @JsonProperty("last_episode_to_air") val last_episode_to_air: LastEpisodeToAir? = null,
-    @JsonProperty("seasons") val seasons: ArrayList<Seasons>? = arrayListOf(),
-    @JsonProperty("videos") val videos: ResultsTrailer? = null,
-    @JsonProperty("external_ids") val external_ids: ExternalIds? = null,
-    @JsonProperty("credits") val credits: Credits? = null,
-    @JsonProperty("recommendations") val recommendations: ResultsRecommendations? = null,
 )
 
 private data class TmdbReleaseDates(@JsonProperty("results") val results: List<TmdbReleaseDateResult>?)
@@ -962,7 +876,10 @@ private data class TmdbCrew(
 )
 
 private data class TmdbImages(@JsonProperty("logos") val logos: List<TmdbLogo>? = null)
-private data class TmdbLogo(@JsonProperty("file_path") val filePath: String?)
+private data class TmdbLogo(
+    @JsonProperty("file_path") val filePath: String?,
+    @JsonProperty("iso_639_1") val iso_639_1: String?
+)
 
 private data class TmdbSeasonDetail(@JsonProperty("episodes") val episodes: List<TmdbEpisode>? = null)
 private data class TmdbEpisode(
@@ -973,7 +890,6 @@ private data class TmdbEpisode(
     @JsonProperty("vote_average") val voteAverage: Double?,
     @JsonProperty("runtime") val runtime: Int?
 )
-
 
 suspend fun invokeUindex(
     title: String? = null,
