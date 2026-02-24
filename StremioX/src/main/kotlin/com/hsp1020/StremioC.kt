@@ -100,7 +100,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val currentUrl = buildUrl("/manifest.json")
         val now = System.currentTimeMillis()
         val cacheAge = now - lastCacheTime
-        val isExpired = cacheAge > 24 * 60 * 60 * 1000 // 24Hour 
+        val isExpired = cacheAge > 24 * 60 * 60 * 1000 // 24Hour
 
         if (cachedManifest != null && 
             lastManifestUrl == currentUrl && 
@@ -139,13 +139,14 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val targetCatalogs = manifest?.catalogs?.filter { !it.isSearchRequired() } ?: emptyList()
 
         val lists = targetCatalogs.amap { catalog ->
-            val catalogKey = catalog.id
+            val catalogKey = "${catalog.id}-${catalog.type}"
             val cacheKey = "${catalogKey}_$skip"
 
             val cachedItems = pageContentCache[cacheKey]
             
             val row = if (cachedItems != null) {
-                HomePageList(catalog.name ?: catalog.id, cachedItems)
+                val catalogName = "${catalog.name ?: catalog.id} - ${catalog.type}"
+                HomePageList(catalogName, cachedItems)
             } else {
                 val freshRow = catalog.toHomePageList(provider = this, skip = skip)
                 if (freshRow.list.isNotEmpty()) {
@@ -399,8 +400,10 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
             val distinctEntries = allMetas.distinctBy { it.id }.map { it.toSearchResponse(provider) }
 
+            val catalogName = "${name ?: id} - $type"
+
             return HomePageList(
-                name ?: id,
+                catalogName,
                 distinctEntries
             )
         }
@@ -623,6 +626,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     finalImdbId?.let { 
                         if (it.startsWith("tt")) {
                             addImdbId(it)
+                        } else {
+                            println("Kitsu or TMDB ID: $it")
                         }
                     }
                 }
@@ -660,10 +665,13 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     finalImdbId?.let { 
                         if (it.startsWith("tt")) {
                             addImdbId(it)
+                        } else {
+                            println("Kitsu or TMDB ID: $it")
                         }
                     }
                 }
             }
+
         }
     }
 
