@@ -458,10 +458,10 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         }
 
         suspend fun toLoadResponse(provider: StremioC, imdbId: String?): LoadResponse {
-            val allTrailers = (trailersSources.mapNotNull { it.source } + trailerStreams.mapNotNull { it.ytId })
+            val allTrailers = trailerStreams.mapNotNull { it.ytId }
                 .distinct()
                 .map { "https://www.youtube.com/watch?v=$it" }
-            
+                .ifEmpty { trailersSources.mapNotNull { it.source } }
             var fetchedRecommendations: List<SearchResponse>? = null
             var fetchedRuntime: Int? = null
             var fetchedAgeRating: String? = null
