@@ -143,9 +143,10 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             val cacheKey = "${catalogKey}_$skip"
 
             val cachedItems = pageContentCache[cacheKey]
-            
+
             val row = if (cachedItems != null) {
-                val catalogName = "${catalog.name ?: catalog.id} - ${catalog.type}"
+                val displayType = catalog.type?.replaceFirstChar { it.uppercase() } ?: ""
+                val catalogName = "${catalog.name ?: catalog.id} - $displayType"
                 HomePageList(catalogName, cachedItems)
             } else {
                 val freshRow = catalog.toHomePageList(provider = this, skip = skip)
@@ -400,7 +401,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
             val distinctEntries = allMetas.distinctBy { it.id }.map { it.toSearchResponse(provider) }
 
-            val catalogName = "${name ?: id} - $type"
+            val displayType = type?.replaceFirstChar { it.uppercase() } ?: ""
+            val catalogName = "${name ?: id} - $displayType"
 
             return HomePageList(
                 catalogName,
