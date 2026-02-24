@@ -1,4 +1,3 @@
-// Version: v1.25
 package com.hsp1020
 
 import android.util.Log
@@ -92,11 +91,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         return if (link.startsWith("/")) "https://image.tmdb.org/t/p/w300$link" else link
     }
 
-    private fun getLogoUrl(link: String?): String? {
-        if (link == null) return null
-        return if (link.startsWith("/")) "https://image.tmdb.org/t/p/w500$link" else link
-    }
-
     private fun getOriImageUrl(link: String?): String? {
         if (link == null) return null
         return if (link.startsWith("/")) "https://image.tmdb.org/t/p/original$link" else link
@@ -106,7 +100,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val currentUrl = buildUrl("/manifest.json")
         val now = System.currentTimeMillis()
         val cacheAge = now - lastCacheTime
-        val isExpired = cacheAge > 24 * 60 * 60 * 1000 
+        val isExpired = cacheAge > 24 * 60 * 60 * 1000 // 24Hour 
 
         if (cachedManifest != null && 
             lastManifestUrl == currentUrl && 
@@ -435,6 +429,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         @JsonProperty("id") val id: String,
         @JsonProperty("poster") val poster: String?,
         @JsonProperty("background") val background: String?,
+        @JsonProperty("logo") val logo: String? = null,
         @JsonProperty("description") val description: String?,
         @JsonProperty("imdbRating") val imdbRating: String?,
         @JsonProperty("type") val type: String?,
@@ -466,7 +461,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             var fetchedRuntime: Int? = null
             var fetchedAgeRating: String? = null
             
-            var fetchedLogo: String? = null
             var fetchedActors: List<ActorData>? = null
             val episodeTmdbMeta = mutableMapOf<String, TmdbEpisode>()
 
@@ -490,7 +484,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 }
 
                 if (tmdbIdStr != null) {
-                    val detailAppend = if (isMovie) "recommendations,release_dates,credits,images" else "recommendations,content_ratings,credits,images"
+                    val detailAppend = if (isMovie) "recommendations,release_dates,credits" else "recommendations,content_ratings,credits"
                     val detailUrl = "$tmdbAPI/$tmdbMediaType/$tmdbIdStr?api_key=$apiKey&append_to_response=$detailAppend"
                     
                     val detailRes = app.get(detailUrl).parsedSafe<TmdbDetailResponse>()
@@ -537,14 +531,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                                 ?.rating
                         }
 
-                        val originalLang = detailRes.original_language
-                        val logos = detailRes.images?.logos ?: emptyList()
-                        val bestLogo = logos.firstOrNull { it.iso_639_1 == "en" }
-                            ?: logos.firstOrNull { it.iso_639_1 == originalLang }
-                            ?: logos.firstOrNull()
-
-                        fetchedLogo = bestLogo?.filePath?.let { provider.getLogoUrl(it) }
-                        
                         val crewList = detailRes.credits?.crew?.filter { 
                             it.job == "Director" || it.job == "Writer" 
                         }?.groupBy { it.name ?: it.originalName }?.mapNotNull { (name, roles) ->
@@ -629,7 +615,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     this.duration = fetchedRuntime
                     this.contentRating = fetchedAgeRating
                     
-                    fetchedLogo?.let { this.logoUrl = it }
+                    logo?.let { this.logoUrl = it }
                     
                     tmdbIdStr?.let { 
                         addTMDbId(it)
@@ -666,7 +652,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     this.recommendations = fetchedRecommendations
                     this.contentRating = fetchedAgeRating
                     
-                    fetchedLogo?.let { this.logoUrl = it }
+                    logo?.let { this.logoUrl = it }
                     
                     tmdbIdStr?.let { 
                         addTMDbId(it)
@@ -821,7 +807,6 @@ private data class TmdbDetailResponse(
     @JsonProperty("release_dates") val release_dates: TmdbReleaseDates? = null,
     @JsonProperty("content_ratings") val content_ratings: TmdbContentRatings? = null,
     @JsonProperty("credits") val credits: TmdbCredits? = null,
-    @JsonProperty("images") val images: TmdbImages? = null,
     @JsonProperty("original_language") val original_language: String? = null
 )
 
@@ -838,6 +823,9 @@ private data class TmdbMedia(
     @JsonProperty("poster_path") val posterPath: String? = null,
     @JsonProperty("overview") val overview: String? = null
 )
+
+//TMDB Search
+
 
 data class Results(
     @JsonProperty("results") val results: ArrayList<Media>? = arrayListOf(),
@@ -873,12 +861,6 @@ private data class TmdbCrew(
     @JsonProperty("original_name") val originalName: String?,
     @JsonProperty("job") val job: String?,
     @JsonProperty("profile_path") val profilePath: String?
-)
-
-private data class TmdbImages(@JsonProperty("logos") val logos: List<TmdbLogo>? = null)
-private data class TmdbLogo(
-    @JsonProperty("file_path") val filePath: String?,
-    @JsonProperty("iso_639_1") val iso_639_1: String?
 )
 
 private data class TmdbSeasonDetail(@JsonProperty("episodes") val episodes: List<TmdbEpisode>? = null)
