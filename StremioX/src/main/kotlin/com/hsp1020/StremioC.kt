@@ -1,4 +1,4 @@
-// v1.2
+// v1.4
 package com.hsp1020
 
 import android.util.Log
@@ -459,9 +459,9 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
         suspend fun toLoadResponse(provider: StremioC, imdbId: String?): LoadResponse {
             val allTrailers = trailerStreams.mapNotNull { it.ytId }
-                .distinct()
-                .map { "https://www.youtube.com/watch?v=$it" }
                 .ifEmpty { trailersSources.mapNotNull { it.source } }
+                .distinct()
+                .map { if (it.startsWith("http")) it else "https://www.youtube.com/watch?v=$it" }
             var fetchedRecommendations: List<SearchResponse>? = null
             var fetchedRuntime: Int? = null
             var fetchedAgeRating: String? = null
