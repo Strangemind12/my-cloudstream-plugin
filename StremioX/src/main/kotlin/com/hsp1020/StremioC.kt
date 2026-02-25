@@ -1,4 +1,4 @@
-// v1.4
+// v1.6
 package com.hsp1020
 
 import android.util.Log
@@ -458,14 +458,16 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         }
 
         suspend fun toLoadResponse(provider: StremioC, imdbId: String?): LoadResponse {
-            val allTrailers = trailerStreams.mapNotNull { it.ytId }
+            val fallbackTrailers = trailerStreams.mapNotNull { it.ytId }
                 .ifEmpty { trailersSources.mapNotNull { it.source } }
                 .distinct()
                 .map { if (it.startsWith("http")) it else "https://www.youtube.com/watch?v=$it" }
+            
             var fetchedRecommendations: List<SearchResponse>? = null
             var fetchedRuntime: Int? = null
             var fetchedAgeRating: String? = null
             var fetchedLogo: String? = null
+            var fetchedTrailers: List<String> = emptyList()
             
             var fetchedActors: List<ActorData>? = null
             val episodeTmdbMeta = mutableMapOf<String, TmdbEpisode>()
@@ -521,7 +523,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 }
 
                 if (tmdbIdStr != null) {
-                    val detailAppend = if (isMovie) "recommendations,release_dates,credits,images" else "recommendations,content_ratings,credits,images"
+                    val detailAppend = if (isMovie) "recommendations,release_dates,credits,images,videos" else "recommendations,content_ratings,credits,images,videos"
                     val detailUrl = "$tmdbAPI/$tmdbMediaType/$tmdbIdStr?api_key=$apiKey&language=ko-KR&append_to_response=$detailAppend&include_image_language=ko"
                     
                     val detailRes = app.get(detailUrl).parsedSafe<TmdbDetailResponse>()
@@ -530,6 +532,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                         fetchedLogo = detailRes.images?.logos?.firstOrNull()?.file_path?.let {
                             "https://image.tmdb.org/t/p/w500$it"
                         }
+
+                        fetchedTrailers = detailRes.videos?.results?.mapNotNull { it.key }?.map { "https://www.youtube.com/watch?v=$it" } ?: emptyList()
 
                         fetchedRecommendations = detailRes.recommendations?.results?.mapNotNull { media ->
                             val recTitle = media.title ?: media.name ?: media.originalTitle ?: return@mapNotNull null
@@ -630,6 +634,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             }
 
             val isSingleMovieVideo = type == "movie" && videos?.size == 1 && videos[0].seasonNumber == 1 && (videos[0].episode == 1 || videos[0].number == 1)
+            val finalTrailers = fetchedTrailers.ifEmpty { fallbackTrailers }
 
             if (videos.isNullOrEmpty() || isSingleMovieVideo) {
                 return provider.newMovieLoadResponse(
@@ -651,7 +656,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                         addActors(cast)
                     }
                     
-                    addTrailer(allTrailers)                    
+                    addTrailer(finalTrailers)                    
                     this.recommendations = fetchedRecommendations
                     this.duration = fetchedRuntime
                     this.contentRating = fetchedAgeRating
@@ -689,7 +694,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                         addActors(cast)
                     }
                     
-                    addTrailer(allTrailers.randomOrNull())
+                    addTrailer(finalTrailers.randomOrNull())
                     this.recommendations = fetchedRecommendations
                     this.contentRating = fetchedAgeRating
                     
@@ -851,7 +856,8 @@ private data class TmdbDetailResponse(
     @JsonProperty("content_ratings") val content_ratings: TmdbContentRatings? = null,
     @JsonProperty("credits") val credits: TmdbCredits? = null,
     @JsonProperty("original_language") val original_language: String? = null,
-    @JsonProperty("images") val images: TmdbImages? = null
+    @JsonProperty("images") val images: TmdbImages? = null,
+    @JsonProperty("videos") val videos: ResultsTrailer? = null
 )
 
 private data class TmdbImages(
