@@ -1,4 +1,4 @@
-// v1.1
+// v1.2
 package com.hsp1020
 
 import android.util.Log
@@ -101,7 +101,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val currentUrl = buildUrl("/manifest.json")
         val now = System.currentTimeMillis()
         val cacheAge = now - lastCacheTime
-        val isExpired = cacheAge > 24 * 60 * 60 * 1000 // 24Hour 
+        val isExpired = cacheAge > 24 * 60 * 60 * 1000
 
         if (cachedManifest != null && 
             lastManifestUrl == currentUrl && 
@@ -118,9 +118,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             lastCacheTime = now
             pageContentCache.clear()
             catalogSentIds.clear()
-        } else {
-            Log.d("Error:","Null")
-        }        
+        }     
         return res ?: cachedManifest
     }
 
@@ -435,6 +433,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         @JsonProperty("id") val id: String,
         @JsonProperty("poster") val poster: String?,
         @JsonProperty("background") val background: String?,
+        @JsonProperty("logo") val logo: String? = null,
         @JsonProperty("description") val description: String?,
         @JsonProperty("imdbRating") val imdbRating: String?,
         @JsonProperty("type") val type: String?,
@@ -445,7 +444,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         @JsonProperty("trailers") val trailersSources: List<Trailer> = emptyList(),
         @JsonProperty("trailerStreams") val trailerStreams: List<TrailerStream> = emptyList(),
         @JsonProperty("year") val yearNum: String? = null,
-        @JsonProperty("links") val links: List<Link> = emptyList()
+        @JsonProperty("links") val links: List<Link> = emptyList(),
+        @JsonProperty("releaseInfo") val releaseInfo: String? = null
     ) {
         fun toSearchResponse(provider: StremioC): SearchResponse {
             return provider.newMovieSearchResponse(
@@ -472,8 +472,12 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
             val extractedImdbId = links.firstOrNull { it.category == "imdb" }?.url?.substringAfterLast("/")?.takeIf { it.startsWith("tt") }
             val extractedTmdbId = if (this.id.startsWith("tmdb:")) this.id.removePrefix("tmdb:") else null
-            val finalImdbId = extractedImdbId ?: (if (this.id.startsWith("tt")) this.id else imdbId)
+            var finalImdbId = extractedImdbId ?: (if (this.id.startsWith("tt")) this.id else imdbId)
             var tmdbIdStr: String? = extractedTmdbId
+
+            if (finalImdbId == null && logo != null) {
+                finalImdbId = "tt[0-9]+".toRegex().find(logo)?.value
+            }
 
             try {
                 val isMovie = type == "movie" || videos.isNullOrEmpty()
@@ -484,6 +488,33 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     val findRes = app.get(findUrl).parsedSafe<TmdbFindResponse>()
                     
                     val tmdbId = if (isMovie) findRes?.movie_results?.firstOrNull()?.id else findRes?.tv_results?.firstOrNull()?.id
+                    if (tmdbId != null) {
+                        tmdbIdStr = tmdbId.toString()
+                    }
+                }
+
+                if (tmdbIdStr == null && !videos.isNullOrEmpty()) {
+                    val tvdbId = videos.firstNotNullOfOrNull { it.tvdb_id } ?: videos.firstNotNullOfOrNull { "thetvdb.com/banners/episodes/(\\d+)".toRegex().find(it.thumbnail ?: "")?.groupValues?.get(1)?.toIntOrNull() }
+                    if (tvdbId != null) {
+                        val findUrl = "$tmdbAPI/find/$tvdbId?api_key=$apiKey&external_source=tvdb_id&language=ko-KR"
+                        val findRes = app.get(findUrl).parsedSafe<TmdbFindResponse>()
+                        val tmdbId = if (isMovie) findRes?.movie_results?.firstOrNull()?.id else findRes?.tv_results?.firstOrNull()?.id
+                        if (tmdbId != null) {
+                            tmdbIdStr = tmdbId.toString()
+                        }
+                    }
+                }
+
+                if (tmdbIdStr == null) {
+                    val searchYear = releaseInfo?.substringBefore("-")?.toIntOrNull() ?: yearNum?.toIntOrNull()
+                    val query = URLEncoder.encode(name, "UTF-8")
+                    val searchUrl = if (isMovie) {
+                        "$tmdbAPI/search/movie?api_key=$apiKey&language=ko-KR&query=$query${if (searchYear != null) "&primary_release_year=$searchYear" else ""}"
+                    } else {
+                        "$tmdbAPI/search/tv?api_key=$apiKey&language=ko-KR&query=$query${if (searchYear != null) "&first_air_date_year=$searchYear" else ""}"
+                    }
+                    val searchRes = app.get(searchUrl).parsedSafe<Results>()
+                    val tmdbId = searchRes?.results?.firstOrNull()?.id
                     if (tmdbId != null) {
                         tmdbIdStr = tmdbId.toString()
                     }
@@ -633,8 +664,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     finalImdbId?.let { 
                         if (it.startsWith("tt")) {
                             addImdbId(it)
-                        } else {
-                            println("Kitsu or TMDB ID: $it")
                         }
                     }
                 }
@@ -672,8 +701,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     finalImdbId?.let { 
                         if (it.startsWith("tt")) {
                             addImdbId(it)
-                        } else {
-                            println("Kitsu or TMDB ID: $it")
                         }
                     }
                 }
@@ -694,6 +721,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         @JsonProperty("description") val description: String? = null,
         @JsonProperty("firstAired") val firstAired: String? = null,
         @JsonProperty("released") val released: String? = null,
+        @JsonProperty("tvdb_id") val tvdb_id: Int? = null
     ) {
         fun toEpisode(provider: StremioC, type: String?, imdbId: String?, tmdbMetaMap: Map<String, TmdbEpisode>): Episode {
             val epKey = "${seasonNumber}_${episode ?: number}"
@@ -880,9 +908,6 @@ private data class TmdbEpisode(
     @JsonProperty("vote_average") val voteAverage: Double?,
     @JsonProperty("runtime") val runtime: Int?
 )
-
-//TMDB Search
-
 
 data class Results(
     @JsonProperty("results") val results: ArrayList<Media>? = arrayListOf(),
