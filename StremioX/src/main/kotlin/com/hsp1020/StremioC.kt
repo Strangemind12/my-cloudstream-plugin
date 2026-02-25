@@ -1,3 +1,4 @@
+// v1.1
 package com.hsp1020
 
 import android.util.Log
@@ -183,7 +184,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
     private suspend fun searchTMDb(query: String): List<SearchResponse> {
         val encoded = URLEncoder.encode(query, "UTF-8")
-        val url = "$tmdbAPI/search/multi?api_key=$apiKey&language=en-US&query=$encoded&page=1&include_adult=false"
+        val url = "$tmdbAPI/search/multi?api_key=$apiKey&language=ko-KR&query=$encoded&page=1&include_adult=false"
         val results = app.get(url, timeout = 120L).parsedSafe<Results>()?.results ?: emptyList()
         return results.filter { it.mediaType == "movie" || it.mediaType == "tv" }.distinctBy { "${it.mediaType}:${it.id}" }.mapNotNull { media ->
                 val stremioType =
@@ -434,7 +435,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         @JsonProperty("id") val id: String,
         @JsonProperty("poster") val poster: String?,
         @JsonProperty("background") val background: String?,
-        @JsonProperty("logo") val logo: String? = null,
         @JsonProperty("description") val description: String?,
         @JsonProperty("imdbRating") val imdbRating: String?,
         @JsonProperty("type") val type: String?,
@@ -465,6 +465,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             var fetchedRecommendations: List<SearchResponse>? = null
             var fetchedRuntime: Int? = null
             var fetchedAgeRating: String? = null
+            var fetchedLogo: String? = null
             
             var fetchedActors: List<ActorData>? = null
             val episodeTmdbMeta = mutableMapOf<String, TmdbEpisode>()
@@ -479,7 +480,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 val tmdbMediaType = if (isMovie) "movie" else "tv"
 
                 if (tmdbIdStr == null && finalImdbId?.startsWith("tt") == true) {
-                    val findUrl = "$tmdbAPI/find/$finalImdbId?api_key=$apiKey&external_source=imdb_id"
+                    val findUrl = "$tmdbAPI/find/$finalImdbId?api_key=$apiKey&external_source=imdb_id&language=ko-KR"
                     val findRes = app.get(findUrl).parsedSafe<TmdbFindResponse>()
                     
                     val tmdbId = if (isMovie) findRes?.movie_results?.firstOrNull()?.id else findRes?.tv_results?.firstOrNull()?.id
@@ -489,12 +490,16 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 }
 
                 if (tmdbIdStr != null) {
-                    val detailAppend = if (isMovie) "recommendations,release_dates,credits" else "recommendations,content_ratings,credits"
-                    val detailUrl = "$tmdbAPI/$tmdbMediaType/$tmdbIdStr?api_key=$apiKey&append_to_response=$detailAppend"
+                    val detailAppend = if (isMovie) "recommendations,release_dates,credits,images" else "recommendations,content_ratings,credits,images"
+                    val detailUrl = "$tmdbAPI/$tmdbMediaType/$tmdbIdStr?api_key=$apiKey&language=ko-KR&append_to_response=$detailAppend&include_image_language=ko,null"
                     
                     val detailRes = app.get(detailUrl).parsedSafe<TmdbDetailResponse>()
                     
                     if (detailRes != null) {
+                        fetchedLogo = detailRes.images?.logos?.firstOrNull()?.file_path?.let {
+                            "https://image.tmdb.org/t/p/w500$it"
+                        }
+
                         fetchedRecommendations = detailRes.recommendations?.results?.mapNotNull { media ->
                             val recTitle = media.title ?: media.name ?: media.originalTitle ?: return@mapNotNull null
                             val posterUrl = provider.getOriImageUrl(media.posterPath)
@@ -526,13 +531,13 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                         if (isMovie) {
                             fetchedRuntime = detailRes.runtime
                             fetchedAgeRating = detailRes.release_dates?.results
-                                ?.firstOrNull { it.iso_3166_1 == "US" }
+                                ?.firstOrNull { it.iso_3166_1 == "KR" }
                                 ?.release_dates
                                 ?.firstOrNull { !it.certification.isNullOrEmpty() }
                                 ?.certification
                         } else {
                             fetchedAgeRating = detailRes.content_ratings?.results
-                                ?.firstOrNull { it.iso_3166_1 == "US" }
+                                ?.firstOrNull { it.iso_3166_1 == "KR" }
                                 ?.rating
                         }
 
@@ -577,7 +582,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                         if (requiredSeasons.isNotEmpty()) {
                             requiredSeasons.amap { seasonNum ->
                                 try {
-                                    val seasonUrl = "$tmdbAPI/tv/$tmdbIdStr/season/$seasonNum?api_key=$apiKey"
+                                    val seasonUrl = "$tmdbAPI/tv/$tmdbIdStr/season/$seasonNum?api_key=$apiKey&language=ko-KR"
                                     val seasonRes = app.get(seasonUrl).parsedSafe<TmdbSeasonDetail>()
                                     seasonRes?.episodes?.forEach { ep ->
                                         if (ep.episodeNumber != null) {
@@ -620,7 +625,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     this.duration = fetchedRuntime
                     this.contentRating = fetchedAgeRating
                     
-                    logo?.let { this.logoUrl = it }
+                    fetchedLogo?.let { this.logoUrl = it }
                     
                     tmdbIdStr?.let { 
                         addTMDbId(it)
@@ -659,7 +664,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     this.recommendations = fetchedRecommendations
                     this.contentRating = fetchedAgeRating
                     
-                    logo?.let { this.logoUrl = it }
+                    fetchedLogo?.let { this.logoUrl = it }
                     
                     tmdbIdStr?.let { 
                         addTMDbId(it)
@@ -817,7 +822,16 @@ private data class TmdbDetailResponse(
     @JsonProperty("release_dates") val release_dates: TmdbReleaseDates? = null,
     @JsonProperty("content_ratings") val content_ratings: TmdbContentRatings? = null,
     @JsonProperty("credits") val credits: TmdbCredits? = null,
-    @JsonProperty("original_language") val original_language: String? = null
+    @JsonProperty("original_language") val original_language: String? = null,
+    @JsonProperty("images") val images: TmdbImages? = null
+)
+
+private data class TmdbImages(
+    @JsonProperty("logos") val logos: List<TmdbLogo>? = null
+)
+
+private data class TmdbLogo(
+    @JsonProperty("file_path") val file_path: String? = null
 )
 
 private data class TmdbRecommendations(
