@@ -1,4 +1,4 @@
-// v1.6
+// v1.8
 package com.hsp1020
 
 import android.util.Log
@@ -118,7 +118,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             lastCacheTime = now
             pageContentCache.clear()
             catalogSentIds.clear()
-        }     
+        }      
         return res ?: cachedManifest
     }
 
@@ -741,8 +741,9 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 this.season = seasonNumber
                 this.episode = this@Video.episode ?: number
 
-                val finalAirDate = tmdbEp?.airDate?.takeIf { it.isNotBlank() } ?: this@Video.firstAired ?: this@Video.released
-                finalAirDate?.takeIf { it.isNotBlank() }?.let { this.addDate(it) }
+                val rawAirDate = tmdbEp?.airDate?.takeIf { it.isNotBlank() } ?: this@Video.firstAired ?: this@Video.released
+                val finalAirDate = rawAirDate?.takeIf { it.isNotBlank() }?.substringBefore("T")
+                finalAirDate?.let { this.addDate(it) }
 
                 tmdbEp?.voteAverage?.takeIf { it > 0.0 }?.let { this.score = Score.from10(it) }
                 tmdbEp?.runtime?.let { this.runTime = it }
