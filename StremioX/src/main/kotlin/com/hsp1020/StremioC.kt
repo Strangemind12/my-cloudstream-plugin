@@ -1,7 +1,6 @@
-// v1.8
+// v1.10
 package com.hsp1020
 
-import android.util.Log
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.AcraApplication
 import com.lagradost.cloudstream3.Actor
@@ -736,14 +735,13 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 LoadData(type, id, seasonNumber, episode ?: number, imdbId)
             ) {
                 this.name = this@Video.name ?: title ?: "Episode ${this@Video.episode ?: number}"
-                this.posterUrl = thumbnail
+                this.posterUrl = thumbnail ?: TRANSPARENT_PIXEL
                 this.description = overview ?: this@Video.description
                 this.season = seasonNumber
                 this.episode = this@Video.episode ?: number
 
-                val rawAirDate = tmdbEp?.airDate?.takeIf { it.isNotBlank() } ?: this@Video.firstAired ?: this@Video.released
-                val finalAirDate = rawAirDate?.takeIf { it.isNotBlank() }?.substringBefore("T")
-                finalAirDate?.let { this.addDate(it) }
+                val finalAirDate = tmdbEp?.airDate?.takeIf { it.isNotBlank() } ?: this@Video.firstAired ?: this@Video.released
+                finalAirDate?.takeIf { it.isNotBlank() }?.let { this.addDate(it) }
 
                 tmdbEp?.voteAverage?.takeIf { it > 0.0 }?.let { this.score = Score.from10(it) }
                 tmdbEp?.runtime?.let { this.runTime = it }
