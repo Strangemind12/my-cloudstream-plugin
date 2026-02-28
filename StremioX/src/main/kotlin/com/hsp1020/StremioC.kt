@@ -1,4 +1,4 @@
-// v1.13
+// v1.15
 package com.hsp1020
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -548,7 +548,16 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             "https://image.tmdb.org/t/p/w500$it"
                         }
 
-                        fetchedTrailers = detailRes.videos?.results?.mapNotNull { it.key }?.map { "https://www.youtube.com/watch?v=$it" } ?: emptyList()
+                        val rawVideos = detailRes.videos?.results ?: emptyList()
+                        
+                        fetchedTrailers = rawVideos.filter { 
+                            it.type == "Trailer" || it.type == "Teaser" 
+                        }.sortedWith(compareBy(
+                            { if (it.type == "Trailer") 0 else 1 },
+                            { it.publishedAt ?: "9999-12-31" }
+                        )).mapNotNull { it.key }.map { 
+                            "https://www.youtube.com/watch?v=$it" 
+                        }
 
                         fetchedRecommendations = detailRes.recommendations?.results?.mapNotNull { media ->
                             val recTitle = media.title ?: media.name ?: media.originalTitle ?: return@mapNotNull null
@@ -709,7 +718,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                         addActors(cast)
                     }
                     
-                    addTrailer(finalTrailers.randomOrNull())
+                    addTrailer(finalTrailers.firstOrNull())
                     this.recommendations = fetchedRecommendations
                     this.contentRating = fetchedAgeRating
                     
@@ -991,6 +1000,8 @@ data class MediaDetailEpisodes(
 
 data class Trailers(
     @JsonProperty("key") val key: String? = null,
+    @JsonProperty("type") val type: String? = null, 
+    @JsonProperty("published_at") val publishedAt: String? = null
 )
 
 data class ResultsTrailer(
