@@ -476,7 +476,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             val fallbackTrailers = trailerStreams.mapNotNull { it.ytId }
                 .ifEmpty { trailersSources.mapNotNull { it.source } }
                 .distinct()
-                .map { if (it.startsWith("http")) it else "https://www.youtube.com/watch?v=$it" }
+                .map { if (it.startsWith("http")) it else "https://m.youtube.com/watch?v=$it" }
             
             var fetchedRecommendations: List<SearchResponse>? = null
             var fetchedRuntime: Int? = null
@@ -556,7 +556,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             { if (it.type == "Trailer") 0 else 1 },
                             { it.publishedAt ?: "9999-12-31" }
                         )).mapNotNull { it.key }.map { 
-                            "https://www.youtube.com/watch?v=$it" 
+                            "https://m.youtube.com/watch?v=$it" 
                         }
 
                         fetchedRecommendations = detailRes.recommendations?.results?.mapNotNull { media ->
@@ -830,7 +830,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 }
             }
             if (ytId != null) {
-                loadExtractor("https://www.youtube.com/watch?v=$ytId", subtitleCallback, callback)
+                loadExtractor("https://m.youtube.com/watch?v=$ytId", subtitleCallback, callback)
             }
             if (externalUrl != null) {
                 loadExtractor(externalUrl, subtitleCallback, callback)
