@@ -23,8 +23,8 @@ import java.util.Collections
 import kotlin.coroutines.resume
 
 /**
- * KotbcExtractor v3.3 (Based on TVWiki/TVMON Provider)
- * - [v3.3] TS 영상 조각(예: 1080p_001.html)을 M3U8로 오인하여 가로채는 현상 방지 (OOM 에러 해결)
+ * KotbcExtractor v3.4 (Based on TVWiki/TVMON Provider)
+ * - [v3.4] master.txt 등 캡처된 파일의 내부 텍스트(본문)를 콘솔에 출력하는 디버깅 로직 추가
  */
 class KotbcExtractor : ExtractorApi() {
     override val name = "KOTBC"
@@ -39,7 +39,7 @@ class KotbcExtractor : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        println("[Kotbc v3.3] getUrl 실행: $url")
+        println("[Kotbc v3.4] getUrl 실행: $url")
         extract(url, referer, subtitleCallback, callback)
     }
 
@@ -53,7 +53,7 @@ class KotbcExtractor : ExtractorApi() {
         val capturedUrl = runWebViewHook(url, referer ?: "https://m136.kotbc2.com/")
         
         if (capturedUrl != null) {
-            println("[Kotbc v3.3] WebView 캡처 성공: $capturedUrl")
+            println("[Kotbc v3.4] WebView 캡처 성공: $capturedUrl")
             
             val headers = mutableMapOf(
                 "User-Agent" to DESKTOP_UA,
@@ -64,54 +64,60 @@ class KotbcExtractor : ExtractorApi() {
             val cookie = CookieManager.getInstance().getCookie(capturedUrl)
             if (!cookie.isNullOrEmpty()) {
                 headers["Cookie"] = cookie
-                println("[Kotbc v3.3] 쿠키 셋팅 완료")
+                println("[Kotbc v3.4] 쿠키 셋팅 완료")
             }
 
             var finalUrl = capturedUrl
             
             try {
-                println("[Kotbc v3.3] 캡처된 URL 본문 파싱 시도: $finalUrl")
+                println("[Kotbc v3.4] 캡처된 URL 본문 다운로드 및 파싱 시도: $finalUrl")
                 val response = app.get(finalUrl, headers = headers)
                 
-                // 용량이 큰 경우를 대비해 text 대신 예외 처리를 거쳐 안전하게 텍스트 추출
                 val content = try {
                     response.text.trim()
                 } catch (e: Exception) {
-                    println("[Kotbc v3.3] text 파싱 에러 (textLarge 시도): ${e.message}")
-                    // 최신 Cloudstream의 textLarge 프로퍼티 사용 (OOM 방지)
+                    println("[Kotbc v3.4] text 파싱 에러 (textLarge 시도): ${e.message}")
                     response.document.text().trim() 
                 }
 
+                // ==========================================
+                // [디버깅용 추가] 파일의 실제 내용을 콘솔에 출력 (최대 2000자 제한하여 로그 잘림 방지)
+                println("[Kotbc v3.4] ================= 본문 내용 시작 =================")
+                println(content.take(2000))
+                if (content.length > 2000) println("... (이하 생략됨, 총 길이: ${content.length}) ...")
+                println("[Kotbc v3.4] ================= 본문 내용 끝 ===================")
+                // ==========================================
+
                 if (!content.startsWith("#EXTM3U")) {
-                    println("[Kotbc v3.3] 본문이 M3U8 포맷이 아님. 내부 M3U8 링크 추출 탐색")
+                    println("[Kotbc v3.4] 본문이 M3U8 포맷이 아님. 내부 M3U8 링크 추출 탐색")
                     val m3u8Regex = Regex("""(https?://[^"']+\.m3u8[^"']*)""")
                     m3u8Regex.find(content)?.let {
                         finalUrl = it.groupValues[1]
-                        println("[Kotbc v3.3] 실제 M3U8 주소 추출 성공: $finalUrl")
+                        println("[Kotbc v3.4] 실제 M3U8 주소 추출 성공: $finalUrl")
                     } ?: run {
-                        println("[Kotbc v3.3] 본문에서 M3U8 링크를 찾지 못함. 원본 URL 유지.")
+                        println("[Kotbc v3.4] 본문에서 M3U8 절대경로 링크를 찾지 못함. 원본 URL 유지.")
                     }
                 } else {
-                    println("[Kotbc v3.3] 캡처된 URL이 이미 정상적인 M3U8 포맷입니다.")
+                    println("[Kotbc v3.4] 캡처된 URL 본문이 정상적인 #EXTM3U 포맷입니다.")
                 }
             } catch (e: Exception) {
-                println("[Kotbc v3.3] 파싱 중 치명적 예외 발생: ${e.message}")
+                println("[Kotbc v3.4] 파싱 중 치명적 예외 발생: ${e.message}")
             }
 
             // 최종 확정된 URL을 플레이어(ExoPlayer)에 전달
             callback(newExtractorLink(name, name, finalUrl, ExtractorLinkType.M3U8) {
                 this.headers = headers
             })
-            println("[Kotbc v3.3] 최종 ExtractorLink 전달 완료: $finalUrl")
+            println("[Kotbc v3.4] 최종 ExtractorLink 전달 완료: $finalUrl")
             return true
         } else {
-            println("[Kotbc v3.3] WebView 캡처 실패")
+            println("[Kotbc v3.4] WebView 캡처 실패")
             return false
         }
     }
 
     private suspend fun runWebViewHook(url: String, referer: String) = suspendCancellableCoroutine<String?> { cont ->
-        println("[Kotbc v3.3] WebView 훅 실행: $url")
+        println("[Kotbc v3.4] WebView 훅 실행: $url")
         val handler = Handler(Looper.getMainLooper())
         
         handler.post {
@@ -127,7 +133,7 @@ class KotbcExtractor : ExtractorApi() {
 
                 val discoveryTimeout = Runnable {
                     if (cont.isActive) {
-                        println("[Kotbc v3.3] WebView Timeout")
+                        println("[Kotbc v3.4] WebView Timeout")
                         try { webView.destroy() } catch (e: Exception) {}
                         cont.resume(null)
                     }
@@ -138,19 +144,17 @@ class KotbcExtractor : ExtractorApi() {
                     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                         val reqUrl = request?.url?.toString() ?: ""
                         
-                        // [핵심 변경점] 1080p_001.html 같은 영상 조각(Segment) 파일은 가로채지 않고 무시합니다.
+                        // 영상 조각(Segment) 파일은 가로채지 않고 무시
                         val isSegment = Regex("""_[0-9]+\.(html|ts)(\?.*)?$""").containsMatchIn(reqUrl)
-                        
                         if (isSegment) {
-                            // 영상 조각 파일이므로 패스 (가로채지 않음)
                             return super.shouldInterceptRequest(view, request)
                         }
 
-                        // 영상 조각이 아닌 진짜 플레이리스트나 중간 연결 html 파일만 가로챔
+                        // 진짜 플레이리스트나 중간 연결 파일만 가로챔 (master.txt 포함)
                         if ((reqUrl.contains(".m3u8") || reqUrl.contains(".html") || reqUrl.contains("master")) 
-                            && (Regex("p[1-9][0-9]?player2\\.xyz").containsMatchIn(reqUrl)  || reqUrl.contains("bunny-frame") || reqUrl.contains("glamov"))) {
+                            && (Regex("p[1-9][0-9]?player2\\.xyz").containsMatchIn(reqUrl)  || reqUrl.contains("bunny-frame") || reqUrl.contains("glamov") || reqUrl.contains("nnmo0oi1.com"))) {
                             
-                            println("[Kotbc v3.3] Target URL Intercepted (영상 조각 아님): $reqUrl")
+                            println("[Kotbc v3.4] Target URL Intercepted: $reqUrl")
                             
                             handler.removeCallbacks(discoveryTimeout)
                             
@@ -167,7 +171,7 @@ class KotbcExtractor : ExtractorApi() {
                 webView.loadUrl(url, mapOf("Referer" to referer))
 
             } catch (e: Exception) {
-                println("[Kotbc v3.3] WebView Init Error: ${e.message}")
+                println("[Kotbc v3.4] WebView Init Error: ${e.message}")
                 if (cont.isActive) cont.resume(null)
             }
         }
