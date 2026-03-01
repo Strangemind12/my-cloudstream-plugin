@@ -107,9 +107,9 @@ class KotbcExtractor : ExtractorApi() {
                         val reqUrl = request?.url?.toString() ?: ""
                         
                         // [핵심] M3U8 또는 Master.txt 요청 감지
-                        // nnmo0oi1.com 도메인의 .m3u8 또는 .txt 요청을 찾음
+                        // nnmo0oi1.com 도메인의 .m3u8 또는 .txt 요청을 찾음                  
                         if ((reqUrl.contains(".m3u8") || reqUrl.contains(".html") || reqUrl.contains("master")) 
-                            && (reqUrl.contains("p3player2.xyz") || reqUrl.contains("bunny-frame") || reqUrl.contains("glamov"))) {
+                            && (Regex("p[1-9][0-9]?player2\\.xyz").containsMatchIn(reqUrl)  || reqUrl.contains("bunny-frame") || reqUrl.contains("glamov"))) {
                             println("[Kotbc] Target URL Intercepted: $reqUrl")
                             
                             handler.removeCallbacks(discoveryTimeout)
