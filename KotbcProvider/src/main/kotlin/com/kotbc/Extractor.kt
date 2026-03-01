@@ -79,6 +79,7 @@ class KotbcExtractor : ExtractorApi() {
 
                 if (!content.startsWith("#EXTM3U")) {
                     println("[Kotbc v3.2] 본문이 M3U8 포맷이 아님. 내부 M3U8 링크 추출 탐색")
+                    println("[Kotbc v3.2] HTML 내용물(디버깅): $content") // <--- 이 줄을 추가
                     val m3u8Regex = Regex("""(https?://[^"']+\.m3u8[^"']*)""")
                     m3u8Regex.find(content)?.let {
                         finalUrl = it.groupValues[1]
@@ -135,7 +136,7 @@ class KotbcExtractor : ExtractorApi() {
                         val reqUrl = request?.url?.toString() ?: ""
                         
                         // [복구됨] 원본 조건문과 동일하게 .html 유지
-                        if ((reqUrl.contains(".m3u8"))
+                        if ((reqUrl.contains(".m3u8") || reqUrl.contains(".html") || reqUrl.contains("master")) 
                             && (Regex("p[1-9][0-9]?player2\\.xyz").containsMatchIn(reqUrl)  || reqUrl.contains("bunny-frame") || reqUrl.contains("glamov"))) {
                             println("[Kotbc v3.2] Target URL Intercepted: $reqUrl")
                             
