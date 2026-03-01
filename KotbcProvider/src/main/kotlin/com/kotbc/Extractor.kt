@@ -23,9 +23,8 @@ import java.util.Collections
 import kotlin.coroutines.resume
 
 /**
- * KotbcExtractor v3.2 (Based on TVWiki/TVMON Provider)
- * - Uses WebView to intercept requests from nnmo0oi1.com / mov.glamov.com
- * - [v3.2] .html 캡처 후 내부 텍스트를 파싱하여 실제 .m3u8 주소를 추출하도록 로직 보완
+ * KotbcExtractor v3.0 (Based on TVWiki/TVMON Provider)
+ * - Uses WebView to intercept M3U8 requests from nnmo0oi1.com / mov.glamov.com
  */
 class KotbcExtractor : ExtractorApi() {
     override val name = "KOTBC"
@@ -40,7 +39,7 @@ class KotbcExtractor : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        println("[Kotbc v3.2] getUrl 실행: $url")
+        println("[Kotbc] getUrl: $url")
         extract(url, referer, subtitleCallback, callback)
     }
 
@@ -50,11 +49,11 @@ class KotbcExtractor : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // WebView를 통해 1차 URL(주로 .html 또는 .m3u8) 획득
+        // WebView를 통해 최종 M3U8 URL을 획득
         val capturedUrl = runWebViewHook(url, referer ?: "https://m136.kotbc2.com/")
         
         if (capturedUrl != null) {
-            println("[Kotbc v3.2] WebView 캡처 성공: $capturedUrl")
+            println("[Kotbc] WebView 캡처 성공: $capturedUrl")
             
             val headers = mutableMapOf(
                 "User-Agent" to DESKTOP_UA,
@@ -62,52 +61,24 @@ class KotbcExtractor : ExtractorApi() {
                 "Origin" to "https://nnmo0oi1.com"
             )
 
-            // 쿠키가 있다면 헤더에 추가
+            // 쿠키가 있다면 추가
             val cookie = CookieManager.getInstance().getCookie(capturedUrl)
             if (!cookie.isNullOrEmpty()) {
                 headers["Cookie"] = cookie
-                println("[Kotbc v3.2] 쿠키 셋팅 완료")
             }
 
-            var finalUrl = capturedUrl
-            
-            // [v3.2 핵심] 캡처된 URL이 .html 등 M3U8 형식이 아닐 경우 실제 M3U8 추출
-            try {
-                println("[Kotbc v3.2] 캡처된 URL 본문 파싱 시도: $finalUrl")
-                val response = app.get(finalUrl, headers = headers)
-                val content = response.text.trim()
-
-                if (!content.startsWith("#EXTM3U")) {
-                    println("[Kotbc v3.2] 본문이 M3U8 포맷이 아님. 내부 M3U8 링크 추출 탐색")
-                    println("[Kotbc v3.2] HTML 내용물(디버깅): $content") // <--- 이 줄을 추가
-                    val m3u8Regex = Regex("""(https?://[^"']+\.m3u8[^"']*)""")
-                    m3u8Regex.find(content)?.let {
-                        finalUrl = it.groupValues[1]
-                        println("[Kotbc v3.2] 실제 M3U8 주소 추출 성공: $finalUrl")
-                    } ?: run {
-                        println("[Kotbc v3.2] 본문에서 M3U8 링크를 찾지 못함. 원본 URL 유지.")
-                    }
-                } else {
-                    println("[Kotbc v3.2] 캡처된 URL이 이미 정상적인 M3U8입니다.")
-                }
-            } catch (e: Exception) {
-                println("[Kotbc v3.2] 파싱 중 예외 발생: ${e.message}")
-            }
-
-            // 최종 확정된 URL을 플레이어(ExoPlayer)에 전달
-            callback(newExtractorLink(name, name, finalUrl, ExtractorLinkType.M3U8) {
+            callback(newExtractorLink(name, name, capturedUrl, ExtractorLinkType.M3U8) {
                 this.headers = headers
             })
-            println("[Kotbc v3.2] 최종 ExtractorLink 전달 완료")
             return true
         } else {
-            println("[Kotbc v3.2] WebView 캡처 실패")
+            println("[Kotbc] WebView 캡처 실패")
             return false
         }
     }
 
     private suspend fun runWebViewHook(url: String, referer: String) = suspendCancellableCoroutine<String?> { cont ->
-        println("[Kotbc v3.2] WebView 훅 실행: $url")
+        println("[Kotbc] WebView 실행: $url")
         val handler = Handler(Looper.getMainLooper())
         
         handler.post {
@@ -124,7 +95,7 @@ class KotbcExtractor : ExtractorApi() {
                 // 타임아웃 설정 (15초 내에 못 찾으면 종료)
                 val discoveryTimeout = Runnable {
                     if (cont.isActive) {
-                        println("[Kotbc v3.2] WebView Timeout")
+                        println("[Kotbc] WebView Timeout")
                         try { webView.destroy() } catch (e: Exception) {}
                         cont.resume(null)
                     }
@@ -135,10 +106,12 @@ class KotbcExtractor : ExtractorApi() {
                     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                         val reqUrl = request?.url?.toString() ?: ""
                         
-                        // [복구됨] 원본 조건문과 동일하게 .html 유지
-                        if ((reqUrl.contains(".m3u8") || reqUrl.contains(".html") || reqUrl.contains("master")) 
-                            && (Regex("p[1-9][0-9]?player2\\.xyz").containsMatchIn(reqUrl)  || reqUrl.contains("bunny-frame") || reqUrl.contains("glamov"))) {
-                            println("[Kotbc v3.2] Target URL Intercepted: $reqUrl")
+                        // [핵심] M3U8 또는 Master.txt 요청 감지
+                        // nnmo0oi1.com 도메인의 .m3u8 또는 .txt 요청을 찾음
+                        if ((reqUrl.contains(".m3u8") || reqUrl.contains(".txt") || reqUrl.contains("master")) 
+                            && (reqUrl.contains("nnmo0oi1.com") || reqUrl.contains("bunny-frame") || reqUrl.contains("glamov"))) {
+                            
+                            println("[Kotbc] Target URL Intercepted: $reqUrl")
                             
                             handler.removeCallbacks(discoveryTimeout)
                             
@@ -156,7 +129,7 @@ class KotbcExtractor : ExtractorApi() {
                 webView.loadUrl(url, mapOf("Referer" to referer))
 
             } catch (e: Exception) {
-                println("[Kotbc v3.2] WebView Init Error: ${e.message}")
+                println("[Kotbc] WebView Init Error: ${e.message}")
                 if (cont.isActive) cont.resume(null)
             }
         }
