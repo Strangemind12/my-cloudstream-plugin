@@ -135,8 +135,8 @@ class KotbcExtractor : ExtractorApi() {
                         val reqUrl = request?.url?.toString() ?: ""
                         
                         // [복구됨] 원본 조건문과 동일하게 .html 유지
-                        if ((reqUrl.contains(".m3u8") || reqUrl.contains(".txt") || reqUrl.contains("master")) 
-                            && (Regex("nnmo0oi1.com").containsMatchIn(reqUrl)  || reqUrl.contains("bunny-frame") || reqUrl.contains("glamov"))) {
+                        if ((reqUrl.contains(".m3u8")
+                            && (Regex("p[1-9][0-9]?player2\\.xyz").containsMatchIn(reqUrl)  || reqUrl.contains("bunny-frame") || reqUrl.contains("glamov"))) {
                             println("[Kotbc v3.2] Target URL Intercepted: $reqUrl")
                             
                             handler.removeCallbacks(discoveryTimeout)
