@@ -13,16 +13,20 @@ import com.fasterxml.jackson.annotation.JsonProperty
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
 
+// [v1.11 추가] 동시성 제어 및 지연을 위한 라이브러리 추가
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.delay
+
 /**
- * TVWiki Provider v1.6
+ * TVWiki Provider v1.11
+ * [v1.11 수정 사항]
+ * - v1.7 ~ v1.9의 모든 수정 사항 폐기 및 원본 v1.6 구조로 완벽 롤백
+ * - 앱의 12개 카테고리 동시 요청으로 인한 서버의 404/차단 회피를 위해 Mutex Lock 및 무작위 Delay 로직만 추가
  * [v1.6 수정 사항]
  * - 상세 페이지 포스터 Fallback 정규식 강화 (tvwiki숫자.net 형태의 메인 URL 무효화 처리)
  * - 플롯(줄거리) 추출 시 빈 값(Empty)일 경우 "다시보기" 텍스트로 치환되도록 방어 로직 추가
  * - 주요 실행 흐름 추적을 위한 디버깅 로그 추가
- * * [v1.5 수정 사항]
- * - 상세 페이지 포스터 Fallback 로직 강화 (애니/예능 포스터 누락 수정)
- * - 사이트가 og:image에 메인 URL이나 'no_image'를 넣을 경우, 이를 무효 처리하고 터널링된 포스터 사용.
- * - toSearchResponse에서 포스터 절대 경로 변환 로직 추가.
  */
 class TVWiki : MainAPI() {
     override var mainUrl = "https://tvwiki5.net"
@@ -52,6 +56,9 @@ class TVWiki : MainAPI() {
     // 태그 내용 정제용 정규식
     private val tagCleanRegex = Regex("""\s*(한국|해외)?영화\s*\(\d{4}\).*""")
 
+    // [v1.11 추가] 동시 다발적인 카테고리 요청을 한 줄로 세우기 위한 자물쇠 객체
+    private val requestMutex = Mutex()
+
     data class SessionResponse(
         @JsonProperty("success") val success: Boolean,
         @JsonProperty("player_url") val playerUrl: String?,
@@ -68,6 +75,8 @@ class TVWiki : MainAPI() {
         "/movie" to "해외영화",
         "/world" to "해외드라마",
         "/ott_ent" to "해외예능/다큐",
+        "/animation" to "일반 애니메이션",
+        "/ani_movie" to "극장판 애니",
         "/old_ent" to "추억의 예능",
         "/old_drama" to "추억의 드라마"
     )
@@ -76,7 +85,14 @@ class TVWiki : MainAPI() {
         val url = "$mainUrl${request.data}?page=$page"
         
         return try {
-            val doc = app.get(url, headers = commonHeaders).document
+            // [v1.11 수정] 1.6 원본 로직을 유지하되, 뮤텍스 락을 걸어 서버에 한 번에 하나씩만 요청하도록 제어
+            val doc = requestMutex.withLock {
+                val randomDelay = (200..800).random().toLong()
+                println("[TVWiki v1.11] 카테고리 로드 대기: ${request.name} | ${randomDelay}ms 지연 후 요청: $url")
+                delay(randomDelay)
+                app.get(url, headers = commonHeaders).document
+            }
+            
             val list = doc.select("#list_type ul li").mapNotNull { it.toSearchResponse() }
             newHomePageResponse(request.name, list, hasNext = list.isNotEmpty())
         } catch (e: Exception) {
