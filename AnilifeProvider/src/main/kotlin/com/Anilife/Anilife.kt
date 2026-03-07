@@ -26,7 +26,6 @@ class Anilife : MainAPI() {
         "/vodtype/categorize/TV/1" to "TV 애니메이션",
         "/vodtype/categorize/OVA/1" to "OVA",
         "/vodtype/categorize/ONA/1" to "ONA",
-        "/vodtype/categorize/Web/1" to "Web",
         "/vodtype/categorize/SP/1" to "SP",
         "/vodtype/categorize/Movie/1" to "극장판"
     )
