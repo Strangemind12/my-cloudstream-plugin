@@ -1,4 +1,4 @@
-// v1.3 - Auto-extract targetKeyUrl from m3u8Content to bypass 5s timeout limits, keeping videoId proxy structure and key7 bypass logic
+// v1.4 - Ultimate JS Hook (XHR & Fetch dual blind interception based on byte length), full JS console logging, 5s timeout compliance
 package com.anilife
 
 import android.content.Context
@@ -88,9 +88,8 @@ class AnilifeProxyExtractor : ExtractorApi() {
             return false
         }
 
-        // 'key7' 태그가 없으면 후킹 생략 후 원본 재생 우회
         if (!m3u8Content.contains("#EXT-X-KEY") && !m3u8Content.contains("key7")) {
-            println("[Anilife][Proxy] M3U8에 키 태그('key7' 등)가 없습니다. 프록시를 우회하고 직접 재생합니다.")
+            println("[Anilife][Proxy] M3U8에 키 태그가 없습니다. 프록시 우회 직접 재생 적용.")
             callback(newExtractorLink(name, name, m3u8Url, ExtractorLinkType.M3U8) {
                 this.referer = "https://anilife.live/"
                 this.headers = headers
@@ -98,7 +97,6 @@ class AnilifeProxyExtractor : ExtractorApi() {
             return true
         }
 
-        // [v1.3 수정] M3U8 본문에서 targetKeyUrl 자체 추출 (5초 타임아웃 돌파용)
         var actualTargetKeyUrl = targetKeyUrl
         val baseUri = try { URI(m3u8Url) } catch (e: Exception) { null }
         
@@ -106,14 +104,13 @@ class AnilifeProxyExtractor : ExtractorApi() {
             val keyMatch = Regex("""#EXT-X-KEY:.*URI="([^"]+)"""").find(m3u8Content)
             if (keyMatch != null) {
                 actualTargetKeyUrl = resolveUrl(baseUri, m3u8Url, keyMatch.groupValues[1])
-                println("[Anilife][Proxy] M3U8 본문에서 키 URL 자체 추출 성공: $actualTargetKeyUrl")
+                println("[Anilife][Proxy] M3U8 자체 파싱 키 URL: $actualTargetKeyUrl")
             }
         }
 
         val proxy = ProxyWebServer().apply { start() }
         currentProxyServer = proxy
 
-        // 자체 추출된 키 URL을 넘겨 즉각적인 Fetch 통신 유도
         runWebViewKeyFetcher(playerUrl, referer, ssid, actualTargetKeyUrl) { foundKey ->
             proxy.forceSetKey(foundKey)
         }
@@ -142,7 +139,7 @@ class AnilifeProxyExtractor : ExtractorApi() {
             proxy.setPlaylist(sb.toString())
             val finalProxyUrl = "http://127.0.0.1:${proxy.port}/$videoId/playlist.m3u8"
             
-            println("[Anilife][Proxy] 3. 프록시 생성 및 URL 반환 완료: $finalProxyUrl")
+            println("[Anilife][Proxy] 3. 프록시 생성 완료: $finalProxyUrl")
             callback(newExtractorLink(name, name, finalProxyUrl, ExtractorLinkType.M3U8) {
                 this.referer = "https://anilife.live/"
                 this.headers = headers
@@ -173,45 +170,65 @@ class AnilifeProxyExtractor : ExtractorApi() {
             (function() {
                 if (window.ultimateHookDone) return;
                 window.ultimateHookDone = true;
+                console.log("Ultimate Hook Initialized.");
 
-                if ("$fetchTarget" !== "") {
+                // 0. 강제 직접 Fetch 시도
+                if ("$fetchTarget" !== "" && "$fetchTarget" !== "null") {
+                    console.log("Direct fetching target: $fetchTarget");
                     fetch("$fetchTarget", {
                         headers: { "x-user-ssid": "$ssidHeader" }
                     }).then(r => r.arrayBuffer()).then(buf => {
                         let hex = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
                         console.log("CapturedKeyHex:[DIRECT]" + hex);
-                    }).catch(e => console.log("[JS] Direct Fetch failed"));
+                    }).catch(e => console.log("Direct Fetch Failed"));
                 }
 
+                // 1. XMLHttpRequest 완벽 통제
                 const origOpen = XMLHttpRequest.prototype.open;
                 XMLHttpRequest.prototype.open = function() {
-                    this._reqUrl = arguments[1] ? arguments[1].toString() : '';
                     return origOpen.apply(this, arguments);
                 };
                 const origSend = XMLHttpRequest.prototype.send;
                 XMLHttpRequest.prototype.send = function() {
                     this.addEventListener('load', function() {
-                        if (this._reqUrl && (this._reqUrl.includes('enc.bin') || this._reqUrl.includes('key'))) {
-                            try {
+                        try {
+                            if (this.responseType === 'arraybuffer' || this.response instanceof ArrayBuffer) {
                                 let buf = this.response;
-                                if (buf) {
+                                if (buf && (buf.byteLength === 16 || buf.byteLength === 32)) {
                                     let hex = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
                                     console.log("CapturedKeyHex:[XHR]" + hex);
                                 }
-                            } catch(e) {}
-                        }
+                            }
+                        } catch(e) {}
                     });
                     return origSend.apply(this, arguments);
                 };
 
+                // 2. Fetch API 통제 (신형 플레이어 대응)
+                const origFetch = window.fetch;
+                window.fetch = async function() {
+                    const response = await origFetch.apply(this, arguments);
+                    try {
+                        const cloned = response.clone();
+                        cloned.arrayBuffer().then(buf => {
+                            if (buf && (buf.byteLength === 16 || buf.byteLength === 32)) {
+                                let hex = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+                                console.log("CapturedKeyHex:[FETCH]" + hex);
+                            }
+                        }).catch(e => {});
+                    } catch(e) {}
+                    return response;
+                };
+
+                // 3. 자동 재생 트리거 딜레이 단축 (0.5초)
                 setInterval(function() {
                     try {
                         document.querySelectorAll('video').forEach(v => { v.muted = true; v.play(); });
+                        document.querySelectorAll('.jw-video, .jw-button-color, .vjs-big-play-button, .plyr__control').forEach(b => b.click());
                         let center = document.elementFromPoint(window.innerWidth/2, window.innerHeight/2);
                         if(center) center.click();
-                        document.querySelectorAll('.jw-video, .jw-button-color, .vjs-big-play-button').forEach(b => b.click());
                     } catch(e) {}
-                }, 1000);
+                }, 500);
             })();
         """.trimIndent()
 
@@ -230,6 +247,8 @@ class AnilifeProxyExtractor : ExtractorApi() {
                 webView.webChromeClient = object : WebChromeClient() {
                     override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
                         val msg = consoleMessage?.message() ?: ""
+                        println("[Anilife][JS] $msg")
+                        
                         if (msg.startsWith("CapturedKeyHex:")) {
                             val keyHex = msg.substringAfter("CapturedKeyHex:").substringAfter("]")
                             println("[Anilife][Hook] ★ 웹뷰 키 확보 성공 ★: $keyHex")
@@ -250,15 +269,15 @@ class AnilifeProxyExtractor : ExtractorApi() {
                     }
                 }
                 
+                println("[Anilife][Hook] 웹뷰 로드 시작: $url")
                 webView.loadUrl(url, mapOf("Referer" to referer))
                 
-                // WebView key request timeout은 이전 지침에 따라 정확히 5초 유지
                 handler.postDelayed({ 
                     try { 
                         println("[Anilife][Hook] 웹뷰 파괴 완료 (5초 타임아웃 적용)")
                         webView.destroy() 
                     } catch (e: Exception) {} 
-                }, 5000) 
+                }, 5000)
                 
             } catch (e: Exception) {}
         }
