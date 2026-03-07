@@ -7,7 +7,7 @@ import org.jsoup.nodes.Element
 
 class StreamedProvider : MainAPI() {
     // .pk 도메인은 내부적으로 .su 등으로 리다이렉트되거나 API 호출을 위해 사용될 수 있습니다.
-    override var mainUrl = "https://streamed.su"
+    override var mainUrl = "https://streamed.pk"
     override var name = "Streamed"
     override val hasMainPage = true
     override var lang = "en"
