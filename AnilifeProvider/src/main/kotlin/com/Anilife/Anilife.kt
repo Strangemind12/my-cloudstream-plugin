@@ -1,10 +1,9 @@
+// v3.0 - Removed heavy WebViewResolver, implemented pure API fetching
 package com.anilife
 
 import android.util.Base64
-import android.webkit.CookieManager
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.network.WebViewResolver
 import org.jsoup.nodes.Document
 
 class Anilife : MainAPI() {
@@ -37,8 +36,10 @@ class Anilife : MainAPI() {
         
         return try {
             val doc = app.get(url, headers = commonHeaders).document
+            println("$TAG [getMainPage] url: $url")
             newHomePageResponse(request.name, parseCommonList(doc))
         } catch (e: Exception) {
+            println("$TAG [getMainPage] Error: ${e.message}")
             newHomePageResponse(request.name, emptyList())
         }
     }
@@ -52,10 +53,17 @@ class Anilife : MainAPI() {
                 val imgTag = element.selectFirst("img")
                 var poster = imgTag?.attr("src") ?: imgTag?.attr("data-src") ?: ""
                 poster = fixUrl(poster)
+                
+                // 썸네일 누락 시 투명 픽셀 버그 방지
+                if (poster.isEmpty()) {
+                    poster = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+                }
+                
                 val finalHref = if (poster.isNotEmpty()) {
                     val encoded = Base64.encodeToString(poster.toByteArray(), Base64.NO_WRAP)
                     if (rawHref.contains("?")) "$rawHref&poster=$encoded" else "$rawHref?poster=$encoded"
                 } else rawHref
+                
                 newAnimeSearchResponse(title, finalHref, TvType.Anime) {
                     this.posterUrl = poster
                     this.posterHeaders = commonHeaders
@@ -65,10 +73,12 @@ class Anilife : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
+        println("$TAG [search] query: $query")
         return parseCommonList(app.get("$mainUrl/search?keyword=$query", headers = commonHeaders).document)
     }
 
     override suspend fun load(url: String): LoadResponse {
+        println("$TAG [load] url: $url")
         var tunnelingPoster: String? = null
         val cleanUrl = if (url.contains("poster=")) {
             val posterParam = url.substringAfter("poster=")
@@ -112,7 +122,8 @@ class Anilife : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("$TAG [LoadLinks] =================== v86.0 (Blind Proxy) ===================")
+        println("$TAG [LoadLinks] =================== v3.0 (No WebView, Pure API) ===================")
+        println("$TAG [LoadLinks] request data: $data")
         
         var cleanData = data.substringBefore("?poster=")
         var detailReferer = "$mainUrl/"
@@ -124,70 +135,33 @@ class Anilife : MainAPI() {
             } catch (e: Exception) { }
         }
 
+        val videoIdMatch = Regex("""id/(\d+)""").find(cleanData)
+        val videoId = videoIdMatch?.groupValues?.get(1) ?: "unknown_id"
+
         try {
+            // [핵심] 타임아웃을 유발하는 WebViewResolver 완전 제거
             val webResponse = app.get(
                 cleanData, 
-                headers = mapOf("Referer" to detailReferer, "User-Agent" to pcUserAgent), 
-                interceptor = WebViewResolver(Regex(".*"))
+                headers = mapOf("Referer" to detailReferer, "User-Agent" to pcUserAgent)
             )
 
             val playerUrl = AnilifeProxyExtractor().extractPlayerUrl(webResponse.text, mainUrl) ?: return false
             println("$TAG [Step 2] 원본 플레이어 URL: $playerUrl")
 
-            val gcdnInterceptor = WebViewResolver(Regex(""".*api\.gcdn\.app.*"""))
-            val gcdnResponse = app.get(
-                playerUrl,
-                headers = mapOf("User-Agent" to pcUserAgent, "Referer" to webResponse.url),
-                interceptor = gcdnInterceptor
+            return AnilifeProxyExtractor().extractWithProxy(
+                m3u8Url = "", // 어차피 Extractor에서 자체 추출하므로 공백 전달
+                playerUrl = playerUrl,
+                referer = "https://anilife.live/",
+                ssid = null,
+                cookies = "",
+                targetKeyUrl = null,
+                videoId = videoId,
+                callback = callback
             )
-            val sniffedUrl = gcdnResponse.url
-
-            val finalCookies = CookieManager.getInstance().getCookie("https://anilife.live") ?: ""
-            var xUserSsid: String? = null
-            var finalM3u8: String? = null
-            var targetKeyUrl: String? = null
-
-            if (sniffedUrl.contains("/m3u8/st/")) {
-                val apiResponse = app.get(
-                    sniffedUrl,
-                    headers = mapOf("User-Agent" to pcUserAgent, "Referer" to "https://anilife.live/", "Cookie" to finalCookies)
-                )
-                xUserSsid = apiResponse.headers["x-user-ssid"] ?: apiResponse.headers["X-User-Ssid"]
-                val match = Regex("""https://api\.gcdn\.app/v1/manifest/[^"']+""").find(apiResponse.text)
-                if (match != null) {
-                    finalM3u8 = match.value.replace("\\/", "/")
-                    
-                    // M3U8에서 타겟 키 URL 파싱
-                    try {
-                        val m3u8Txt = app.get(finalM3u8, headers = mapOf("User-Agent" to pcUserAgent, "Referer" to "https://anilife.live/")).text
-                        val kMatch = Regex("""URI="([^"]+)"""").find(m3u8Txt)
-                        if (kMatch != null) {
-                            var kUrl = kMatch.groupValues[1]
-                            if (!kUrl.startsWith("http")) {
-                                kUrl = if (kUrl.startsWith("/")) "https://api.gcdn.app$kUrl" else finalM3u8.substringBeforeLast("/") + "/" + kUrl
-                            }
-                            targetKeyUrl = kUrl
-                        }
-                    } catch (e: Exception) {}
-                }
-            } else {
-                finalM3u8 = sniffedUrl
-            }
-
-            if (finalM3u8 != null) {
-                return AnilifeProxyExtractor().extractWithProxy(
-                    m3u8Url = finalM3u8,
-                    playerUrl = playerUrl,
-                    referer = "https://anilife.live/",
-                    ssid = xUserSsid,
-                    cookies = finalCookies,
-                    targetKeyUrl = targetKeyUrl, // 키 URL 추가
-                    callback = callback
-                )
-            }
 
         } catch (e: Exception) {
             e.printStackTrace()
+            println("$TAG [LoadLinks] Error: ${e.message}")
         }
         return false
     }
