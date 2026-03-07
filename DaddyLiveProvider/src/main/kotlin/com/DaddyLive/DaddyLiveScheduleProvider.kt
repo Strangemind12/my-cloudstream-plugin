@@ -16,7 +16,7 @@ class DaddyLiveScheduleProvider : MainAPI() {
     override var mainUrl = "https://dlstreams.top"
     override var name = "DaddyLive"
     override val supportedTypes = setOf(TvType.Live)
-    override var lang = "un"
+    override var lang = "en"
     override val hasMainPage = true
     override val vpnStatus = VPNStatus.MightBeNeeded
 
