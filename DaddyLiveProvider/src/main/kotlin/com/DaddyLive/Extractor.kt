@@ -15,7 +15,7 @@ import kotlinx.coroutines.*
 import kotlin.coroutines.resume
 
 class DaddyLiveExtractor : ExtractorApi() {
-    override val mainUrl = "https://dlhd.link"
+    override val mainUrl = "https://dlstreams.top"
     override val name = "DaddyLive"
     override val requiresReferer = false
     private val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
@@ -106,7 +106,7 @@ class DaddyLiveExtractor : ExtractorApi() {
                     }
                 }
                 
-                webView.loadUrl(targetUrl, mapOf("Referer" to "https://dlhd.link/"))
+                webView.loadUrl(targetUrl, mapOf("Referer" to "https://dlstreams.top"))
 
                 // 35초간 끈질기게 인증 정보를 기다립니다.
                 handler.postDelayed({ 
