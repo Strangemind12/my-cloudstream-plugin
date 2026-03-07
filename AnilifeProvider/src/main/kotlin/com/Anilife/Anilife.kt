@@ -1,4 +1,4 @@
-// v3.6 - Optimized episode parsing (Removed inside-loop prints and regex compilation to prevent ANR)
+// v4.2 - Fixed Video ID extraction regex to support UUID provider format
 package com.anilife
 
 import android.util.Base64
@@ -96,25 +96,19 @@ class Anilife : MainAPI() {
         val tags = doc.select(".genxed a").map { it.text() }
 
         var currentEpisodeNumber = 0
-        
-        // [핵심 최적화] 정규식을 반복문 바깥에서 한 번만 컴파일하여 병목 방지
         val numRegex = Regex("[^0-9.]") 
 
-        // 최신화가 위에 있으므로 reversed()로 1화부터 오름차순으로 처리
         val elements = doc.select(".eplister > ul > li > a").reversed()
         val episodes = elements.mapNotNull { element ->
             val rawHref = fixUrl(element.attr("href"))
             val numText = element.selectFirst(".epl-num")?.text()?.trim() ?: ""
             val epTitle = element.selectFirst(".epl-title")?.text()?.trim() ?: ""
             
-            // 시각적 타이틀은 원본 유지 (예: 1128.5화 - 특별편)
             val fullName = if (numText.isNotEmpty()) "${numText}화 - $epTitle" else epTitle
             val finalHref = if (rawHref.contains("?")) "$rawHref&ref=$encodedRef" else "$rawHref?ref=$encodedRef"
             
-            // 숫자가 아닌 문자 제거 후 정수로 변환 (1128.5 -> 1128)
             val parsedNum = numText.replace(numRegex, "").toFloatOrNull()?.toInt() ?: 0
 
-            // 중복 번호 밀어내기 (Collision 방지)
             if (currentEpisodeNumber == 0) {
                 currentEpisodeNumber = if (parsedNum > 0) parsedNum else 1
             } else {
@@ -125,7 +119,6 @@ class Anilife : MainAPI() {
                 }
             }
 
-            // [핵심 최적화] 반복문 내부의 println 삭제하여 앱 튕김(ANR) 방지
             newEpisode(finalHref) {
                 this.name = fullName
                 this.episode = currentEpisodeNumber
@@ -137,7 +130,7 @@ class Anilife : MainAPI() {
             this.posterHeaders = commonHeaders
             this.plot = plot
             this.tags = tags
-            addEpisodes(DubStatus.Subbed, episodes) // 1화부터 정방향으로 정상 삽입
+            addEpisodes(DubStatus.Subbed, episodes)
         }
     }
 
@@ -147,7 +140,7 @@ class Anilife : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("$TAG [LoadLinks] =================== v3.6 (Optimized Loading) ===================")
+        println("$TAG [LoadLinks] =================== v4.2 (UUID VideoId Regex Fix) ===================")
         println("$TAG [LoadLinks] request data: $data")
         
         var cleanData = data.substringBefore("?poster=")
@@ -160,8 +153,10 @@ class Anilife : MainAPI() {
             } catch (e: Exception) { }
         }
 
-        val videoIdMatch = Regex("""id/(\d+)""").find(cleanData)
+        // [핵심 변경] id/숫자 형태뿐만 아니라 provider/UUID 형태도 완벽하게 캐치하도록 정규식 개선
+        val videoIdMatch = Regex("""(?:id|provider)/([^/?]+)""").find(cleanData)
         val videoId = videoIdMatch?.groupValues?.get(1) ?: "unknown_id"
+        println("$TAG [Step 1] 파싱된 고유 Video ID: $videoId")
 
         try {
             val webResponse = app.get(
@@ -179,7 +174,7 @@ class Anilife : MainAPI() {
                 ssid = null,
                 cookies = "",
                 targetKeyUrl = null,
-                videoId = videoId,
+                videoId = videoId, // 올바르게 파싱된 UUID 전달
                 callback = callback
             )
 
