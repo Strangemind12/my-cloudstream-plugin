@@ -1,4 +1,4 @@
-// v1.2 - Fixed ProxyWebServer blocking & TCP RST bug, reduced WebView timeout to 5s, added videoId to proxy url, bypass key logic, added default parameters to prevent compile error
+// v1.3 - Auto-extract targetKeyUrl from m3u8Content to bypass 5s timeout limits, keeping videoId proxy structure and key7 bypass logic
 package com.anilife
 
 import android.content.Context
@@ -61,8 +61,8 @@ class AnilifeProxyExtractor : ExtractorApi() {
         referer: String,
         ssid: String?,
         cookies: String,
-        targetKeyUrl: String? = null,    // [수정] 빌드 에러 방지를 위해 기본값 null 적용
-        videoId: String = "unknown_id",  // [수정] 빌드 에러 방지를 위해 기본값 적용
+        targetKeyUrl: String? = null,
+        videoId: String = "unknown_id",
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         synchronized(this) { currentProxyServer?.stop(); currentProxyServer = null }
@@ -81,7 +81,6 @@ class AnilifeProxyExtractor : ExtractorApi() {
             headers["X-User-Ssid"] = ssid
         }
 
-        // M3U8 원본 다운로드
         val m3u8Content = try {
             app.get(m3u8Url, headers = headers).text
         } catch (e: Exception) {
@@ -89,7 +88,7 @@ class AnilifeProxyExtractor : ExtractorApi() {
             return false
         }
 
-        // 'key7' 또는 '#EXT-X-KEY' 태그가 없는 영상은 프록시 우회 후 원본 직접 재생 적용
+        // 'key7' 태그가 없으면 후킹 생략 후 원본 재생 우회
         if (!m3u8Content.contains("#EXT-X-KEY") && !m3u8Content.contains("key7")) {
             println("[Anilife][Proxy] M3U8에 키 태그('key7' 등)가 없습니다. 프록시를 우회하고 직접 재생합니다.")
             callback(newExtractorLink(name, name, m3u8Url, ExtractorLinkType.M3U8) {
@@ -99,16 +98,27 @@ class AnilifeProxyExtractor : ExtractorApi() {
             return true
         }
 
+        // [v1.3 수정] M3U8 본문에서 targetKeyUrl 자체 추출 (5초 타임아웃 돌파용)
+        var actualTargetKeyUrl = targetKeyUrl
+        val baseUri = try { URI(m3u8Url) } catch (e: Exception) { null }
+        
+        if (actualTargetKeyUrl.isNullOrBlank()) {
+            val keyMatch = Regex("""#EXT-X-KEY:.*URI="([^"]+)"""").find(m3u8Content)
+            if (keyMatch != null) {
+                actualTargetKeyUrl = resolveUrl(baseUri, m3u8Url, keyMatch.groupValues[1])
+                println("[Anilife][Proxy] M3U8 본문에서 키 URL 자체 추출 성공: $actualTargetKeyUrl")
+            }
+        }
+
         val proxy = ProxyWebServer().apply { start() }
         currentProxyServer = proxy
 
-        // 웹뷰를 띄워서 키만 강제로 탈취
-        runWebViewKeyFetcher(playerUrl, referer, ssid, targetKeyUrl) { foundKey ->
+        // 자체 추출된 키 URL을 넘겨 즉각적인 Fetch 통신 유도
+        runWebViewKeyFetcher(playerUrl, referer, ssid, actualTargetKeyUrl) { foundKey ->
             proxy.forceSetKey(foundKey)
         }
 
         try {
-            val baseUri = try { URI(m3u8Url) } catch (e: Exception) { null }
             val sb = StringBuilder()
             
             for (line in m3u8Content.lines()) {
@@ -118,12 +128,10 @@ class AnilifeProxyExtractor : ExtractorApi() {
                 if (trimmed.startsWith("#EXT-X-KEY")) {
                     val match = Regex("""URI="([^"]+)"""").find(trimmed)
                     if (match != null) {
-                        // 키는 무조건 로컬 프록시를 보도록 수정 (비디오 ID 포함)
                         val newKeyLine = trimmed.replace(match.groupValues[1], "http://127.0.0.1:${proxy.port}/$videoId/key.bin")
                         sb.append(newKeyLine).append("\n")
                     } else sb.append(trimmed).append("\n")
                 } else if (!trimmed.startsWith("#")) {
-                    // 영상 세그먼트는 CDN 절대 주소로 변환하여 프록시 거치지 않게 처리
                     val absSeg = resolveUrl(baseUri, m3u8Url, trimmed)
                     sb.append(absSeg).append("\n")
                 } else {
@@ -132,7 +140,6 @@ class AnilifeProxyExtractor : ExtractorApi() {
             }
             
             proxy.setPlaylist(sb.toString())
-            // 프록시 URL 구조에 비디오 ID 포함 적용
             val finalProxyUrl = "http://127.0.0.1:${proxy.port}/$videoId/playlist.m3u8"
             
             println("[Anilife][Proxy] 3. 프록시 생성 및 URL 반환 완료: $finalProxyUrl")
@@ -156,7 +163,6 @@ class AnilifeProxyExtractor : ExtractorApi() {
         }
     }
 
-    // [v86.0] 궁극의 키 탈취 웹뷰 로직 (타임아웃 단축)
     private fun runWebViewKeyFetcher(url: String, referer: String, ssid: String?, targetKeyUrl: String?, onKeyFound: (String) -> Unit) {
         val handler = Handler(Looper.getMainLooper())
         
@@ -246,12 +252,13 @@ class AnilifeProxyExtractor : ExtractorApi() {
                 
                 webView.loadUrl(url, mapOf("Referer" to referer))
                 
+                // WebView key request timeout은 이전 지침에 따라 정확히 5초 유지
                 handler.postDelayed({ 
                     try { 
                         println("[Anilife][Hook] 웹뷰 파괴 완료 (5초 타임아웃 적용)")
                         webView.destroy() 
                     } catch (e: Exception) {} 
-                }, 5000) // WebView key request timeout을 5초로 하향 적용
+                }, 5000) 
                 
             } catch (e: Exception) {}
         }
@@ -288,7 +295,6 @@ class AnilifeProxyExtractor : ExtractorApi() {
                 while (isRunning) { 
                     try { 
                         val socket = server!!.accept()
-                        // 병목 현상 및 블로킹을 막기 위해 요청당 별도 스레드에서 처리
                         thread { handle(socket) }
                     } catch (e: Exception) {} 
                 } 
@@ -304,7 +310,6 @@ class AnilifeProxyExtractor : ExtractorApi() {
                 val line = reader.readLine() ?: return
                 val path = line.split(" ")[1]
 
-                // [중요 수정] HTTP/1.1 규격에 맞춰 클라이언트 헤더를 모두 읽어내야 TCP RST를 방지할 수 있음.
                 while (true) {
                     val headerLine = reader.readLine()
                     if (headerLine.isNullOrEmpty()) break
@@ -321,7 +326,6 @@ class AnilifeProxyExtractor : ExtractorApi() {
                     path.contains("key.bin") || path.contains("key7") -> {
                         println("[Anilife][Proxy] key 요청됨: $path")
                         
-                        // 타임아웃 5초 (50 * 100ms) 적용
                         var retries = 0
                         while (verifiedKey == null && retries < 50) {
                             Thread.sleep(100)
