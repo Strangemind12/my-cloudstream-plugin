@@ -1,9 +1,10 @@
 /**
- * DaddyLiveExtractor v4.8 (Header Snatcher & New CDN Support)
- * - [핵심] 6개 채널 동시 요청으로 인한 서버의 연결 차단(ERR_CONNECTION_CLOSED) 방지를 위해 순차 탐색(Sequential) 적용
- * - [Fix] WebView 키 요청 대기 타임아웃 5초(5000ms) 유지
- * - [Feature] URL 토큰 인증 방식(md5=, expires=)이 적용된 새로운 CDN(sanwalyaarpya.com 등)의 직링(.m3u8) 추출 로직 추가
- * - [Fix] WebView 자동 재생 차단 해제 (mediaPlaybackRequiresUserGesture = false) 추가 (v4.8)
+ * DaddyLiveExtractor v4.9 (Direct Player Bypass & Kodi Header Sync)
+ * - [핵심] dlstreams.top 광고 페이지를 건너뛰고 채널 ID를 파싱하여 ksohls.ru 플레이어로 직접 진입 (iframe 병목 해결)
+ * - [Fix] Kodi 애드온 참고: Referer 및 Origin을 ksohls.ru 정책에 맞게 동기화
+ * - [Fix] Kodi 애드온 참고: User-Agent를 Chrome/131.0.0.0 으로 업데이트하여 봇 필터링 회피
+ * - [유지] WebView 키 요청 대기 타임아웃 5초(5000ms) 및 자동 재생 해제 로직 보존
+ * - [유지] 기존 isMono, isKey 검출 로직 제거 없이 호환 유지
  */
 package com.DaddyLive
 
@@ -19,15 +20,28 @@ class DaddyLiveExtractor : ExtractorApi() {
     override val mainUrl = "https://dlstreams.top"
     override val name = "DaddyLive"
     override val requiresReferer = false
-    private val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
+    
+    // Kodi 애드온에 명시된 _AUTH_UA 적용
+    private val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    private val playerReferer = "https://www.ksohls.ru/"
 
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val links = AppUtils.tryParseJson<List<Pair<String, String>>>(url) ?: return
-        println("[DaddyLiveExt] v4.8 헤더 스내칭 엔진 가동 (순차 탐색 + 자동 재생 해제)")
+        println("[DaddyLiveExt] v4.9 헤더 스내칭 우회 엔진 가동 (ksohls.ru 직접 호출)")
 
         for ((name, link) in links) {
-            println("[DaddyLiveExt] 시도 중인 링크: $name -> $link")
-            val resultData = runWebViewHeaderSnatcher(name, link)
+            println("[DaddyLiveExt] 시도 중인 원본 링크: $name -> $link")
+            
+            // 1. URL에서 채널 ID 파싱 후 플레이어 직링크 생성 (광고 페이지 우회)
+            val idMatch = Regex("""stream-(\d+)""").find(link)
+            val finalTargetUrl = if (idMatch != null) {
+                "https://www.ksohls.ru/premiumtv/daddyhd.php?id=${idMatch.groupValues[1]}"
+            } else {
+                link
+            }
+            println("[DaddyLiveExt] 플레이어 직링크 우회 접속: $finalTargetUrl")
+
+            val resultData = runWebViewHeaderSnatcher(name, finalTargetUrl)
             
             if (resultData != null) {
                 val (finalUrl, snatchedHeaders) = resultData
@@ -35,7 +49,7 @@ class DaddyLiveExtractor : ExtractorApi() {
                 
                 callback(newExtractorLink(name, name, finalUrl, type = ExtractorLinkType.M3U8) {
                     this.quality = Qualities.Unknown.value
-                    this.referer = "https://lefttoplay.xyz/"
+                    this.referer = playerReferer
                     this.headers = snatchedHeaders
                 })
                 
@@ -51,14 +65,13 @@ class DaddyLiveExtractor : ExtractorApi() {
                 val context = (AcraApplication.context ?: app) as Context
                 val webView = WebView(context)
                 var isFinished = false
-                var capturedLoveCdn: Pair<String, Map<String, String>>? = null
+                var capturedBackup: Pair<String, Map<String, String>>? = null
 
                 webView.settings.apply { 
                     javaScriptEnabled = true
                     domStorageEnabled = true
                     userAgentString = userAgent
                     mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                    // [Fix] 사용자의 화면 터치 없이도 미디어가 자동 재생되도록 허용하여 m3u8 네트워크 요청 유발
                     mediaPlaybackRequiresUserGesture = false 
                 }
 
@@ -70,22 +83,20 @@ class DaddyLiveExtractor : ExtractorApi() {
                         val lower = reqUrl.lowercase()
                         val reqHeaders = request?.requestHeaders ?: mutableMapOf()
 
-                        // 1. 기존 DaddyLive 헤더 인증 방식 감지 (dvalna.ru, mono.css)
+                        // 기존 및 신규 DaddyLive 헤더 인증 방식 감지
                         val isMono = lower.contains("mono.css")
                         val isKey = lower.contains("/key/") && lower.contains("dvalna.ru")
+                        val isM3u8 = lower.contains(".m3u8")
                         val hasAuth = reqHeaders.containsKey("Authorization") || reqHeaders.containsKey("authorization")
 
-                        // 2. 신규 CDN 및 토큰 인증 방식 감지 (sanwalyaarpya.com 또는 md5 토큰이 포함된 m3u8)
-                        val isNewM3u8Cdn = lower.contains(".m3u8") && (lower.contains("sanwalyaarpya.com") || lower.contains("md5="))
-
-                        // --- 분기 1: 신규 CDN 링크 발견 시 ---
-                        if (isNewM3u8Cdn && !isFinished) {
-                            println("[DaddyLiveExt] [$nameTag] ★신규 CDN/토큰 형태의 m3u8 링크를 낚아챘습니다! URL: $reqUrl")
+                        // --- 분기 1: 완벽한 m3u8 스트림 + 인증 헤더 발견 (Kodi 정책과 일치) ---
+                        if (isM3u8 && hasAuth && !isFinished) {
+                            println("[DaddyLiveExt] [$nameTag] ★직통 m3u8 및 인증(Authorization) 헤더 낚아채기 성공! URL: $reqUrl")
                             
                             val headersToSteal = mutableMapOf<String, String>()
                             reqHeaders.forEach { (k, v) -> headersToSteal[k] = v }
-                            headersToSteal["Referer"] = "https://lefttoplay.xyz/"
-                            headersToSteal["Origin"] = "https://lefttoplay.xyz"
+                            headersToSteal["Referer"] = playerReferer
+                            headersToSteal["Origin"] = "https://www.ksohls.ru"
 
                             isFinished = true
                             handler.post { webView.destroy() }
@@ -93,14 +104,14 @@ class DaddyLiveExtractor : ExtractorApi() {
                             return super.shouldInterceptRequest(view, request)
                         }
 
-                        // --- 분기 2: 기존 헤더 인증 방식 발견 시 ---
+                        // --- 분기 2: 기존 레거시 헤더 인증 방식 발견 시 (혹시 모를 서버 롤백 대비) ---
                         if ((isMono || isKey) && hasAuth && !isFinished) {
-                            println("[DaddyLiveExt] [$nameTag] ★기존 헤더 인증 방식(Authorization)을 낚아챘습니다!")
+                            println("[DaddyLiveExt] [$nameTag] ★기존 레거시 헤더(Authorization)를 낚아챘습니다!")
                             
                             val headersToSteal = mutableMapOf<String, String>()
                             reqHeaders.forEach { (k, v) -> headersToSteal[k] = v }
-                            headersToSteal["Referer"] = "https://lefttoplay.xyz/"
-                            headersToSteal["Origin"] = "https://lefttoplay.xyz"
+                            headersToSteal["Referer"] = playerReferer
+                            headersToSteal["Origin"] = "https://www.ksohls.ru"
                             
                             val finalUrl = if (isMono) reqUrl else {
                                 reqUrl.replace("/key/", "/").replace(Regex("/\\d+$"), "/mono.css")
@@ -112,35 +123,30 @@ class DaddyLiveExtractor : ExtractorApi() {
                             return super.shouldInterceptRequest(view, request)
                         }
 
-                        // --- 분기 3: lovecdn.ru 백업용 ---
-                        if (lower.contains("lovecdn.ru") && lower.contains(".m3u8") && !isFinished) {
+                        // --- 분기 3: 백업 캡처 (Authorization이 없더라도 m3u8이면 기록) ---
+                        if (isM3u8 && capturedBackup == null && !isFinished) {
                             val backupHeaders = mutableMapOf<String, String>()
                             reqHeaders.forEach { (k, v) -> backupHeaders[k] = v }
-                            capturedLoveCdn = Pair(reqUrl, backupHeaders)
-                            println("[DaddyLiveExt] [$nameTag] 백업 CDN(lovecdn) 캡처 완료 대기 중...")
-                        }
-
-                        // --- 분기 4: [추가 백업] 알 수 없는 새로운 도메인의 m3u8 검출 시 (구조 변경 대비) ---
-                        if (lower.contains(".m3u8") && capturedLoveCdn == null && !isFinished) {
-                            val backupHeaders = mutableMapOf<String, String>()
-                            reqHeaders.forEach { (k, v) -> backupHeaders[k] = v }
-                            capturedLoveCdn = Pair(reqUrl, backupHeaders)
-                            println("[DaddyLiveExt] [$nameTag] 미확인 신규 도메인의 백업 m3u8 캡처 완료 대기 중...")
+                            backupHeaders["Referer"] = playerReferer
+                            backupHeaders["Origin"] = "https://www.ksohls.ru"
+                            capturedBackup = Pair(reqUrl, backupHeaders)
+                            println("[DaddyLiveExt] [$nameTag] 백업 m3u8 캡처 완료 대기 중...")
                         }
 
                         return super.shouldInterceptRequest(view, request)
                     }
                 }
                 
-                webView.loadUrl(targetUrl, mapOf("Referer" to "https://dlstreams.top"))
+                // 플레이어 서버가 요구하는 Referer를 초기 로드부터 정확히 세팅
+                webView.loadUrl(targetUrl, mapOf("Referer" to playerReferer))
 
                 handler.postDelayed({ 
                     if (!isFinished && cont.isActive) { 
                         isFinished = true
                         webView.destroy()
-                        if (capturedLoveCdn != null) {
+                        if (capturedBackup != null) {
                             println("[DaddyLiveExt] [$nameTag] 1, 2순위 추출 실패, 백업 m3u8 스트림으로 후퇴합니다.")
-                            cont.resume(capturedLoveCdn)
+                            cont.resume(capturedBackup)
                         } else {
                             println("[DaddyLiveExt] [$nameTag] 추출 실패 (타임아웃 5초 - 타겟 데이터 없음)")
                             cont.resume(null)
