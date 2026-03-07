@@ -1,221 +1,192 @@
-// v4.1 - True Ultra-Lightweight Hybrid Proxy (Memory Serving, Video ID Cache Collision Prevented)
+// v3.6 - Optimized episode parsing (Removed inside-loop prints and regex compilation to prevent ANR)
 package com.anilife
 
 import android.util.Base64
-import com.lagradost.cloudstream3.SubtitleFile
-import com.lagradost.cloudstream3.app
-import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import java.io.BufferedReader
-import java.io.InputStreamReader
-import java.net.ServerSocket
-import java.net.Socket
-import java.net.URI
-import kotlin.concurrent.thread
+import org.jsoup.nodes.Document
 
-class AnilifeProxyExtractor : ExtractorApi() {
-    override val name = "AnilifeExtractor"
-    override val mainUrl = "https://api.gcdn.app"
-    override val requiresReferer = false
+class Anilife : MainAPI() {
+    override var mainUrl = "https://anilife.live"
+    override var name = "Anilife"
+    override val hasMainPage = true
+    override var lang = "ko"
+    override val supportedTypes = setOf(TvType.Anime)
 
-    private val DESKTOP_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
+    private val TAG = "[Anilife]"
+    private val pcUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
 
-    companion object {
-        @Volatile private var currentProxyServer: ProxyWebServer? = null
+    private val commonHeaders = mapOf(
+        "User-Agent" to pcUserAgent,
+        "Referer" to "$mainUrl/"
+    )
+
+    override val mainPage = mainPageOf(
+        "/top20" to "실시간 TOP 20",
+        "/vodtype/categorize/TV/1" to "TV 애니메이션",
+        "/vodtype/categorize/OVA/1" to "OVA",
+        "/vodtype/categorize/ONA/1" to "ONA",
+        "/vodtype/categorize/Web/1" to "Web",
+        "/vodtype/categorize/SP/1" to "SP",
+        "/vodtype/categorize/Movie/1" to "극장판"
+    )
+
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        val url = if (request.name.contains("TOP 20")) "$mainUrl${request.data}" 
+                  else "$mainUrl${request.data.substringBeforeLast("/")}/$page"
+        
+        return try {
+            val doc = app.get(url, headers = commonHeaders).document
+            println("$TAG [getMainPage] url: $url")
+            newHomePageResponse(request.name, parseCommonList(doc))
+        } catch (e: Exception) {
+            println("$TAG [getMainPage] Error: ${e.message}")
+            newHomePageResponse(request.name, emptyList())
+        }
     }
 
-    override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) { }
-
-    fun extractPlayerUrl(html: String, domain: String): String? {
-        val patterns = listOf(
-            Regex("""location\.href\s*=\s*["']([^"']+)["']"""),
-            Regex("""["']([^"']*h\/live\?p=[^"']+)["']""")
-        )
-        for (regex in patterns) {
-            regex.find(html)?.let {
-                var url = it.groupValues[1]
-                if (url.contains("h/live") && url.contains("p=")) {
-                    if (!url.startsWith("http")) url = if (url.startsWith("/")) "$domain$url" else "$domain/$url"
-                    return url.replace("\\/", "/")
+    private fun parseCommonList(doc: Document): List<SearchResponse> {
+        return doc.select(".listupd > article.bs").mapNotNull { element ->
+            try {
+                val aTag = element.selectFirst("div.bsx > a") ?: return@mapNotNull null
+                val rawHref = fixUrl(aTag.attr("href"))
+                val title = (element.selectFirst(".tt h2") ?: element.selectFirst(".tt"))?.text()?.trim() ?: "Unknown"
+                val imgTag = element.selectFirst("img")
+                var poster = imgTag?.attr("src") ?: imgTag?.attr("data-src") ?: ""
+                poster = fixUrl(poster)
+                
+                if (poster.isEmpty()) {
+                    poster = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
                 }
+                
+                val finalHref = if (poster.isNotEmpty()) {
+                    val encoded = Base64.encodeToString(poster.toByteArray(), Base64.NO_WRAP)
+                    if (rawHref.contains("?")) "$rawHref&poster=$encoded" else "$rawHref?poster=$encoded"
+                } else rawHref
+                
+                newAnimeSearchResponse(title, finalHref, TvType.Anime) {
+                    this.posterUrl = poster
+                    this.posterHeaders = commonHeaders
+                }
+            } catch (e: Exception) { null }
+        }
+    }
+
+    override suspend fun search(query: String): List<SearchResponse> {
+        println("$TAG [search] query: $query")
+        return parseCommonList(app.get("$mainUrl/search?keyword=$query", headers = commonHeaders).document)
+    }
+
+    override suspend fun load(url: String): LoadResponse {
+        println("$TAG [load] url: $url")
+        var tunnelingPoster: String? = null
+        val cleanUrl = if (url.contains("poster=")) {
+            val posterParam = url.substringAfter("poster=")
+            tunnelingPoster = String(Base64.decode(posterParam.substringBefore("&"), Base64.NO_WRAP))
+            url.substringBefore("?poster=")
+        } else url
+
+        val response = app.get(cleanUrl, headers = commonHeaders)
+        val doc = response.document
+        val finalUrl = response.url
+        val encodedRef = Base64.encodeToString(finalUrl.toByteArray(), Base64.NO_WRAP)
+
+        val title = doc.selectFirst(".entry-title")?.text()?.trim() ?: "Unknown"
+        val plot = doc.selectFirst(".synp .entry-content")?.text()?.trim()
+        val tags = doc.select(".genxed a").map { it.text() }
+
+        var currentEpisodeNumber = 0
+        
+        // [핵심 최적화] 정규식을 반복문 바깥에서 한 번만 컴파일하여 병목 방지
+        val numRegex = Regex("[^0-9.]") 
+
+        // 최신화가 위에 있으므로 reversed()로 1화부터 오름차순으로 처리
+        val elements = doc.select(".eplister > ul > li > a").reversed()
+        val episodes = elements.mapNotNull { element ->
+            val rawHref = fixUrl(element.attr("href"))
+            val numText = element.selectFirst(".epl-num")?.text()?.trim() ?: ""
+            val epTitle = element.selectFirst(".epl-title")?.text()?.trim() ?: ""
+            
+            // 시각적 타이틀은 원본 유지 (예: 1128.5화 - 특별편)
+            val fullName = if (numText.isNotEmpty()) "${numText}화 - $epTitle" else epTitle
+            val finalHref = if (rawHref.contains("?")) "$rawHref&ref=$encodedRef" else "$rawHref?ref=$encodedRef"
+            
+            // 숫자가 아닌 문자 제거 후 정수로 변환 (1128.5 -> 1128)
+            val parsedNum = numText.replace(numRegex, "").toFloatOrNull()?.toInt() ?: 0
+
+            // 중복 번호 밀어내기 (Collision 방지)
+            if (currentEpisodeNumber == 0) {
+                currentEpisodeNumber = if (parsedNum > 0) parsedNum else 1
+            } else {
+                if (parsedNum > currentEpisodeNumber) {
+                    currentEpisodeNumber = parsedNum
+                } else {
+                    currentEpisodeNumber++
+                }
+            }
+
+            // [핵심 최적화] 반복문 내부의 println 삭제하여 앱 튕김(ANR) 방지
+            newEpisode(finalHref) {
+                this.name = fullName
+                this.episode = currentEpisodeNumber
             }
         }
-        return null
+
+        return newAnimeLoadResponse(title, cleanUrl, TvType.Anime) {
+            this.posterUrl = doc.selectFirst(".thumb img")?.attr("src") ?: tunnelingPoster
+            this.posterHeaders = commonHeaders
+            this.plot = plot
+            this.tags = tags
+            addEpisodes(DubStatus.Subbed, episodes) // 1화부터 정방향으로 정상 삽입
+        }
     }
 
-    suspend fun extractWithProxy(
-        m3u8Url: String,
-        playerUrl: String,
-        referer: String,
-        ssid: String?,
-        cookies: String,
-        targetKeyUrl: String? = null,
-        videoId: String = "unknown_id",
+    override suspend fun loadLinks(
+        data: String,
+        isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("[Anilife][Extractor] v4.1 - True Ultra-Lightweight Memory Proxy 시작")
+        println("$TAG [LoadLinks] =================== v3.6 (Optimized Loading) ===================")
+        println("$TAG [LoadLinks] request data: $data")
         
-        val cleanHeaders = mapOf(
-            "User-Agent" to DESKTOP_UA,
-            "Referer" to "https://anilife.live/",
-            "Origin" to "https://anilife.live",
-            "Accept" to "*/*"
-        )
+        var cleanData = data.substringBefore("?poster=")
+        var detailReferer = "$mainUrl/"
+        if (cleanData.contains("ref=")) {
+            try {
+                val refEncoded = cleanData.substringAfter("ref=").substringBefore("&")
+                detailReferer = String(Base64.decode(refEncoded, Base64.NO_WRAP))
+                cleanData = cleanData.substringBefore("?ref=").substringBefore("&ref=")
+            } catch (e: Exception) { }
+        }
+
+        val videoIdMatch = Regex("""id/(\d+)""").find(cleanData)
+        val videoId = videoIdMatch?.groupValues?.get(1) ?: "unknown_id"
 
         try {
-            var finalM3u8 = ""
-            val playerHtml = app.get(playerUrl, headers = cleanHeaders).text
-            val aldataRegex = Regex("""_aldata\s*=\s*['"]([^'"]+)['"]""")
-            val match = aldataRegex.find(playerHtml)
-            
-            if (match != null) {
-                val b64 = match.groupValues[1]
-                val decoded = String(Base64.decode(b64, Base64.DEFAULT))
-                val vid1080Regex = Regex(""""vid_url_1080"\s*:\s*"([^"]+)"""")
-                val vid720Regex = Regex(""""vid_url_720"\s*:\s*"([^"]+)"""")
-                
-                var apiUrl = vid1080Regex.find(decoded)?.groupValues?.get(1)
-                if (apiUrl.isNullOrBlank() || apiUrl == "none") {
-                    apiUrl = vid720Regex.find(decoded)?.groupValues?.get(1)
-                }
-                
-                apiUrl = apiUrl?.replace("\\/", "/")
-                
-                if (!apiUrl.isNullOrBlank() && apiUrl != "none") {
-                    val fullApiUrl = if (apiUrl.startsWith("http")) apiUrl else "https://$apiUrl"
-                    val apiRes = app.get(fullApiUrl, headers = cleanHeaders).text
-                    val urlRegex = Regex(""""url"\s*:\s*"([^"]+)"""")
-                    val extractedUrl = urlRegex.find(apiRes)?.groupValues?.get(1)
-                    
-                    if (!extractedUrl.isNullOrBlank()) {
-                        finalM3u8 = extractedUrl.replace("\\/", "/")
-                    }
-                }
-            }
+            val webResponse = app.get(
+                cleanData, 
+                headers = mapOf("Referer" to detailReferer, "User-Agent" to pcUserAgent)
+            )
 
-            if (finalM3u8.isBlank()) {
-                println("[Anilife][Extractor] M3U8 주소 확보 실패")
-                return false
-            }
+            val playerUrl = AnilifeProxyExtractor().extractPlayerUrl(webResponse.text, mainUrl) ?: return false
+            println("$TAG [Step 2] 원본 플레이어 URL: $playerUrl")
 
-            var m3u8Content = app.get(finalM3u8, headers = cleanHeaders).text
-            var baseUri = try { URI(finalM3u8) } catch (e: Exception) { null }
-
-            if (m3u8Content.contains("#EXT-X-STREAM-INF")) {
-                val subUrlLine = m3u8Content.lines().lastOrNull { it.isNotBlank() && !it.startsWith("#") }
-                if (subUrlLine != null) {
-                    finalM3u8 = resolveUrl(baseUri, finalM3u8, subUrlLine)
-                    m3u8Content = app.get(finalM3u8, headers = cleanHeaders).text
-                    baseUri = try { URI(finalM3u8) } catch (e: Exception) { null }
-                }
-            }
-
-            val sb = StringBuilder()
-            for (lineText in m3u8Content.lines()) {
-                val trimmed = lineText.trim()
-                if (trimmed.isEmpty()) continue
-                
-                if (trimmed.startsWith("#EXT-X-KEY")) {
-                    println("[Anilife][Extractor] 가짜 키(Fake Key) 사전 제거됨: $trimmed")
-                    continue
-                } else if (trimmed.startsWith("#")) {
-                    sb.append(trimmed).append("\n")
-                } else {
-                    val absUrl = resolveUrl(baseUri, finalM3u8, trimmed)
-                    sb.append(absUrl).append("\n")
-                }
-            }
-
-            val processedPlaylist = sb.toString()
-
-            synchronized(this) { currentProxyServer?.stop(); currentProxyServer = null }
-            val proxy = ProxyWebServer().apply { 
-                updatePlaylist(processedPlaylist)
-                start() 
-            }
-            currentProxyServer = proxy
-
-            // [핵심 변경] TVWiki, Movieking과 동일하게 URL에 videoId를 주입하여 ExoPlayer 캐시 꼬임 원천 차단
-            val proxyUrl = "http://127.0.0.1:${proxy.port}/$videoId/playlist.m3u8"
-            println("[Anilife][Extractor] 초경량 메모리 프록시 세팅 완료 URL: $proxyUrl")
-            
-            callback(newExtractorLink(name, name, proxyUrl, ExtractorLinkType.M3U8) {
-                this.referer = "https://anilife.live/"
-                this.headers = cleanHeaders
-            })
-            
-            return true
+            return AnilifeProxyExtractor().extractWithProxy(
+                m3u8Url = "",
+                playerUrl = playerUrl,
+                referer = "https://anilife.live/",
+                ssid = null,
+                cookies = "",
+                targetKeyUrl = null,
+                videoId = videoId,
+                callback = callback
+            )
 
         } catch (e: Exception) {
             e.printStackTrace()
-            println("[Anilife][Extractor] 에러 발생: ${e.message}")
-            return false
+            println("$TAG [LoadLinks] Error: ${e.message}")
         }
-    }
-
-    private fun resolveUrl(baseUri: URI?, baseUrlStr: String, target: String): String {
-        if (target.startsWith("http")) return target
-        return try { baseUri?.resolve(target).toString() } catch (e: Exception) {
-            if (target.startsWith("/")) "${baseUrlStr.substringBefore("/", "https://")}//${baseUrlStr.split("/")[2]}$target"
-            else "${baseUrlStr.substringBeforeLast("/")}/$target"
-        }
-    }
-
-    class ProxyWebServer {
-        var port: Int = 0
-        private var serverSocket: ServerSocket? = null
-        private var isRunning = false
-        @Volatile private var playlistData: String = ""
-
-        fun updatePlaylist(data: String) {
-            playlistData = data
-        }
-
-        fun start() {
-            try {
-                serverSocket = ServerSocket(0).also { port = it.localPort }
-                isRunning = true
-                thread { 
-                    while (isRunning && serverSocket != null && !serverSocket!!.isClosed) { 
-                        try { handleClient(serverSocket!!.accept()) } catch (e: Exception) {} 
-                    } 
-                }
-            } catch (e: Exception) { println("[Anilife][Proxy] Server Start Failed: $e") }
-        }
-
-        fun stop() { 
-            isRunning = false
-            try { serverSocket?.close(); serverSocket = null } catch (e: Exception) {} 
-        }
-
-        private fun handleClient(socket: Socket) {
-            try {
-                socket.soTimeout = 5000
-                val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
-                val line = reader.readLine() ?: return
-                val path = line.split(" ")[1]
-
-                while (true) {
-                    val headerLine = reader.readLine()
-                    if (headerLine.isNullOrEmpty()) break
-                }
-
-                val out = socket.getOutputStream()
-
-                // path가 포함하는 문자열로 판별하므로 videoId가 있어도 정상 서빙
-                if (path.contains("playlist.m3u8")) {
-                    println("[Anilife][Proxy] 초경량 M3U8 메모리 서빙 수행")
-                    out.write("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nAccess-Control-Allow-Origin: *\r\n\r\n".toByteArray())
-                    out.write(playlistData.toByteArray(charset("UTF-8")))
-                } else {
-                    out.write("HTTP/1.1 404 Not Found\r\n\r\n".toByteArray())
-                }
-                out.flush()
-            } catch (e: Exception) {
-            } finally {
-                try { socket.close() } catch (e: Exception) {}
-            }
-        }
+        return false
     }
 }
