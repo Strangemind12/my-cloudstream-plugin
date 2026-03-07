@@ -1,4 +1,4 @@
-// v2.0 - Github aldata extraction logic applied. WebView and ProxyWebServer completely removed.
+// v2.1 - Clean Headers (Removed Cookie & ssid) to match Github logic & prevent CDN 404 in ExoPlayer
 package com.anilife
 
 import android.util.Base64
@@ -44,76 +44,81 @@ class AnilifeProxyExtractor : ExtractorApi() {
         videoId: String = "unknown_id",
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("[Anilife][Extractor] Github 브랜치 로직 적용 - WebView/Proxy 완전 제거")
+        println("[Anilife][Extractor] v2.1 - Clean Headers & Direct API Parsing 시작")
         
-        val headers = mutableMapOf(
+        // [핵심 수정] Github 로직(mod_anilife.py / anilife.go)과 100% 동일하게 맞춥니다.
+        // 기존에는 ExtractorLink에 Cookie와 x-user-ssid를 포함시켰으나, 
+        // ExoPlayer가 세그먼트/키를 요청할 때 CDN에서 비정상 헤더로 간주하여 404를 뱉는 원인이 되므로 완벽히 제거합니다.
+        val cleanHeaders = mapOf(
             "User-Agent" to DESKTOP_UA,
             "Referer" to "https://anilife.live/",
             "Origin" to "https://anilife.live",
-            "Cookie" to cookies,
             "Accept" to "*/*"
         )
-        if (!ssid.isNullOrBlank()) {
-            headers["x-user-ssid"] = ssid
-            headers["X-User-Ssid"] = ssid
-        }
 
         try {
-            // 1. 플레이어 페이지 HTML 요청
-            val playerHtml = app.get(playerUrl, headers = headers).text
-            
-            // 2. _aldata Base64 추출 (Github Python/Go 로직 이식)
-            val aldataRegex = Regex("""_aldata\s*=\s*['"]([A-Za-z0-9+/=]+)['"]""")
-            val match = aldataRegex.find(playerHtml)
-            
             var finalM3u8 = m3u8Url
 
-            if (match != null) {
-                val b64 = match.groupValues[1]
-                val decoded = String(Base64.decode(b64, Base64.DEFAULT))
-                println("[Anilife][Extractor] _aldata 디코딩 성공: $decoded")
-                
-                // 3. 디코딩된 JSON 텍스트에서 vid_url_1080 (또는 720) 추출
-                val vid1080Regex = Regex(""""vid_url_1080"\s*:\s*"([^"]+)"""")
-                val vid720Regex = Regex(""""vid_url_720"\s*:\s*"([^"]+)"""")
-                
-                var apiUrl = vid1080Regex.find(decoded)?.groupValues?.get(1)
-                if (apiUrl.isNullOrBlank() || apiUrl == "none") {
-                    apiUrl = vid720Regex.find(decoded)?.groupValues?.get(1)
+            // 1. Anilife.kt에서 넘어온 URL이 API 주소 형태라면 직접 JSON 파싱하여 M3U8 도출
+            if (finalM3u8.contains("/m3u8/st/")) {
+                println("[Anilife][Extractor] API URL 감지됨, 직접 파싱 시도: $finalM3u8")
+                val apiRes = app.get(finalM3u8, headers = cleanHeaders).text
+                val urlRegex = Regex(""""url"\s*:\s*"([^"]+)"""")
+                val extractedUrl = urlRegex.find(apiRes)?.groupValues?.get(1)
+                if (!extractedUrl.isNullOrBlank()) {
+                    finalM3u8 = extractedUrl.replace("\\/", "/")
+                    println("[Anilife][Extractor] API에서 찐 M3U8 추출 완료: $finalM3u8")
                 }
-                
-                if (!apiUrl.isNullOrBlank() && apiUrl != "none") {
-                    val fullApiUrl = if (apiUrl.startsWith("http")) apiUrl else "https://$apiUrl"
-                    println("[Anilife][Extractor] API URL 확보: $fullApiUrl")
-                    
-                    // 4. API 호출하여 실제 찐 M3U8 주소가 담긴 JSON 배열 획득
-                    val apiRes = app.get(fullApiUrl, headers = headers).text
-                    println("[Anilife][Extractor] API 응답: $apiRes")
-                    
-                    val urlRegex = Regex(""""url"\s*:\s*"([^"]+)"""")
-                    val extractedUrl = urlRegex.find(apiRes)?.groupValues?.get(1)
-                    
-                    if (!extractedUrl.isNullOrBlank()) {
-                        finalM3u8 = extractedUrl.replace("\\/", "/")
-                        println("[Anilife][Extractor] 찐 M3U8 URL 추출 완료: $finalM3u8")
-                    }
-                }
-            } else {
-                println("[Anilife][Extractor] _aldata 추출 실패, 폴백 M3U8 사용")
             }
 
-            // 5. 무거운 로컬 프록시 서버 없이 다이렉트로 ExtractorLink 반환
-            // ExoPlayer에 이 주소와 헤더만 넘겨주면, 암호화 키 요청 등은 알아서 네이티브로 처리합니다.
+            // 2. 혹시라도 파싱이 안 되었을 때를 대비한 _aldata 백업 추출
+            if (!finalM3u8.contains("master.m3u8") && !finalM3u8.contains("manifest")) {
+                println("[Anilife][Extractor] 백업: _aldata 추출 시도")
+                try {
+                    val playerHtml = app.get(playerUrl, headers = cleanHeaders).text
+                    val aldataRegex = Regex("""_aldata\s*=\s*['"]([^'"]+)['"]""")
+                    val match = aldataRegex.find(playerHtml)
+                    
+                    if (match != null) {
+                        val b64 = match.groupValues[1]
+                        val decoded = String(Base64.decode(b64, Base64.DEFAULT))
+                        val vid1080Regex = Regex(""""vid_url_1080"\s*:\s*"([^"]+)"""")
+                        val vid720Regex = Regex(""""vid_url_720"\s*:\s*"([^"]+)"""")
+                        
+                        var apiUrl = vid1080Regex.find(decoded)?.groupValues?.get(1)
+                        if (apiUrl.isNullOrBlank() || apiUrl == "none") {
+                            apiUrl = vid720Regex.find(decoded)?.groupValues?.get(1)
+                        }
+                        
+                        if (!apiUrl.isNullOrBlank() && apiUrl != "none") {
+                            val fullApiUrl = if (apiUrl.startsWith("http")) apiUrl else "https://$apiUrl"
+                            val apiRes = app.get(fullApiUrl, headers = cleanHeaders).text
+                            val urlRegex = Regex(""""url"\s*:\s*"([^"]+)"""")
+                            val extractedUrl = urlRegex.find(apiRes)?.groupValues?.get(1)
+                            if (!extractedUrl.isNullOrBlank()) {
+                                finalM3u8 = extractedUrl.replace("\\/", "/")
+                                println("[Anilife][Extractor] _aldata에서 찐 M3U8 추출 완료: $finalM3u8")
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    println("[Anilife][Extractor] _aldata 백업 추출 실패 (CF 차단 등): ${e.message}")
+                }
+            }
+
+            println("[Anilife][Extractor] 최종 M3U8 전달: $finalM3u8")
+            
+            // 3. 군더더기 없는 깔끔한 헤더와 함께 ExoPlayer로 전달 (404 에러 방지)
             callback(newExtractorLink(name, name, finalM3u8, ExtractorLinkType.M3U8) {
                 this.referer = "https://anilife.live/"
-                this.headers = headers
+                this.headers = cleanHeaders
             })
             
             return true
 
         } catch (e: Exception) {
             e.printStackTrace()
-            println("[Anilife][Extractor] 로직 에러: ${e.message}")
+            println("[Anilife][Extractor] 에러 발생: ${e.message}")
             return false
         }
     }
