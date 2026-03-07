@@ -1,4 +1,4 @@
-// v3.0 - Github _aldata extraction + Recursive Fake Key Stripping Proxy
+// v3.1 - Fixed Coroutine Suspend Context & Unresolved reference build errors
 package com.anilife
 
 import android.util.Base64
@@ -7,6 +7,7 @@ import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import kotlinx.coroutines.runBlocking
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.ServerSocket
@@ -54,7 +55,7 @@ class AnilifeProxyExtractor : ExtractorApi() {
         videoId: String = "unknown_id",
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("[Anilife][Extractor] v3.0 - Recursive Fake Key Stripping Proxy 시작")
+        println("[Anilife][Extractor] v3.1 - Recursive Fake Key Stripping Proxy 시작")
         
         val cleanHeaders = mapOf(
             "User-Agent" to DESKTOP_UA,
@@ -124,14 +125,6 @@ class AnilifeProxyExtractor : ExtractorApi() {
         }
     }
 
-    private fun resolveUrl(baseUri: URI?, baseUrlStr: String, target: String): String {
-        if (target.startsWith("http")) return target
-        return try { baseUri?.resolve(target).toString() } catch (e: Exception) {
-            if (target.startsWith("/")) "${baseUrlStr.substringBefore("/", "https://")}//${baseUrlStr.split("/")[2]}$target"
-            else "${baseUrlStr.substringBeforeLast("/")}/$target"
-        }
-    }
-
     class FakeKeyStripperProxy() {
         var port: Int = 0
         private var server: ServerSocket? = null
@@ -151,6 +144,15 @@ class AnilifeProxyExtractor : ExtractorApi() {
         }
 
         fun stop() { isRunning = false; server?.close() }
+
+        // [수정] 클래스 내부로 이동하여 Unresolved reference 에러 해결
+        private fun resolveUrl(baseUri: URI?, baseUrlStr: String, target: String): String {
+            if (target.startsWith("http")) return target
+            return try { baseUri?.resolve(target).toString() } catch (e: Exception) {
+                if (target.startsWith("/")) "${baseUrlStr.substringBefore("/", "https://")}//${baseUrlStr.split("/")[2]}$target"
+                else "${baseUrlStr.substringBeforeLast("/")}/$target"
+            }
+        }
 
         private fun handle(socket: Socket) {
             try {
@@ -172,8 +174,17 @@ class AnilifeProxyExtractor : ExtractorApi() {
                     
                     println("[Anilife][Proxy] 원본 M3U8 요청 수신 (타겟: $targetUrl)")
 
+                    // [수정] 일반 Thread 내부이므로 runBlocking을 통해 Suspend 함수 호출 강제
                     val m3u8Content = try {
-                        app.get(targetUrl, headers = mapOf("Referer" to "https://anilife.live/", "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36")).text
+                        runBlocking {
+                            app.get(
+                                targetUrl, 
+                                headers = mapOf(
+                                    "Referer" to "https://anilife.live/", 
+                                    "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
+                                )
+                            ).text
+                        }
                     } catch (e: Exception) { "" }
 
                     val baseUri = try { URI(targetUrl) } catch (e: Exception) { null }
