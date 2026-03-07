@@ -13,7 +13,7 @@ import java.text.SimpleDateFormat
 import java.util.*
 
 class DaddyLiveScheduleProvider : MainAPI() {
-    override var mainUrl = "https://dlhd.link"
+    override var mainUrl = "https://dlstreams.top"
     override var name = "DaddyLive"
     override val supportedTypes = setOf(TvType.Live)
     override var lang = "un"
