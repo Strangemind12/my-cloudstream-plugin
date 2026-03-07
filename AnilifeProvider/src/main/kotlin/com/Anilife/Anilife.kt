@@ -1,4 +1,4 @@
-// v4.2 - Fixed Video ID extraction regex to support UUID provider format
+// v4.3 - Disabled pagination for TOP 20 category
 package com.anilife
 
 import android.util.Base64
@@ -26,21 +26,32 @@ class Anilife : MainAPI() {
         "/vodtype/categorize/TV/1" to "TV 애니메이션",
         "/vodtype/categorize/OVA/1" to "OVA",
         "/vodtype/categorize/ONA/1" to "ONA",
+        "/vodtype/categorize/Web/1" to "Web",
         "/vodtype/categorize/SP/1" to "SP",
         "/vodtype/categorize/Movie/1" to "극장판"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        // [핵심 변경] TOP 20은 1페이지만 존재하므로 2페이지부터는 빈 리스트 반환 및 페이지네이션 중단
+        if (request.name.contains("TOP 20") && page > 1) {
+            return newHomePageResponse(request.name, emptyList(), hasNext = false)
+        }
+
         val url = if (request.name.contains("TOP 20")) "$mainUrl${request.data}" 
                   else "$mainUrl${request.data.substringBeforeLast("/")}/$page"
         
         return try {
             val doc = app.get(url, headers = commonHeaders).document
             println("$TAG [getMainPage] url: $url")
-            newHomePageResponse(request.name, parseCommonList(doc))
+            
+            val items = parseCommonList(doc)
+            // TOP 20일 경우에만 다음 페이지가 없음을 명시(hasNext = false), 그 외에는 리스트가 비어있지 않으면 계속 로드
+            val hasNextPage = if (request.name.contains("TOP 20")) false else items.isNotEmpty()
+            
+            newHomePageResponse(request.name, items, hasNext = hasNextPage)
         } catch (e: Exception) {
             println("$TAG [getMainPage] Error: ${e.message}")
-            newHomePageResponse(request.name, emptyList())
+            newHomePageResponse(request.name, emptyList(), hasNext = false)
         }
     }
 
@@ -139,7 +150,7 @@ class Anilife : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("$TAG [LoadLinks] =================== v4.2 (UUID VideoId Regex Fix) ===================")
+        println("$TAG [LoadLinks] =================== v4.3 (TOP 20 Pagination Fix) ===================")
         println("$TAG [LoadLinks] request data: $data")
         
         var cleanData = data.substringBefore("?poster=")
@@ -152,7 +163,6 @@ class Anilife : MainAPI() {
             } catch (e: Exception) { }
         }
 
-        // [핵심 변경] id/숫자 형태뿐만 아니라 provider/UUID 형태도 완벽하게 캐치하도록 정규식 개선
         val videoIdMatch = Regex("""(?:id|provider)/([^/?]+)""").find(cleanData)
         val videoId = videoIdMatch?.groupValues?.get(1) ?: "unknown_id"
         println("$TAG [Step 1] 파싱된 고유 Video ID: $videoId")
@@ -173,7 +183,7 @@ class Anilife : MainAPI() {
                 ssid = null,
                 cookies = "",
                 targetKeyUrl = null,
-                videoId = videoId, // 올바르게 파싱된 UUID 전달
+                videoId = videoId,
                 callback = callback
             )
 
