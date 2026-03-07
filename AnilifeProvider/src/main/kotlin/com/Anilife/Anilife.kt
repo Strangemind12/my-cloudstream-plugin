@@ -1,4 +1,4 @@
-// v3.5 - Fixed episode collision by sequentially incrementing duplicate/decimal episode numbers
+// v3.6 - Optimized episode parsing (Removed inside-loop prints and regex compilation to prevent ANR)
 package com.anilife
 
 import android.util.Base64
@@ -96,9 +96,13 @@ class Anilife : MainAPI() {
         val tags = doc.select(".genxed a").map { it.text() }
 
         var currentEpisodeNumber = 0
+        
+        // [핵심 최적화] 정규식을 반복문 바깥에서 한 번만 컴파일하여 병목 방지
+        val numRegex = Regex("[^0-9.]") 
 
         // 최신화가 위에 있으므로 reversed()로 1화부터 오름차순으로 처리
-        val episodes = doc.select(".eplister > ul > li > a").reversed().mapNotNull { element ->
+        val elements = doc.select(".eplister > ul > li > a").reversed()
+        val episodes = elements.mapNotNull { element ->
             val rawHref = fixUrl(element.attr("href"))
             val numText = element.selectFirst(".epl-num")?.text()?.trim() ?: ""
             val epTitle = element.selectFirst(".epl-title")?.text()?.trim() ?: ""
@@ -108,38 +112,32 @@ class Anilife : MainAPI() {
             val finalHref = if (rawHref.contains("?")) "$rawHref&ref=$encodedRef" else "$rawHref?ref=$encodedRef"
             
             // 숫자가 아닌 문자 제거 후 정수로 변환 (1128.5 -> 1128)
-            val parsedNum = numText.replace(Regex("[^0-9.]"), "").toFloatOrNull()?.toInt() ?: 0
+            val parsedNum = numText.replace(numRegex, "").toFloatOrNull()?.toInt() ?: 0
 
-            // [사용자 요청 로직] 중복 번호 밀어내기
+            // 중복 번호 밀어내기 (Collision 방지)
             if (currentEpisodeNumber == 0) {
-                // 첫 에피소드 초기화
                 currentEpisodeNumber = if (parsedNum > 0) parsedNum else 1
             } else {
                 if (parsedNum > currentEpisodeNumber) {
-                    // 정상적으로 숫자가 건너뛸 경우 해당 숫자 반영 (예: 1130 -> 1135)
                     currentEpisodeNumber = parsedNum
                 } else {
-                    // 번호가 같거나(소수점 잘림 현상) 역전되었을 경우 강제로 1을 더해 앱 중복 삭제 방지
-                    // 예: 1128 -> 1128.5(1128로 인식됨) -> +1 하여 1129로 할당
                     currentEpisodeNumber++
                 }
             }
-            
-            println("$TAG [Episode Mapping] 원본: $numText -> 할당된 앱 에피소드 번호: $currentEpisodeNumber")
 
+            // [핵심 최적화] 반복문 내부의 println 삭제하여 앱 튕김(ANR) 방지
             newEpisode(finalHref) {
                 this.name = fullName
                 this.episode = currentEpisodeNumber
             }
         }
 
-        // 앱 내 표시 순서를 보장하기 위해 한 번 더 뒤집어서 최신화가 위로 오게 반환
         return newAnimeLoadResponse(title, cleanUrl, TvType.Anime) {
             this.posterUrl = doc.selectFirst(".thumb img")?.attr("src") ?: tunnelingPoster
             this.posterHeaders = commonHeaders
             this.plot = plot
             this.tags = tags
-            addEpisodes(DubStatus.Subbed, episodes.reversed())
+            addEpisodes(DubStatus.Subbed, episodes) // 1화부터 정방향으로 정상 삽입
         }
     }
 
@@ -149,7 +147,7 @@ class Anilife : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("$TAG [LoadLinks] =================== v3.5 (Episode Collision Fix) ===================")
+        println("$TAG [LoadLinks] =================== v3.6 (Optimized Loading) ===================")
         println("$TAG [LoadLinks] request data: $data")
         
         var cleanData = data.substringBefore("?poster=")
