@@ -1,3 +1,4 @@
+// v1.1 - Fixed ProxyWebServer blocking & TCP RST bug, reduced WebView timeout to 5s, added videoId to proxy url, bypass key logic
 package com.anilife
 
 import android.content.Context
@@ -61,13 +62,12 @@ class AnilifeProxyExtractor : ExtractorApi() {
         ssid: String?,
         cookies: String,
         targetKeyUrl: String?,
+        videoId: String, // 비디오 ID 매개변수 추가
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         synchronized(this) { currentProxyServer?.stop(); currentProxyServer = null }
 
-        println("[Anilife][Proxy] 1. 블라인드 프록시 초기화 (No-Verify)")
-        val proxy = ProxyWebServer().apply { start() }
-        currentProxyServer = proxy
+        println("[Anilife][Proxy] 1. 프록시 초기화 시작")
 
         val headers = mutableMapOf(
             "User-Agent" to DESKTOP_UA,
@@ -89,7 +89,20 @@ class AnilifeProxyExtractor : ExtractorApi() {
             return false
         }
 
-        // [핵심] 웹뷰를 띄워서 키만 강제로 탈취 (검증 로직 완전 배제)
+        // 'key7' 또는 '#EXT-X-KEY' 태그가 없는 영상은 프록시 우회 후 원본 직접 재생 적용
+        if (!m3u8Content.contains("#EXT-X-KEY") && !m3u8Content.contains("key7")) {
+            println("[Anilife][Proxy] M3U8에 키 태그('key7' 등)가 없습니다. 프록시를 우회하고 직접 재생합니다.")
+            callback(newExtractorLink(name, name, m3u8Url, ExtractorLinkType.M3U8) {
+                this.referer = "https://anilife.live/"
+                this.headers = headers
+            })
+            return true
+        }
+
+        val proxy = ProxyWebServer().apply { start() }
+        currentProxyServer = proxy
+
+        // 웹뷰를 띄워서 키만 강제로 탈취
         runWebViewKeyFetcher(playerUrl, referer, ssid, targetKeyUrl) { foundKey ->
             proxy.forceSetKey(foundKey)
         }
@@ -105,12 +118,12 @@ class AnilifeProxyExtractor : ExtractorApi() {
                 if (trimmed.startsWith("#EXT-X-KEY")) {
                     val match = Regex("""URI="([^"]+)"""").find(trimmed)
                     if (match != null) {
-                        // 키는 무조건 우리 로컬 프록시를 보도록 수정
-                        val newKeyLine = trimmed.replace(match.groupValues[1], "http://127.0.0.1:${proxy.port}/key.bin")
+                        // 키는 무조건 로컬 프록시를 보도록 수정 (비디오 ID 포함)
+                        val newKeyLine = trimmed.replace(match.groupValues[1], "http://127.0.0.1:${proxy.port}/$videoId/key.bin")
                         sb.append(newKeyLine).append("\n")
                     } else sb.append(trimmed).append("\n")
                 } else if (!trimmed.startsWith("#")) {
-                    // 영상 세그먼트는 CDN 절대 주소로 직행 (프록시 거치지 않음)
+                    // 영상 세그먼트는 CDN 절대 주소로 변환하여 프록시 거치지 않게 처리
                     val absSeg = resolveUrl(baseUri, m3u8Url, trimmed)
                     sb.append(absSeg).append("\n")
                 } else {
@@ -119,9 +132,10 @@ class AnilifeProxyExtractor : ExtractorApi() {
             }
             
             proxy.setPlaylist(sb.toString())
-            val finalProxyUrl = "http://127.0.0.1:${proxy.port}/playlist.m3u8"
+            // 프록시 URL 구조에 비디오 ID 포함 적용
+            val finalProxyUrl = "http://127.0.0.1:${proxy.port}/$videoId/playlist.m3u8"
             
-            println("[Anilife][Proxy] 3. 프록시 URL 전달: $finalProxyUrl")
+            println("[Anilife][Proxy] 3. 프록시 생성 및 URL 반환 완료: $finalProxyUrl")
             callback(newExtractorLink(name, name, finalProxyUrl, ExtractorLinkType.M3U8) {
                 this.referer = "https://anilife.live/"
                 this.headers = headers
@@ -142,7 +156,7 @@ class AnilifeProxyExtractor : ExtractorApi() {
         }
     }
 
-    // [v86.0] 궁극의 키 탈취 웹뷰 (직접 Fetch + 강제 클릭 + 통신 후킹 3단 콤보)
+    // [v86.0] 궁극의 키 탈취 웹뷰 로직 (타임아웃 단축)
     private fun runWebViewKeyFetcher(url: String, referer: String, ssid: String?, targetKeyUrl: String?, onKeyFound: (String) -> Unit) {
         val handler = Handler(Looper.getMainLooper())
         
@@ -154,7 +168,6 @@ class AnilifeProxyExtractor : ExtractorApi() {
                 if (window.ultimateHookDone) return;
                 window.ultimateHookDone = true;
 
-                // 1. Direct Fetch 시도 (가장 확실함)
                 if ("$fetchTarget" !== "") {
                     fetch("$fetchTarget", {
                         headers: { "x-user-ssid": "$ssidHeader" }
@@ -164,7 +177,6 @@ class AnilifeProxyExtractor : ExtractorApi() {
                     }).catch(e => console.log("[JS] Direct Fetch failed"));
                 }
 
-                // 2. XHR / Fetch 가로채기
                 const origOpen = XMLHttpRequest.prototype.open;
                 XMLHttpRequest.prototype.open = function() {
                     this._reqUrl = arguments[1] ? arguments[1].toString() : '';
@@ -186,7 +198,6 @@ class AnilifeProxyExtractor : ExtractorApi() {
                     return origSend.apply(this, arguments);
                 };
 
-                // 3. 강제 자동재생 시뮬레이션 (클릭 유도)
                 setInterval(function() {
                     try {
                         document.querySelectorAll('video').forEach(v => { v.muted = true; v.play(); });
@@ -207,7 +218,7 @@ class AnilifeProxyExtractor : ExtractorApi() {
                     javaScriptEnabled = true
                     domStorageEnabled = true
                     userAgentString = DESKTOP_UA
-                    mediaPlaybackRequiresUserGesture = false // 필수
+                    mediaPlaybackRequiresUserGesture = false
                 }
 
                 webView.webChromeClient = object : WebChromeClient() {
@@ -216,7 +227,7 @@ class AnilifeProxyExtractor : ExtractorApi() {
                         if (msg.startsWith("CapturedKeyHex:")) {
                             val keyHex = msg.substringAfter("CapturedKeyHex:").substringAfter("]")
                             println("[Anilife][Hook] ★ 웹뷰 키 확보 성공 ★: $keyHex")
-                            onKeyFound(keyHex) // 발견 즉시 전송
+                            onKeyFound(keyHex)
                         }
                         return true
                     }
@@ -236,8 +247,11 @@ class AnilifeProxyExtractor : ExtractorApi() {
                 webView.loadUrl(url, mapOf("Referer" to referer))
                 
                 handler.postDelayed({ 
-                    try { webView.destroy() } catch (e: Exception) {} 
-                }, 20000)
+                    try { 
+                        println("[Anilife][Hook] 웹뷰 파괴 완료 (5초 타임아웃 적용)")
+                        webView.destroy() 
+                    } catch (e: Exception) {} 
+                }, 5000) // WebView key request timeout을 5초로 하향 적용
                 
             } catch (e: Exception) {}
         }
@@ -257,7 +271,6 @@ class AnilifeProxyExtractor : ExtractorApi() {
                     verifiedKey = rawBytes
                     println("[Anilife][Proxy] 16바이트 정답 키 세팅 완료")
                 } else if (rawBytes.size >= 32) {
-                    // 32바이트 텍스트인 경우 디코딩
                     val text = String(rawBytes).trim()
                     val decoded = text.hexToByteArray()
                     if (decoded.size == 16) {
@@ -271,40 +284,66 @@ class AnilifeProxyExtractor : ExtractorApi() {
         fun start() {
             server = ServerSocket(0).also { port = it.localPort }
             isRunning = true
-            thread { while (isRunning) { try { handle(server!!.accept()) } catch (e: Exception) {} } }
+            thread { 
+                while (isRunning) { 
+                    try { 
+                        val socket = server!!.accept()
+                        // 병목 현상 및 블로킹을 막기 위해 요청당 별도 스레드에서 처리
+                        thread { handle(socket) }
+                    } catch (e: Exception) {} 
+                } 
+            }
         }
 
         fun stop() { isRunning = false; server?.close() }
         fun setPlaylist(p: String) { playlist = p }
 
         private fun handle(socket: Socket) {
-            val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
-            val line = reader.readLine() ?: return
-            val path = line.split(" ")[1]
-            val out = socket.getOutputStream()
+            try {
+                val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
+                val line = reader.readLine() ?: return
+                val path = line.split(" ")[1]
 
-            when {
-                path.contains("playlist.m3u8") -> {
-                    out.write("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\n\r\n".toByteArray())
-                    out.write(playlist.toByteArray())
+                // [중요 수정] HTTP/1.1 규격에 맞춰 클라이언트 헤더를 모두 읽어내야 TCP RST를 방지할 수 있음.
+                while (true) {
+                    val headerLine = reader.readLine()
+                    if (headerLine.isNullOrEmpty()) break
                 }
-                path.contains("/key.bin") -> {
-                    // [핵심] 검증 로직 완전 제거. 웹뷰가 키를 줄 때까지 최대 15초만 대기함.
-                    var retries = 0
-                    while (verifiedKey == null && retries < 150) {
-                        Thread.sleep(100) // 0.1초 단위 대기
-                        retries++
+
+                val out = socket.getOutputStream()
+
+                when {
+                    path.contains("playlist.m3u8") -> {
+                        println("[Anilife][Proxy] playlist.m3u8 요청됨: $path")
+                        out.write("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\n\r\n".toByteArray())
+                        out.write(playlist.toByteArray())
                     }
-                    
-                    if (verifiedKey != null) {
-                        out.write("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nAccess-Control-Allow-Origin: *\r\n\r\n".toByteArray())
-                        out.write(verifiedKey!!)
-                    } else {
-                        out.write("HTTP/1.1 404 Not Found\r\n\r\n".toByteArray())
+                    path.contains("key.bin") || path.contains("key7") -> {
+                        println("[Anilife][Proxy] key 요청됨: $path")
+                        
+                        // 타임아웃 5초 (50 * 100ms) 적용
+                        var retries = 0
+                        while (verifiedKey == null && retries < 50) {
+                            Thread.sleep(100)
+                            retries++
+                        }
+                        
+                        if (verifiedKey != null) {
+                            println("[Anilife][Proxy] 키 반환 성공")
+                            out.write("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nAccess-Control-Allow-Origin: *\r\n\r\n".toByteArray())
+                            out.write(verifiedKey!!)
+                        } else {
+                            println("[Anilife][Proxy] 키 반환 실패 (타임아웃)")
+                            out.write("HTTP/1.1 404 Not Found\r\n\r\n".toByteArray())
+                        }
                     }
                 }
+                out.flush()
+            } catch (e: Exception) {
+                println("[Anilife][Proxy] Handle Error: ${e.message}")
+            } finally {
+                try { socket.close() } catch (e: Exception) {}
             }
-            out.flush(); socket.close()
         }
     }
 }
