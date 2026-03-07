@@ -1,9 +1,9 @@
 /**
- * DaddyLiveExtractor v6.1 (Dynamic Iframe Token Scanner & Ultimate Proxy)
- * - [핵심 원인] ksohls.ru 도메인이 봇 차단(403/Cloudflare)을 걸어 토큰 추출이 거부됨.
- * - [해결] Kodi 애드온의 get_stream_page_url 우회 방식을 포팅하여, 실시간으로 변하는 제3의 iframe(enviromentalspace 등)에서 동적 토큰 탈취 성공.
- * - [Fix] 로컬 프록시 서버가 ExoPlayer의 쿼리스트링 요청(?foo=bar)을 정상 라우팅하지 못하던 버그 수정.
- * - [성능] 암호화 키(Key) 및 TS 세그먼트 요청에 대한 CORS 헤더와 타임아웃 예외 처리 강화.
+ * DaddyLiveExtractor v6.2 (Cloudflare Bypass & Full Headers Sync)
+ * - [핵심 원인] 이전 버전에서 메인 토큰 추출이 막혔던 이유는, app.get 요청 시 브라우저 표준 헤더(Sec-Fetch 등)가 누락되어 Cloudflare의 봇 방어(403)에 차단되었기 때문임.
+ * - [Fix] Kodi와 완벽히 동일한 위장 헤더(getStandardHeaders)를 모든 HTTP 통신에 주입하여 403 캡챠 페이지 차단을 원천 봉쇄.
+ * - [Fix] 서버에서 요구하는 M3U8 원본 플레이리스트의 파일명을 mono.css -> mono.m3u8 로 정정.
+ * - [Fix] 백업 경로(superdinamico, lovecdn)의 다중 iframe 스캔 정밀도를 향상하여 실패 시 2차 방어망 보강.
  */
 package com.DaddyLive
 
@@ -18,7 +18,6 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 import kotlin.concurrent.thread
 
-// ExoPlayer의 암호화 키 우회 다운로드를 전담하는 초경량 로컬 프록시 서버
 object DaddyLiveProxy {
     var port = 0
     private var isRunning = false
@@ -29,13 +28,13 @@ object DaddyLiveProxy {
     val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
     fun startServer() {
-        if (isRunning && serverSocket != null && !serverSocket!!.isClosed) return
+        if (isRunning && serverSocket?.isClosed == false) return
         isRunning = true
         thread {
             try {
                 serverSocket = ServerSocket(0)
                 port = serverSocket!!.localPort
-                println("[DaddyLiveProxy] 로컬 프록시 서버 가동 완료 (Port: $port)")
+                println("[DaddyLiveProxy] 로컬 프록시 서버 가동 (Port: $port)")
                 
                 while (isRunning) {
                     try {
@@ -58,7 +57,6 @@ object DaddyLiveProxy {
             val parts = requestLine.split(" ")
             if (parts.size < 2) return
             
-            // Query Parameter 제거 후 순수 경로만 추출 (버그 픽스)
             val path = parts[1].substringBefore("?")
             val out = client.getOutputStream()
 
@@ -83,17 +81,13 @@ object DaddyLiveProxy {
                         )
                         if (resp.isSuccessful) resp.text else null
                     }
-                } catch (e: Exception) {
-                    println("[DaddyLiveProxy] M3U8 CDN 요청 에러: ${e.message}")
-                    null
-                }
+                } catch (e: Exception) { null }
                 
                 if (responseText == null) { send404(out); return }
                 
                 var m3u8Body = responseText
                 val baseUrl = state.m3u8Url.substringBeforeLast("/") + "/"
                 
-                // M3U8 내부의 AES 키 요청 주소를 내 로컬 프록시로 변조
                 m3u8Body = m3u8Body.replace(Regex("""URI="([^"]+)"""")) { match ->
                     val uri = match.groupValues[1]
                     val km = Regex("""/key/[^/]+/(\d+)""").find(uri)
@@ -104,7 +98,6 @@ object DaddyLiveProxy {
                     }
                 }
 
-                // 상대 경로 TS를 절대 경로로 변환 (ExoPlayer가 직접 받음)
                 val lines = m3u8Body.lines().map { line ->
                     if (line.isNotBlank() && !line.startsWith("#")) {
                         if (line.startsWith("http")) line else baseUrl + line
@@ -150,10 +143,7 @@ object DaddyLiveProxy {
                         val resp = app.get(keyUrl, headers = headers)
                         if (resp.isSuccessful) resp.okhttpResponse.body?.bytes() else null
                     }
-                } catch (e: Exception) {
-                    println("[DaddyLiveProxy] Key 다운로드 에러: ${e.message}")
-                    null
-                }
+                } catch (e: Exception) { null }
                 
                 if (responseBytes == null) { send404(out); return }
                 
@@ -164,7 +154,6 @@ object DaddyLiveProxy {
                 out.write("Connection: close\r\n\r\n".toByteArray())
                 out.write(responseBytes)
                 out.flush()
-
             } else {
                 send404(out)
             }
@@ -221,9 +210,24 @@ class DaddyLiveExtractor : ExtractorApi() {
     
     private val userAgent = DaddyLiveProxy.userAgent
 
+    // Cloudflare 차단 방지를 위한 브라우저 표준 헤더 세트 (Kodi 완벽 동기화)
+    private fun getStandardHeaders(referer: String = "$mainUrl/"): Map<String, String> {
+        return mapOf(
+            "User-Agent" to userAgent,
+            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+            "Accept-Language" to "en-US,en;q=0.9",
+            "Referer" to referer,
+            "Upgrade-Insecure-Requests" to "1",
+            "Sec-Fetch-Dest" to "document",
+            "Sec-Fetch-Mode" to "navigate",
+            "Sec-Fetch-Site" to "none",
+            "Sec-Fetch-User" to "?1"
+        )
+    }
+
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val links = AppUtils.tryParseJson<List<Pair<String, String>>>(url) ?: return
-        println("[DaddyLiveExt] v6.1 동적 iframe 스캐너 및 로컬 프록시 엔진 가동")
+        println("[DaddyLiveExt] v6.2 Cloudflare Bypass & Proxy 엔진 가동")
 
         for ((name, link) in links) {
             val idMatch = Regex("""stream-(\d+)""").find(link)
@@ -233,26 +237,24 @@ class DaddyLiveExtractor : ExtractorApi() {
                 val channelKey = "premium$channelId"
                 
                 try {
-                    // Kodi 방식의 다중 우회 토큰 획득 로직 실행
                     val credentials = fetchAuthCredentials(channelId)
                     
                     if (credentials != null) {
                         val (authToken, channelSalt) = credentials
                         println("[DaddyLiveExt] [$channelKey] 암호화 토큰 탈취 성공!")
                         
-                        // 서버 키 조회
                         val lookupUrl = "https://chevy.vovlacosa.sbs/server_lookup?channel_id=$channelKey"
-                        val lookupJson = app.get(lookupUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to "https://www.ksohls.ru/")).text
+                        val lookupJson = app.get(lookupUrl, headers = getStandardHeaders("https://www.ksohls.ru/")).text
                         val serverKey = Regex(""""server_key"\s*:\s*"([^"]+)"""").find(lookupJson)?.groupValues?.get(1) ?: "zeko"
                         
+                        // v6.2 Fix: mono.css -> mono.m3u8 확장자 변경 (Kodi 최신 사양 적용)
                         val m3u8Url = if (serverKey == "top1/cdn") {
-                            "https://chevy.soyspace.cyou/proxy/top1/cdn/$channelKey/mono.css"
+                            "https://chevy.soyspace.cyou/proxy/top1/cdn/$channelKey/mono.m3u8"
                         } else {
-                            "https://chevy.soyspace.cyou/proxy/$serverKey/$channelKey/mono.css"
+                            "https://chevy.soyspace.cyou/proxy/$serverKey/$channelKey/mono.m3u8"
                         }
-                        println("[DaddyLiveExt] [$channelKey] M3U8 원본 CDN 할당됨: $m3u8Url")
+                        println("[DaddyLiveExt] [$channelKey] 원본 M3U8 할당됨: $m3u8Url")
                         
-                        // 로컬 프록시 구동
                         DaddyLiveProxy.activeChannels[channelKey] = DaddyLiveProxy.ChannelState(authToken, channelSalt, m3u8Url)
                         DaddyLiveProxy.startServer()
                         
@@ -268,20 +270,21 @@ class DaddyLiveExtractor : ExtractorApi() {
                         })
                         break
                     } else {
-                        println("[DaddyLiveExt] [$channelKey] 토큰 추출 1, 2순위 실패. 백업 우회 경로 탐색으로 넘어갑니다.")
+                        println("[DaddyLiveExt] [$channelKey] 토큰 추출 실패. 백업 우회 경로 탐색으로 넘어갑니다.")
                     }
                 } catch (e: Exception) {
                     println("[DaddyLiveExt] [$channelKey] 메인 프로세스 에러: ${e.message}")
                 }
             }
             
-            // 기존 AnyPlayer(백업 우회망) Fallback 로직 유지
-            val streamUrl = getAnyPlayerStream(link)
-            if (streamUrl != null) {
-                println("[DaddyLiveExt] AnyPlayer(백업망) 우회 성공: $streamUrl")
-                val origin = if (streamUrl.contains("sanwalyaarpya.com")) "https://stellarthread.com" else "https://lefttoplay.xyz/"
+            // 백업 우회망 탐색 (메인 추출 실패 시)
+            val fallbackStreamUrl = if (channelId != null) extractFallbackLinks(channelId) else getAnyPlayerStream(link, mainUrl)
+            
+            if (fallbackStreamUrl != null) {
+                println("[DaddyLiveExt] 백업 우회 성공: $fallbackStreamUrl")
+                val origin = if (fallbackStreamUrl.contains("sanwalyaarpya.com")) "https://stellarthread.com" else "https://lefttoplay.xyz/"
                 
-                callback(newExtractorLink(name, name, streamUrl, type = ExtractorLinkType.M3U8) {
+                callback(newExtractorLink(name, name, fallbackStreamUrl, type = ExtractorLinkType.M3U8) {
                     this.quality = Qualities.Unknown.value
                     this.headers = mapOf(
                         "User-Agent" to userAgent,
@@ -295,46 +298,38 @@ class DaddyLiveExtractor : ExtractorApi() {
     }
 
     private suspend fun fetchAuthCredentials(channelId: String): Pair<String, String>? {
-        val watchUrl = "$mainUrl/watch.php?id=$channelId"
-        
-        // 1순위: 메인 플레이어(ksohls) 직접 접근 (Cloudflare에 막힐 확률 높음)
+        // 1순위: 메인 플레이어 (Cloudflare 차단 우회를 위한 표준 헤더 사용)
         val playerUrl1 = "https://www.ksohls.ru/premiumtv/daddyhd.php?id=$channelId"
         try {
-            val html1 = app.get(playerUrl1, headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/")).text
-            val at = extractCredential(html1, "authToken")
-            val cs = extractCredential(html1, "channelSalt")
-            if (at != null && cs != null) {
-                println("[DaddyLiveExt] 1순위 우회 성공 (ksohls.ru 다이렉트)")
-                return Pair(at, cs)
+            val resp1 = app.get(playerUrl1, headers = getStandardHeaders())
+            if (resp1.isSuccessful) {
+                val at = extractCredential(resp1.text, "authToken")
+                val cs = extractCredential(resp1.text, "channelSalt")
+                if (at != null && cs != null) return Pair(at, cs)
             }
-        } catch (e: Exception) {
-            println("[DaddyLiveExt] 1순위 우회 실패: ${e.message}")
-        }
+        } catch (e: Exception) { }
         
-        // 2순위: 동적 iframe 스캔 (enviromentalspace 등 우회 서버 탐색 - Kodi v3 핵심기술)
+        // 2순위: 동적 iframe 스캔
         val paths = listOf("stream", "cast", "watch", "plus", "player")
         for (path in paths) {
             try {
                 val streamPageUrl = "$mainUrl/$path/stream-$channelId.php"
-                val html2 = app.get(streamPageUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to watchUrl)).text
+                val html2 = app.get(streamPageUrl, headers = getStandardHeaders()).text
                 
-                val iframeMatch = Regex("""<iframe[^>]+src=["'](https?://[^"']+premiumtv[^"']+)["']""").find(html2)
-                if (iframeMatch != null) {
-                    val playerUrl2 = iframeMatch.groupValues[1]
-                    println("[DaddyLiveExt] 동적 우회 플레이어 감지: $playerUrl2")
+                val iframes = Regex("""<iframe[^>]+src=["']([^"']+)["']""").findAll(html2)
+                for (iframeMatch in iframes) {
+                    var playerUrl2 = iframeMatch.groupValues[1]
+                    if (playerUrl2.startsWith("//")) playerUrl2 = "https:$playerUrl2"
+                    if (!playerUrl2.startsWith("http")) continue
                     
-                    val html3 = app.get(playerUrl2, headers = mapOf("User-Agent" to userAgent, "Referer" to streamPageUrl)).text
-                    val at = extractCredential(html3, "authToken")
-                    val cs = extractCredential(html3, "channelSalt")
-                    
-                    if (at != null && cs != null) {
-                        println("[DaddyLiveExt] 2순위 동적 iframe 서버를 통한 토큰 탈취 성공!")
-                        return Pair(at, cs)
+                    val resp3 = app.get(playerUrl2, headers = getStandardHeaders(streamPageUrl))
+                    if (resp3.isSuccessful) {
+                        val at = extractCredential(resp3.text, "authToken")
+                        val cs = extractCredential(resp3.text, "channelSalt")
+                        if (at != null && cs != null) return Pair(at, cs)
                     }
                 }
-            } catch (e: Exception) {
-                println("[DaddyLiveExt] 2순위 $path 탐색 에러: ${e.message}")
-            }
+            } catch (e: Exception) { }
         }
         return null
     }
@@ -349,49 +344,82 @@ class DaddyLiveExtractor : ExtractorApi() {
             val key = m2.groupValues[2].toInt()
             val arrM = Regex(initName + """\s*=\s*\[([^\]]+)\]""").find(page)
             if (arrM != null) {
-                val arr = arrM.groupValues[1].split(",").map { it.trim().toInt() }
+                val arr = arrM.groupValues[1].split(",").mapNotNull { it.trim().toIntOrNull() }
                 return arr.map { (it xor key).toChar() }.joinToString("")
             }
         }
         return null
     }
 
-    private suspend fun getAnyPlayerStream(watchUrl: String): String? {
+    private suspend fun extractFallbackLinks(channelId: String): String? {
+        val paths = listOf("stream", "cast", "watch", "plus", "player")
+        for (path in paths) {
+            try {
+                val streamPageUrl = "$mainUrl/$path/stream-$channelId.php"
+                val html = app.get(streamPageUrl, headers = getStandardHeaders()).text
+                
+                val iframes = Regex("""<iframe[^>]+src=["']([^"']+)["']""").findAll(html)
+                for (iframeMatch in iframes) {
+                    var iframeUrl = iframeMatch.groupValues[1]
+                    if (iframeUrl.startsWith("//")) iframeUrl = "https:$iframeUrl"
+                    if (!iframeUrl.startsWith("http")) continue
+                    
+                    val streamUrl = getAnyPlayerStream(iframeUrl, streamPageUrl)
+                    if (streamUrl != null) return streamUrl
+                }
+            } catch (e: Exception) {}
+        }
+        return null
+    }
+
+    private suspend fun getAnyPlayerStream(iframeUrl: String, referer: String): String? {
         try {
-            val response = app.get(watchUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/")).text
-            if (response.contains("ksohls.ru")) return null
+            val response = app.get(iframeUrl, headers = getStandardHeaders(referer)).text
             
-            val sdMatch = Regex("""<iframe[^>]+src=["'](https://[^"']+\.superdinamico\.com/embed\.php[^"']*)["']""").find(response)
-            if (sdMatch != null) {
-                val embedUrl = sdMatch.groupValues[1]
-                val r2 = app.get(embedUrl, headers = mapOf("Referer" to watchUrl, "User-Agent" to userAgent)).text
-                val idMatch = Regex("""get_stream\.php\?id=([a-f0-9]{32})""").find(r2)
+            // ksohls는 프록시 전용이므로 백업에서는 스킵 처리
+            if (response.contains("ksohls.ru") || iframeUrl.contains("ksohls.ru")) return null
+            
+            // 1. superdinamico 우회
+            var sdEmbedUrl = if (iframeUrl.contains("superdinamico.com/embed.php")) iframeUrl else null
+            if (sdEmbedUrl == null) {
+                val sdMatch = Regex("""<iframe[^>]+src=["'](https://[^"']+\.superdinamico\.com/embed\.php[^"']*)["']""").find(response)
+                if (sdMatch != null) sdEmbedUrl = sdMatch.groupValues[1]
+            }
+            if (sdEmbedUrl != null) {
+                val r2 = if (sdEmbedUrl == iframeUrl) response else app.get(sdEmbedUrl, headers = getStandardHeaders(iframeUrl)).text
+                val idMatch = Regex("""get_stream\.php\?id=([a-f0-9]+)""").find(r2)
                 if (idMatch != null) return "https://edg.ligapk.com/exemple.php?id=${idMatch.groupValues[1]}"
             }
-            
-            val lcMatch = Regex("""<iframe[^>]+src=["'](https://lovecdn\.ru/[^"']+)["']""").find(response)
-            if (lcMatch != null) {
-                val embedUrl = lcMatch.groupValues[1]
-                val streamNameMatch = Regex("""[?&]stream=([^&"'>\s]+)""").find(embedUrl)
+
+            // 2. lovecdn 우회
+            var lcEmbedUrl = if (iframeUrl.contains("lovecdn.ru")) iframeUrl else null
+            if (lcEmbedUrl == null) {
+                val lcMatch = Regex("""<iframe[^>]+src=["'](https://lovecdn\.ru/[^"']+)["']""").find(response)
+                if (lcMatch != null) lcEmbedUrl = lcMatch.groupValues[1]
+            }
+            if (lcEmbedUrl != null) {
+                val streamNameMatch = Regex("""[?&]stream=([^&"'>\s]+)""").find(lcEmbedUrl)
                 if (streamNameMatch != null) {
                     val ltUrl = "https://lovetier.bz/player/${streamNameMatch.groupValues[1]}"
-                    val r2 = app.get(ltUrl, headers = mapOf("Referer" to embedUrl, "User-Agent" to userAgent)).text
+                    val r2 = app.get(ltUrl, headers = getStandardHeaders(lcEmbedUrl)).text
                     val streamUrlMatch = Regex("""streamUrl\s*:\s*["'](https?:[^"']+)["']""").find(r2)
                     if (streamUrlMatch != null) return streamUrlMatch.groupValues[1].replace("\\/", "/")
                 }
             }
-            
+
+            // 3. 다이렉트 m3u8
             val m3u8Match = Regex("""["'](https?://[^\s"'<>]+\.m3u8[^"']*)["']""").find(response)
             if (m3u8Match != null) return m3u8Match.groupValues[1]
             
-            val iframes = Regex("""<iframe[^>]+src=["'](https?://[^"']{10,200})["']""").findAll(response)
+            // 4. 알 수 없는 내부 iframe 재귀 파싱
+            val innerIframes = Regex("""<iframe[^>]+src=["'](https?://[^"']+)["']""").findAll(response)
             val skipHosts = listOf("sstatic", "histats", "adsco", "fidget", "chatango", "facebook.com", "google.com", "ksohls.ru")
             
-            for (iframe in iframes) {
-                val iframeUrl = iframe.groupValues[1]
-                if (skipHosts.any { iframeUrl.contains(it) }) continue
+            for (iframe in innerIframes) {
+                val innerUrl = iframe.groupValues[1]
+                if (skipHosts.any { innerUrl.contains(it) }) continue
                 try {
-                    val ri = app.get(iframeUrl, headers = mapOf("Referer" to watchUrl, "User-Agent" to userAgent)).text
+                    val ri = app.get(innerUrl, headers = getStandardHeaders(iframeUrl)).text
                     val mi = Regex("""["'](https?://[^\s"'<>]+\.m3u8[^"']*)["']""").find(ri)
                     if (mi != null) return mi.groupValues[1]
                     
