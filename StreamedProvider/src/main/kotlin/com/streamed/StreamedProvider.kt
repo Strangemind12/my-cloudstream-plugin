@@ -1,4 +1,4 @@
-// 버전 정보: v1.9
+// 버전 정보: v2.0
 package com.streamed
 
 import android.content.Context
@@ -13,7 +13,8 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
 
 class StreamedProvider : MainAPI() {
-    override var mainUrl = "https://streamed.su"
+    // v2.0 변경: 사용자 요청에 따라 .pk 도메인을 기본으로 사용
+    override var mainUrl = "https://streamed.pk"
     override var name = "Streamed"
     override val hasMainPage = true
     override var lang = "en"
@@ -24,6 +25,7 @@ class StreamedProvider : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        println("[Streamed v2.0] 디버깅 - getMainPage 호출: ${request.data}")
         val document = app.get(request.data).document
         val homeList = arrayListOf<SearchResponse>()
         
@@ -39,12 +41,13 @@ class StreamedProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
+        println("[Streamed v2.0] 디버깅 - load 호출: $url")
         val document = app.get(url).document
         val title = document.select("title").text().replace("Stream Links - Streamed", "").trim()
         val sourceLinks = arrayListOf<String>()
         val baseUrl = url.trimEnd('/')
         
-        // v1.9 수정: 사용자가 지정한 하위 경로 순서 적용
+        // 사용자 지정 하위 경로 우선순위 적용
         sourceLinks.add("$baseUrl/admin/1")
         sourceLinks.add("$baseUrl/admin/2")
         sourceLinks.add("$baseUrl/delta/1")
@@ -54,20 +57,37 @@ class StreamedProvider : MainAPI() {
     }
 
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
-        println("[Streamed v1.9] 디버깅 - loadLinks 시작: $data")
+        println("[Streamed v2.0] 디버깅 - loadLinks 시작")
         val links = AppUtils.tryParseJson<List<String>>(data) ?: listOf(data)
         var isSuccess = false
         
         for (sourceUrl in links) {
-            println("[Streamed v1.9] 디버깅 - 탐색 시도: $sourceUrl")
-            val m3u8Url = captureM3u8WithWebView(sourceUrl)
+            println("[Streamed v2.0] 디버깅 - 채널 탐색 시도: $sourceUrl")
+            
+            // 1단계: app.get으로 iframe 소스 직접 추출 시도 (웹뷰 에러 방지)
+            val response = app.get(sourceUrl)
+            val doc = response.document
+            var targetUrl = sourceUrl
+            
+            val iframe = doc.select("iframe").firstOrNull()
+            if (iframe != null) {
+                val src = iframe.attr("src").ifEmpty { iframe.attr("data-src") }
+                if (src.isNotBlank()) {
+                    targetUrl = fixUrl(src)
+                    println("[Streamed v2.0] 디버깅 - Iframe 소스 발견, 직접 접속 수행: $targetUrl")
+                }
+            }
+
+            // 2단계: 플레이어 주소로 네이티브 웹뷰 구동 (Network interception)
+            val m3u8Url = captureM3u8WithWebView(targetUrl)
             
             if (!m3u8Url.isNullOrEmpty()) {
-                println("[Streamed v1.9] 디버깅 - m3u8 가로채기 성공: $m3u8Url")
+                println("[Streamed v2.0] 디버깅 - modifiles.fans 등 최종 패킷 가로채기 성공: $m3u8Url")
                 callback(newExtractorLink(this.name, this.name, m3u8Url, ExtractorLinkType.M3U8) {
-                    this.referer = "https://embedme.top/" // 주요 플레이어 Referer 고정
+                    this.referer = "https://embedme.top/"
                 })
-                isSuccess = true; break // 하나라도 찾으면 종료
+                isSuccess = true
+                break // 성공 시 루프 종료
             }
         }
         return isSuccess
@@ -81,23 +101,24 @@ class StreamedProvider : MainAPI() {
                 val webView = WebView(context)
                 val chromeUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
                 
+                // 쿠키 및 웹뷰 설정 최적화
+                CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
                 webView.settings.apply {
                     javaScriptEnabled = true
                     domStorageEnabled = true
                     databaseEnabled = true
-                    mediaPlaybackRequiresUserGesture = false
                     mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                     userAgentString = chromeUA
+                    cacheMode = WebSettings.LOAD_NO_CACHE
                 }
 
-                // v1.9 수정: 타임아웃 8초로 약간 여유 부여 (Cloudflare 로딩 대기)
                 val timeoutRunnable = Runnable {
                     if (cont.isActive) {
-                        println("[Streamed v1.9] 디버깅 - 웹뷰 타임아웃 종료: $url")
+                        println("[Streamed v2.0] 디버깅 - 웹뷰 타임아웃(5초): $url")
                         webView.stopLoading(); webView.destroy(); cont.resume(null)
                     }
                 }
-                handler.postDelayed(timeoutRunnable, 8000L)
+                handler.postDelayed(timeoutRunnable, 5000L) // 지침 준수: 5초 타임아웃
 
                 webView.webViewClient = object : WebViewClient() {
                     override fun onReceivedSslError(v: WebView?, h: SslErrorHandler?, e: android.net.http.SslError?) { h?.proceed() }
@@ -105,58 +126,45 @@ class StreamedProvider : MainAPI() {
                     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                         val reqUrl = request?.url?.toString() ?: ""
                         
-                        // 1. m3u8 발견 시 즉시 반환
-                        if (reqUrl.contains(".m3u8")) {
-                            println("[Streamed v1.9] 디버깅 - 패킷 캡처 성공!")
+                        // .m3u8 또는 modifiles.fans 패킷 감지 시 즉시 낚아챔
+                        if (reqUrl.contains(".m3u8") || reqUrl.contains("modifiles.fans")) {
+                            println("[Streamed v2.0] 디버깅 - 최종 m3u8 주소 추출 성공: $reqUrl")
                             handler.removeCallbacks(timeoutRunnable)
                             handler.post { if (cont.isActive) { webView.destroy(); cont.resume(reqUrl) } }
-                        }
-                        
-                        // 2. v1.9 핵심: Iframe 소스 발견 시 웹뷰를 해당 페이지로 직접 이동 (CORS 우회)
-                        if (reqUrl.contains("embedme.top") || reqUrl.contains("/player/")) {
-                            if (!view?.url?.contains(reqUrl.substringBefore("?"))!!) {
-                                println("[Streamed v1.9] 디버깅 - 플레이어 소스 감지, 리다이렉트 수행: $reqUrl")
-                                handler.post { view.loadUrl(reqUrl) }
-                            }
                         }
                         return super.shouldInterceptRequest(view, request)
                     }
 
-                    override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
-                        if (request?.isForMainFrame == true) {
-                            println("[Streamed v1.9] 디버깅 - 웹뷰 로드 에러: ${error?.description} (${error?.errorCode})")
-                        }
-                    }
-
                     override fun onPageFinished(view: WebView?, url: String?) {
-                        // v1.9 핵심: 플레이어 내부 버튼을 0.3초 간격으로 매우 공격적으로 클릭 시도
+                        // 플레이어 내부 버튼 자동 클릭 (더 빠르고 공격적인 0.2초 간격)
                         val clickScript = """
-                            var clickInterval = setInterval(function() {
-                                var targets = document.querySelectorAll('video, .play-btn, .plyr__control--overlaid, button, [role="button"]');
-                                targets.forEach(function(t) { 
-                                    try { 
-                                        t.click(); 
-                                        if(t.play) t.play();
-                                    } catch(e) {} 
+                            var itv = setInterval(function() {
+                                var btns = document.querySelectorAll('video, .play-btn, .plyr__control--overlaid, button');
+                                btns.forEach(function(b) { 
+                                    try { b.click(); if(b.play) b.play(); } catch(e){} 
                                 });
-                            }, 300);
-                            setTimeout(function() { clearInterval(clickInterval); }, 5000);
+                            }, 200);
+                            setTimeout(function() { clearInterval(itv); }, 4500);
                         """.trimIndent()
                         view?.evaluateJavascript(clickScript, null)
                     }
+
+                    override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
+                        if (request?.isForMainFrame == true) {
+                            println("[Streamed v2.0] 디버깅 - 웹뷰 로드 오류: ${error?.errorCode} ${error?.description}")
+                        }
+                    }
                 }
 
-                println("[Streamed v1.9] 디버깅 - 웹뷰 백그라운드 로드 시작: $url")
-                // Cloudflare 통과를 위한 추가 헤더 주입
+                println("[Streamed v2.0] 디버깅 - 웹뷰 플레이어 로드 시작: $url")
                 val extraHeaders = mapOf(
-                    "Referer" to "https://streamed.su/",
-                    "Sec-Ch-Ua" to "\"Chromium\";v=\"122\", \"Not(A:Brand\";v=\"24\", \"Google Chrome\";v=\"122\"",
-                    "Sec-Ch-Ua-Mobile" to "?0",
+                    "Referer" to "https://streamed.pk/",
+                    "Sec-Ch-Ua" to "\"Chromium\";v=\"122\", \"Google Chrome\";v=\"122\"",
                     "Sec-Ch-Ua-Platform" to "\"Windows\""
                 )
                 webView.loadUrl(url, extraHeaders)
             } catch (e: Exception) {
-                println("[Streamed v1.9] 디버깅 - 웹뷰 초기화 치명적 오류: ${e.message}")
+                println("[Streamed v2.0] 디버깅 - 웹뷰 초기화 실패: ${e.message}")
                 if (cont.isActive) cont.resume(null)
             }
         }
