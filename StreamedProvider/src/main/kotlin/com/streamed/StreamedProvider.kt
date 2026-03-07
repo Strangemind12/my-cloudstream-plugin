@@ -1,9 +1,9 @@
-// 버전 정보: v1.3
+// 버전 정보: v1.4
 package com.streamed
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import org.jsoup.nodes.Element
+import com.lagradost.cloudstream3.utils.AppUtils.toJson
 
 class StreamedProvider : MainAPI() {
     override var mainUrl = "https://streamed.su"
@@ -17,12 +17,12 @@ class StreamedProvider : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        println("[Streamed v1.3] 디버깅 - getMainPage 호출됨: url=${request.data}, page=$page")
+        println("[Streamed v1.4] 디버깅 - getMainPage 호출됨: url=${request.data}, page=$page")
         
         val document = app.get(request.data).document
         val homeList = arrayListOf<SearchResponse>()
         
-        println("[Streamed v1.3] 디버깅 - 메인 페이지 HTML 파싱 시작")
+        println("[Streamed v1.4] 디버깅 - 메인 페이지 HTML 파싱 시작")
         
         // /watch/ 로 시작하는 a 태그 추출
         document.select("a[href^=/watch/]").forEach { element ->
@@ -34,105 +34,103 @@ class StreamedProvider : MainAPI() {
                 val title = element.text().trim().ifEmpty { parts.last() }
                 val url = fixUrl(href)
                 
-                println("[Streamed v1.3] 디버깅 - 발견된 경기 항목: title=$title, url=$url")
+                println("[Streamed v1.4] 디버깅 - 발견된 경기 항목: title=$title, url=$url")
                 
-                // v1.3 변경점: DaddyLiveScheduleProvider 규격 참고, 빌더 패턴 적용
                 homeList.add(newLiveSearchResponse(title, url) {
-                    this.posterUrl = null // 썸네일 이미지가 확인되면 여기에 할당
+                    this.posterUrl = null
                 })
             }
         }
         
-        println("[Streamed v1.3] 디버깅 - getMainPage 파싱 완료, 총 ${homeList.size}개 항목 반환")
+        println("[Streamed v1.4] 디버깅 - getMainPage 파싱 완료, 총 ${homeList.size}개 항목 반환")
         return newHomePageResponse(request.name, homeList.distinctBy { it.url })
     }
 
     override suspend fun load(url: String): LoadResponse {
-        println("[Streamed v1.3] 디버깅 - load 호출됨: url=$url")
+        println("[Streamed v1.4] 디버깅 - load 호출됨: url=$url")
         
         val document = app.get(url).document
         val title = document.select("title").text().replace("Stream Links - Streamed", "").trim()
         
-        println("[Streamed v1.3] 디버깅 - 추출된 타이틀: $title")
+        println("[Streamed v1.4] 디버깅 - 추출된 타이틀: $title")
         
-        val episodes = arrayListOf<Episode>()
+        val sourceLinks = arrayListOf<String>()
         
-        // 경기 링크 페이지에서 실제 영상 재생 서버(Admin 1, Admin 2 등) 링크 추출
-        document.select("a[href^=/watch/]").forEachIndexed { index, element ->
+        // 경기 링크 페이지에서 실제 영상 재생 서버(Admin 1, Admin 2 등) 링크 일괄 추출
+        document.select("a[href^=/watch/]").forEach { element ->
             val href = element.attr("href")
             val parts = href.trimEnd('/').split("/")
             
-            // URL의 마지막 부분이 숫자인 경우(예: /watch/match-name/1) 소스 링크로 판단
+            // URL의 마지막 부분이 숫자인 경우 소스 링크로 판단 (예: /watch/match-name/1)
             if (parts.isNotEmpty() && parts.last().toIntOrNull() != null) {
-                val epName = element.text().trim().ifEmpty { "Admin ${parts.last()}" }
-                
-                println("[Streamed v1.3] 디버깅 - 발견된 재생 링크: name=$epName, url=${fixUrl(href)}")
-                
-                // v1.3 변경점: TVMon.kt 규격 참고, data 단일 파라미터 및 빌더 패턴 사용
-                episodes.add(newEpisode(fixUrl(href)) {
-                    this.name = epName
-                })
+                val fixedUrl = fixUrl(href)
+                sourceLinks.add(fixedUrl)
+                println("[Streamed v1.4] 디버깅 - 발견된 재생 링크 추가됨: $fixedUrl")
             }
         }
         
-        println("[Streamed v1.3] 디버깅 - load 파싱 완료, 총 ${episodes.size}개 링크 반환")
+        // SvelteKit 동적 렌더링 등의 이유로 정적 a 태그를 찾지 못했을 경우의 안전 장치
+        if (sourceLinks.isEmpty()) {
+            println("[Streamed v1.4] 디버깅 - 상세 페이지에서 분기 링크를 찾지 못해 기본 url을 바로 넘깁니다.")
+            sourceLinks.add(url)
+        }
         
-        // v1.3 변경점: 다중 채널을 에피소드 형태로 반환 (TVMon.kt 참고)
-        return newTvSeriesLoadResponse(title, url, TvType.Live, episodes) {
+        println("[Streamed v1.4] 디버깅 - load 파싱 완료. 앱 메인에 재생 버튼을 활성화시키기 위해 LiveStreamLoadResponse를 반환합니다.")
+        
+        // v1.4 핵심 변경점: 다중 소스 링크 리스트를 Json 문자열로 변환해 dataUrl에 통째로 심어 loadLinks로 전달 (DaddyLive 방식)
+        return newLiveStreamLoadResponse(title, url, dataUrl = sourceLinks.toJson()) {
             this.posterUrl = null
         }
     }
 
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
-        println("[Streamed v1.3] 디버깅 - loadLinks 호출됨: data=$data")
+        println("[Streamed v1.4] 디버깅 - loadLinks 호출됨 (재생 버튼 클릭됨): data=$data")
         
-        val response = app.get(data)
-        val document = response.document
-        val html = document.html()
-        
-        println("[Streamed v1.3] 디버깅 - 재생 페이지 HTML 가져오기 성공, iframe 또는 m3u8 검색 시작")
-        
+        // Json 배열로 넘어온 dataUrl을 다시 리스트로 복원
+        val links = AppUtils.tryParseJson<List<String>>(data) ?: listOf(data)
         var isSuccess = false
         
-        // 1. iframe 소스 추출 시도
-        document.select("iframe").forEach { iframe ->
-            val src = iframe.attr("src")
-            println("[Streamed v1.3] 디버깅 - iframe 발견: src=$src")
-            if (src.isNotBlank()) {
-                val fixedSrc = fixUrl(src)
-                println("[Streamed v1.3] 디버깅 - iframe 경로 처리 중: $fixedSrc")
-                loadExtractor(fixedSrc, data, subtitleCallback, callback)
+        links.forEachIndexed { index, sourceUrl ->
+            println("[Streamed v1.4] 디버깅 - Admin ${index + 1} 서버 탐색 중: $sourceUrl")
+            val response = app.get(sourceUrl)
+            val html = response.document.html()
+            
+            // 1. iframe 소스 추출 시도
+            response.document.select("iframe").forEach { iframe ->
+                val src = iframe.attr("src")
+                if (src.isNotBlank()) {
+                    val fixedSrc = fixUrl(src)
+                    println("[Streamed v1.4] 디버깅 - iframe 발견: src=$fixedSrc")
+                    loadExtractor(fixedSrc, sourceUrl, subtitleCallback, callback)
+                    isSuccess = true
+                }
+            }
+            
+            // 2. 평문 m3u8 URL이 HTML 내부에 있는지 정규식으로 직접 탐색
+            val m3u8Regex = """(https?://[^"'\s]+\.m3u8[^"'\s]*)""".toRegex()
+            val m3u8Match = m3u8Regex.find(html)
+            
+            if (m3u8Match != null) {
+                val m3u8Url = m3u8Match.groupValues[1]
+                val sourceName = if (links.size > 1) "Admin ${index + 1}" else this.name
+                println("[Streamed v1.4] 디버깅 - m3u8 매칭 성공: name=$sourceName, url=$m3u8Url")
+                
+                callback(
+                    newExtractorLink(
+                        name = sourceName,
+                        source = this.name,
+                        url = m3u8Url,
+                        type = ExtractorLinkType.M3U8
+                    ) {
+                        this.referer = mainUrl
+                    }
+                )
                 isSuccess = true
             }
         }
         
-        // 2. 평문 m3u8 URL이 HTML 내부에 있는지 정규식으로 직접 탐색
-        val m3u8Regex = """(https?://[^"'\s]+\.m3u8[^"'\s]*)""".toRegex()
-        val m3u8Match = m3u8Regex.find(html)
-        
-        if (m3u8Match != null) {
-            val m3u8Url = m3u8Match.groupValues[1]
-            println("[Streamed v1.3] 디버깅 - m3u8 정규식 매칭 성공: url=$m3u8Url")
-            
-            // v1.3 변경점: TVMon.kt의 Extractor 규격 완전 적용 (ExtractorLinkType 열거형 및 빌더 패턴 사용)
-            callback(
-                newExtractorLink(
-                    name = this.name,
-                    source = this.name,
-                    url = m3u8Url,
-                    type = ExtractorLinkType.M3U8
-                ) {
-                    this.referer = mainUrl
-                }
-            )
-            isSuccess = true
-        } else {
-            println("[Streamed v1.3] 디버깅 - m3u8 정규식 매칭 실패. 크롬 개발자 도구 '네트워크(Network)' 탭 분석이 필요할 수 있습니다.")
-        }
-        
-        // 3. 난독화 객체 탐지 로그
-        if (html.contains("window['")) {
-            println("[Streamed v1.3] 디버깅 - 난독화된 자바스크립트 블록이 탐지되었습니다. 정적 파싱이 실패할 경우 WebView 렌더러 연동 등 추가 작업이 필요합니다.")
+        if (!isSuccess) {
+            println("[Streamed v1.4] 디버깅 - 모든 Admin 서버 탐색 완료. 추출된 링크가 없습니다. 동적 렌더링 우회용 WebView가 필요할 수 있습니다.")
         }
         
         return isSuccess
