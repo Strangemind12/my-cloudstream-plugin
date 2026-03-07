@@ -1,8 +1,9 @@
 /**
- * DaddyLiveExtractor v4.7 (Header Snatcher & New CDN Support)
+ * DaddyLiveExtractor v4.8 (Header Snatcher & New CDN Support)
  * - [핵심] 6개 채널 동시 요청으로 인한 서버의 연결 차단(ERR_CONNECTION_CLOSED) 방지를 위해 순차 탐색(Sequential) 적용
  * - [Fix] WebView 키 요청 대기 타임아웃 5초(5000ms) 유지
  * - [Feature] URL 토큰 인증 방식(md5=, expires=)이 적용된 새로운 CDN(sanwalyaarpya.com 등)의 직링(.m3u8) 추출 로직 추가
+ * - [Fix] WebView 자동 재생 차단 해제 (mediaPlaybackRequiresUserGesture = false) 추가 (v4.8)
  */
 package com.DaddyLive
 
@@ -22,7 +23,7 @@ class DaddyLiveExtractor : ExtractorApi() {
 
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val links = AppUtils.tryParseJson<List<Pair<String, String>>>(url) ?: return
-        println("[DaddyLiveExt] v4.7 헤더 스내칭 엔진 가동 (순차 탐색 + New CDN 지원)")
+        println("[DaddyLiveExt] v4.8 헤더 스내칭 엔진 가동 (순차 탐색 + 자동 재생 해제)")
 
         for ((name, link) in links) {
             println("[DaddyLiveExt] 시도 중인 링크: $name -> $link")
@@ -57,6 +58,8 @@ class DaddyLiveExtractor : ExtractorApi() {
                     domStorageEnabled = true
                     userAgentString = userAgent
                     mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                    // [Fix] 사용자의 화면 터치 없이도 미디어가 자동 재생되도록 허용하여 m3u8 네트워크 요청 유발
+                    mediaPlaybackRequiresUserGesture = false 
                 }
 
                 webView.webViewClient = object : WebViewClient() {
@@ -114,6 +117,15 @@ class DaddyLiveExtractor : ExtractorApi() {
                             val backupHeaders = mutableMapOf<String, String>()
                             reqHeaders.forEach { (k, v) -> backupHeaders[k] = v }
                             capturedLoveCdn = Pair(reqUrl, backupHeaders)
+                            println("[DaddyLiveExt] [$nameTag] 백업 CDN(lovecdn) 캡처 완료 대기 중...")
+                        }
+
+                        // --- 분기 4: [추가 백업] 알 수 없는 새로운 도메인의 m3u8 검출 시 (구조 변경 대비) ---
+                        if (lower.contains(".m3u8") && capturedLoveCdn == null && !isFinished) {
+                            val backupHeaders = mutableMapOf<String, String>()
+                            reqHeaders.forEach { (k, v) -> backupHeaders[k] = v }
+                            capturedLoveCdn = Pair(reqUrl, backupHeaders)
+                            println("[DaddyLiveExt] [$nameTag] 미확인 신규 도메인의 백업 m3u8 캡처 완료 대기 중...")
                         }
 
                         return super.shouldInterceptRequest(view, request)
@@ -127,10 +139,10 @@ class DaddyLiveExtractor : ExtractorApi() {
                         isFinished = true
                         webView.destroy()
                         if (capturedLoveCdn != null) {
-                            println("[DaddyLiveExt] [$nameTag] 1, 2순위 추출 실패, 백업 lovecdn으로 후퇴")
+                            println("[DaddyLiveExt] [$nameTag] 1, 2순위 추출 실패, 백업 m3u8 스트림으로 후퇴합니다.")
                             cont.resume(capturedLoveCdn)
                         } else {
-                            println("[DaddyLiveExt] [$nameTag] 추출 실패 (타임아웃 5초)")
+                            println("[DaddyLiveExt] [$nameTag] 추출 실패 (타임아웃 5초 - 타겟 데이터 없음)")
                             cont.resume(null)
                         }
                     } 
