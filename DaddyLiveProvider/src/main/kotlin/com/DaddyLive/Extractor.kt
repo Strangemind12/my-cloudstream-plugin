@@ -1,8 +1,8 @@
 /**
- * DaddyLiveExtractor v4.5 (Header Snatcher)
- * - [핵심] Header Snatching: WebView가 생성한 Authorization 및 X-Key 헤더를 실시간 복제
- * - [핵심] 재생 보장: 웹뷰가 통과한 보안 검증 결과(헤더)를 플레이어에 그대로 덮어씌움
- * - [Fix] mono.css 발견 시에만 종료하여 가짜 주소에 속지 않도록 설계
+ * DaddyLiveExtractor v4.7 (Header Snatcher & New CDN Support)
+ * - [핵심] 6개 채널 동시 요청으로 인한 서버의 연결 차단(ERR_CONNECTION_CLOSED) 방지를 위해 순차 탐색(Sequential) 적용
+ * - [Fix] WebView 키 요청 대기 타임아웃 5초(5000ms) 유지
+ * - [Feature] URL 토큰 인증 방식(md5=, expires=)이 적용된 새로운 CDN(sanwalyaarpya.com 등)의 직링(.m3u8) 추출 로직 추가
  */
 package com.DaddyLive
 
@@ -22,21 +22,23 @@ class DaddyLiveExtractor : ExtractorApi() {
 
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val links = AppUtils.tryParseJson<List<Pair<String, String>>>(url) ?: return
-        println("[DaddyLiveExt] v4.5 헤더 스내칭 엔진 가동")
+        println("[DaddyLiveExt] v4.7 헤더 스내칭 엔진 가동 (순차 탐색 + New CDN 지원)")
 
-        coroutineScope {
-            links.amap { (name, link) ->
-                val resultData = runWebViewHeaderSnatcher(name, link)
-                if (resultData != null) {
-                    val (finalUrl, snatchedHeaders) = resultData
-                    println("[DaddyLiveExt] ★인증 헤더 확보 성공: $finalUrl")
-                    
-                    callback(newExtractorLink(name, name, finalUrl, type = ExtractorLinkType.M3U8) {
-                        this.quality = Qualities.Unknown.value
-                        this.referer = "https://lefttoplay.xyz/"
-                        this.headers = snatchedHeaders // 웹뷰에서 훔친 헤더들을 플레이어에 주입
-                    })
-                }
+        for ((name, link) in links) {
+            println("[DaddyLiveExt] 시도 중인 링크: $name -> $link")
+            val resultData = runWebViewHeaderSnatcher(name, link)
+            
+            if (resultData != null) {
+                val (finalUrl, snatchedHeaders) = resultData
+                println("[DaddyLiveExt] ★최종 추출된 영상 URL: $finalUrl")
+                
+                callback(newExtractorLink(name, name, finalUrl, type = ExtractorLinkType.M3U8) {
+                    this.quality = Qualities.Unknown.value
+                    this.referer = "https://lefttoplay.xyz/"
+                    this.headers = snatchedHeaders
+                })
+                
+                break
             }
         }
     }
@@ -65,27 +67,39 @@ class DaddyLiveExtractor : ExtractorApi() {
                         val lower = reqUrl.lowercase()
                         val reqHeaders = request?.requestHeaders ?: mutableMapOf()
 
-                        // 1. [사용자 요청 핵심] dvalna.ru의 mono.css 혹은 키 주소 감지
+                        // 1. 기존 DaddyLive 헤더 인증 방식 감지 (dvalna.ru, mono.css)
                         val isMono = lower.contains("mono.css")
                         val isKey = lower.contains("/key/") && lower.contains("dvalna.ru")
-                        
-                        // 2. 인증 헤더(Authorization)가 포함되어 있는지 확인
                         val hasAuth = reqHeaders.containsKey("Authorization") || reqHeaders.containsKey("authorization")
 
-                        if ((isMono || isKey) && hasAuth && !isFinished) {
-                            println("[DaddyLiveExt] [$nameTag] ★진짜 인증 헤더를 낚아챘습니다!")
+                        // 2. 신규 CDN 및 토큰 인증 방식 감지 (sanwalyaarpya.com 또는 md5 토큰이 포함된 m3u8)
+                        val isNewM3u8Cdn = lower.contains(".m3u8") && (lower.contains("sanwalyaarpya.com") || lower.contains("md5="))
+
+                        // --- 분기 1: 신규 CDN 링크 발견 시 ---
+                        if (isNewM3u8Cdn && !isFinished) {
+                            println("[DaddyLiveExt] [$nameTag] ★신규 CDN/토큰 형태의 m3u8 링크를 낚아챘습니다! URL: $reqUrl")
                             
-                            // Fiddler에서 보신 그 모든 헤더들을 그대로 복제합니다.
                             val headersToSteal = mutableMapOf<String, String>()
                             reqHeaders.forEach { (k, v) -> headersToSteal[k] = v }
+                            headersToSteal["Referer"] = "https://lefttoplay.xyz/"
+                            headersToSteal["Origin"] = "https://lefttoplay.xyz"
+
+                            isFinished = true
+                            handler.post { webView.destroy() }
+                            if (cont.isActive) cont.resume(Pair(reqUrl, headersToSteal))
+                            return super.shouldInterceptRequest(view, request)
+                        }
+
+                        // --- 분기 2: 기존 헤더 인증 방식 발견 시 ---
+                        if ((isMono || isKey) && hasAuth && !isFinished) {
+                            println("[DaddyLiveExt] [$nameTag] ★기존 헤더 인증 방식(Authorization)을 낚아챘습니다!")
                             
-                            // Referer와 Origin은 lefttoplay.xyz로 확실히 고정 (서버 검증 통과용)
+                            val headersToSteal = mutableMapOf<String, String>()
+                            reqHeaders.forEach { (k, v) -> headersToSteal[k] = v }
                             headersToSteal["Referer"] = "https://lefttoplay.xyz/"
                             headersToSteal["Origin"] = "https://lefttoplay.xyz"
                             
-                            // 만약 키 주소에서 헤더를 땄다면, 영상 주소는 mono.css로 추정하여 반환
                             val finalUrl = if (isMono) reqUrl else {
-                                // 키 주소를 통해 유추하거나 이전에 조립한 mono.css 주소 사용
                                 reqUrl.replace("/key/", "/").replace(Regex("/\\d+$"), "/mono.css")
                             }
 
@@ -95,7 +109,7 @@ class DaddyLiveExtractor : ExtractorApi() {
                             return super.shouldInterceptRequest(view, request)
                         }
 
-                        // 3. lovecdn.ru 백업용 (mono.css가 안 나올 경우 대비)
+                        // --- 분기 3: lovecdn.ru 백업용 ---
                         if (lower.contains("lovecdn.ru") && lower.contains(".m3u8") && !isFinished) {
                             val backupHeaders = mutableMapOf<String, String>()
                             reqHeaders.forEach { (k, v) -> backupHeaders[k] = v }
@@ -108,20 +122,23 @@ class DaddyLiveExtractor : ExtractorApi() {
                 
                 webView.loadUrl(targetUrl, mapOf("Referer" to "https://dlstreams.top"))
 
-                // 35초간 끈질기게 인증 정보를 기다립니다.
                 handler.postDelayed({ 
                     if (!isFinished && cont.isActive) { 
                         isFinished = true
                         webView.destroy()
                         if (capturedLoveCdn != null) {
-                            println("[DaddyLiveExt] [$nameTag] mono.css 인증 실패, lovecdn으로 후퇴")
+                            println("[DaddyLiveExt] [$nameTag] 1, 2순위 추출 실패, 백업 lovecdn으로 후퇴")
                             cont.resume(capturedLoveCdn)
                         } else {
+                            println("[DaddyLiveExt] [$nameTag] 추출 실패 (타임아웃 5초)")
                             cont.resume(null)
                         }
                     } 
-                }, 35000)
-            } catch (e: Exception) { if (cont.isActive) cont.resume(null) }
+                }, 5000)
+            } catch (e: Exception) { 
+                println("[DaddyLiveExt] [$nameTag] 예외 발생: ${e.message}")
+                if (cont.isActive) cont.resume(null) 
+            }
         }
     }
 }
