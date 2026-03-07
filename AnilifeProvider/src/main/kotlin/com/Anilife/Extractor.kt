@@ -16,7 +16,7 @@ import java.net.URI
 import kotlin.concurrent.thread
 
 class AnilifeProxyExtractor : ExtractorApi() {
-    override val name = "AnilifeExtractor"
+    override val name = "Anilife"
     override val mainUrl = "https://api.gcdn.app"
     override val requiresReferer = false
 
