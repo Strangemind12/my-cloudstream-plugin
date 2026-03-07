@@ -1,4 +1,4 @@
-// v3.0 - Removed heavy WebViewResolver, implemented pure API fetching
+// v3.4 - Simplified episode extraction relying on pure HTML order, fixed decimal parsing
 package com.anilife
 
 import android.util.Base64
@@ -26,6 +26,7 @@ class Anilife : MainAPI() {
         "/vodtype/categorize/TV/1" to "TV 애니메이션",
         "/vodtype/categorize/OVA/1" to "OVA",
         "/vodtype/categorize/ONA/1" to "ONA",
+        "/vodtype/categorize/Web/1" to "Web",
         "/vodtype/categorize/SP/1" to "SP",
         "/vodtype/categorize/Movie/1" to "극장판"
     )
@@ -54,7 +55,6 @@ class Anilife : MainAPI() {
                 var poster = imgTag?.attr("src") ?: imgTag?.attr("data-src") ?: ""
                 poster = fixUrl(poster)
                 
-                // 썸네일 누락 시 투명 픽셀 버그 방지
                 if (poster.isEmpty()) {
                     poster = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
                 }
@@ -95,17 +95,24 @@ class Anilife : MainAPI() {
         val plot = doc.selectFirst(".synp .entry-content")?.text()?.trim()
         val tags = doc.select(".genxed a").map { it.text() }
 
+        // [v3.4 수정] 복잡한 강제 정렬 로직 폐기. HTML 소스코드의 순서를 그대로 신뢰합니다.
         val episodes = doc.select(".eplister > ul > li > a").mapNotNull { element ->
             val rawHref = fixUrl(element.attr("href"))
             val numText = element.selectFirst(".epl-num")?.text()?.trim() ?: ""
             val epTitle = element.selectFirst(".epl-title")?.text()?.trim() ?: ""
+            
+            // 화면에 보여줄 이름은 원본 그대로 (예: 1128.5화 - 특별편)
             val fullName = if (numText.isNotEmpty()) "${numText}화 - $epTitle" else epTitle
             val finalHref = if (rawHref.contains("?")) "$rawHref&ref=$encodedRef" else "$rawHref?ref=$encodedRef"
+            
             newEpisode(finalHref) {
                 this.name = fullName
-                this.episode = numText.toIntOrNull()
+                // 기존의 toIntOrNull()은 "1128.5"를 파싱하지 못해 null로 만들었고, 
+                // 이 때문에 클라우드스트림 앱이 null 값을 목록 맨 아래로 던져버려 순서가 꼬였습니다.
+                // toFloatOrNull()?.toInt()로 처리하면 1128.5 -> 1128 로 파싱되어 정상적으로 정렬됩니다.
+                this.episode = numText.toFloatOrNull()?.toInt()
             }
-        }.reversed()
+        }.reversed() // 최신화가 위에 있으므로 1화부터 표시하기 위해 뒤집음
 
         return newAnimeLoadResponse(title, cleanUrl, TvType.Anime) {
             this.posterUrl = doc.selectFirst(".thumb img")?.attr("src") ?: tunnelingPoster
@@ -122,7 +129,7 @@ class Anilife : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("$TAG [LoadLinks] =================== v3.0 (No WebView, Pure API) ===================")
+        println("$TAG [LoadLinks] =================== v3.4 (Pure HTML Order Extraction) ===================")
         println("$TAG [LoadLinks] request data: $data")
         
         var cleanData = data.substringBefore("?poster=")
@@ -139,7 +146,6 @@ class Anilife : MainAPI() {
         val videoId = videoIdMatch?.groupValues?.get(1) ?: "unknown_id"
 
         try {
-            // [핵심] 타임아웃을 유발하는 WebViewResolver 완전 제거
             val webResponse = app.get(
                 cleanData, 
                 headers = mapOf("Referer" to detailReferer, "User-Agent" to pcUserAgent)
@@ -149,7 +155,7 @@ class Anilife : MainAPI() {
             println("$TAG [Step 2] 원본 플레이어 URL: $playerUrl")
 
             return AnilifeProxyExtractor().extractWithProxy(
-                m3u8Url = "", // 어차피 Extractor에서 자체 추출하므로 공백 전달
+                m3u8Url = "",
                 playerUrl = playerUrl,
                 referer = "https://anilife.live/",
                 ssid = null,
