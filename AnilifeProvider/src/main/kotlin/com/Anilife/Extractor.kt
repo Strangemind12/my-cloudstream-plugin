@@ -1,4 +1,4 @@
-// v1.1 - Fixed ProxyWebServer blocking & TCP RST bug, reduced WebView timeout to 5s, added videoId to proxy url, bypass key logic
+// v1.2 - Fixed ProxyWebServer blocking & TCP RST bug, reduced WebView timeout to 5s, added videoId to proxy url, bypass key logic, added default parameters to prevent compile error
 package com.anilife
 
 import android.content.Context
@@ -61,8 +61,8 @@ class AnilifeProxyExtractor : ExtractorApi() {
         referer: String,
         ssid: String?,
         cookies: String,
-        targetKeyUrl: String?,
-        videoId: String, // 비디오 ID 매개변수 추가
+        targetKeyUrl: String? = null,    // [수정] 빌드 에러 방지를 위해 기본값 null 적용
+        videoId: String = "unknown_id",  // [수정] 빌드 에러 방지를 위해 기본값 적용
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         synchronized(this) { currentProxyServer?.stop(); currentProxyServer = null }
