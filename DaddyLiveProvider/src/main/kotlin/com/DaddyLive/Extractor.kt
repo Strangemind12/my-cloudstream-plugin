@@ -1,8 +1,8 @@
 /**
- * DaddyLiveExtractor v10.0 (Zero-Base Python Script Port)
- * - [핵심] 기존의 무겁고 쓸데없는 로컬 프록시, WebView, AES 복호화 로직을 100% 전면 폐기.
- * - [적용] 사용자가 제공한 파이썬 스크립트의 로직(server_lookup API 직통 호출 및 iosplayer CDN 조립)을 완벽히 이식.
- * - [헤더] 파이썬 스크립트에 명시된 ilovetoplay.xyz Referer 및 Origin 헤더 적용.
+ * DaddyLiveExtractor v12.0 (Zero-Base / Pure HTTP Extractor)
+ * - [핵심] 사용자 요청에 따라 WebView, 로컬 프록시, 해싱 등 복잡한 코드를 100% 전면 폐기.
+ * - [로직] 파이썬 스크립트의 legacy get_stream_link 로직(iframe 탐색 -> server_lookup API 호출 -> iosplayer 조합)을 그대로 직역함.
+ * - [헤더] 파이썬 스크립트 구조에 맞춰 Referer와 Origin을 ilovetoplay.xyz 로 고정.
  */
 package com.DaddyLive
 
@@ -10,51 +10,43 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 
 class DaddyLiveExtractor : ExtractorApi() {
-    // 파이썬 스크립트 기준 메인 URL 적용
-    override val mainUrl = "https://daddylive.mp"
+    // 파이썬 코드에 명시된 최신 베이스 URL
+    override val mainUrl = "https://dlstreams.top"
     override val name = "DaddyLive"
     override val requiresReferer = false
 
-    // 파이썬 스크립트에 명시된 User-Agent
     private val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val links = AppUtils.tryParseJson<List<Pair<String, String>>>(url) ?: return
-        println("[DaddyLiveExt] v10.0 Zero-Base 파이썬 로직 이식 엔진 가동")
+        println("[DaddyLiveExt] v12.0 Zero-Base 초경량 추출 엔진 가동")
 
         for ((name, link) in links) {
-            // URL에서 stream-1508 등 채널 ID 추출
+            // 1. 링크에서 채널 ID만 순수하게 추출 (예: id=1508)
             val idMatch = Regex("""(?:stream-|id=)(\d+)""").find(link)
-            val channelId = idMatch?.groupValues?.get(1)
-            
-            if (channelId == null) {
-                println("[DaddyLiveExt] 채널 ID를 찾을 수 없습니다: $link")
-                continue
-            }
+            val channelId = idMatch?.groupValues?.get(1) ?: continue
             
             println("[DaddyLiveExt] 타겟 채널 ID: $channelId")
             
             try {
-                // 1. 임베드 페이지 요청 (파이썬: f"https://daddylive.mp/embed/stream-{dlhd_id}.php")
+                // 2. 임베드 페이지 직접 접근
                 val embedUrl = "$mainUrl/embed/stream-$channelId.php"
-                val embedHtml = app.get(embedUrl, headers = mapOf("User-Agent" to userAgent)).text
+                val embedHtml = app.get(embedUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/")).text
                 
-                // 2. iframe src 추출 (파이썬: iframe = soup.find('iframe', id='thatframe'))
+                // 3. 내부 iframe(실제 플레이어) 도메인 찾기
                 val iframeMatch = Regex("""<iframe[^>]+id=["']thatframe["'][^>]+src=["'](https?://[^"']+)["']""").find(embedHtml)
                     ?: Regex("""<iframe[^>]+src=["'](https?://[^"']+premiumtv[^"']+)["']""").find(embedHtml)
                     
-                if (iframeMatch != null) {
-                    val iframeUrl = iframeMatch.groupValues[1]
-                    println("[DaddyLiveExt] iframe URL 발견: $iframeUrl")
+                val iframeUrl = iframeMatch?.groupValues?.get(1)
+                
+                if (iframeUrl != null) {
+                    println("[DaddyLiveExt] iframe 도메인 발견: $iframeUrl")
                     
-                    // iframe 도메인 추출 (파이썬: parent_site_domain = real_link.split('/premiumtv')[0])
                     val domainMatch = Regex("""(https?://[^/]+)""").find(iframeUrl)
                     val parentDomain = domainMatch?.groupValues?.get(1) ?: "https://newembedplay.xyz"
                     
-                    // 3. Server Lookup API 호출 (파이썬: server_key_link)
+                    // 4. Server Lookup API 직접 호출하여 서버 키(server_key) 파싱
                     val serverKeyUrl = "$parentDomain/server_lookup.php?channel_id=premium$channelId"
-                    
-                    // 파이썬 코드와 동일한 헤더 구성
                     val keyHeaders = mapOf(
                         "User-Agent" to userAgent,
                         "Referer" to iframeUrl,
@@ -62,40 +54,31 @@ class DaddyLiveExtractor : ExtractorApi() {
                         "Sec-Fetch-Site" to "same-origin"
                     )
                     
-                    println("[DaddyLiveExt] Server Lookup API 요청: $serverKeyUrl")
                     val serverKeyJson = app.get(serverKeyUrl, headers = keyHeaders).text
+                    val serverKey = Regex(""""server_key"\s*:\s*"([^"]+)"""").find(serverKeyJson)?.groupValues?.get(1) ?: "zeko"
                     
-                    // JSON에서 server_key 추출
-                    val serverKeyMatch = Regex(""""server_key"\s*:\s*"([^"]+)"""").find(serverKeyJson)
-                    val serverKey = serverKeyMatch?.groupValues?.get(1)
+                    println("[DaddyLiveExt] Server Key 획득: $serverKey")
                     
-                    if (serverKey != null) {
-                        println("[DaddyLiveExt] Server Key 추출 성공: $serverKey")
-                        
-                        // 4. M3U8 주소 직접 조립 (파이썬: f"https://{server_key}new.iosplayer.ru/{server_key}/premium{dlhd_id}/mono.m3u8")
-                        val streamUrl = "https://${serverKey}new.iosplayer.ru/$serverKey/premium$channelId/mono.m3u8"
-                        println("[DaddyLiveExt] 최종 추출된 직링크: $streamUrl")
-                        
-                        // 5. ExoPlayer에 전달할 재생 헤더 구성 (파이썬 M3U8 생성 로직 참고)
-                        callback(newExtractorLink(name, name, streamUrl, type = ExtractorLinkType.M3U8) {
-                            this.quality = Qualities.Unknown.value
-                            this.referer = "https://ilovetoplay.xyz/" // M3u8 must contains TS files 에러 방지용
-                            this.headers = mapOf(
-                                "User-Agent" to userAgent,
-                                "Referer" to "https://ilovetoplay.xyz/",
-                                "Origin" to "https://ilovetoplay.xyz"
-                            )
-                        })
-                        
-                        break // 성공했으므로 다른 링크 탐색 중단
-                    } else {
-                        println("[DaddyLiveExt] Server Key 추출 실패. 응답 내용: $serverKeyJson")
-                    }
+                    // 5. 파이썬 로직대로 iosplayer.ru M3U8 주소 수동 조립
+                    val streamUrl = "https://${serverKey}new.iosplayer.ru/$serverKey/premium$channelId/mono.m3u8"
+                    println("[DaddyLiveExt] 최종 M3U8 직링크: $streamUrl")
+                    
+                    // 6. ExoPlayer 재생 필수 헤더 주입
+                    callback(newExtractorLink(name, name, streamUrl, type = ExtractorLinkType.M3U8) {
+                        this.quality = Qualities.Unknown.value
+                        this.referer = "https://ilovetoplay.xyz/" 
+                        this.headers = mapOf(
+                            "User-Agent" to userAgent,
+                            "Referer" to "https://ilovetoplay.xyz/",
+                            "Origin" to "https://ilovetoplay.xyz"
+                        )
+                    })
+                    break 
                 } else {
-                    println("[DaddyLiveExt] 임베드 페이지에서 'thatframe' iframe을 찾을 수 없습니다.")
+                    println("[DaddyLiveExt] iframe을 찾을 수 없습니다. (Cloudflare 차단 가능성)")
                 }
             } catch (e: Exception) {
-                println("[DaddyLiveExt] 파이썬 로직 수행 중 에러 발생: ${e.message}")
+                println("[DaddyLiveExt] 에러 발생: ${e.message}")
             }
         }
     }
