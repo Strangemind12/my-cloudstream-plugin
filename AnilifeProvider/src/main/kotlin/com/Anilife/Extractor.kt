@@ -1,13 +1,15 @@
-// v1.4 - Ultimate JS Hook (XHR & Fetch dual blind interception based on byte length), full JS console logging, 5s timeout compliance
+// v1.5 - CookieManager Sync, MixedContent ALLOW, Forced ArrayBuffer XHR Hook
 package com.anilife
 
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.webkit.ConsoleMessage
+import android.webkit.CookieManager
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
+import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import com.lagradost.cloudstream3.SubtitleFile
@@ -88,6 +90,7 @@ class AnilifeProxyExtractor : ExtractorApi() {
             return false
         }
 
+        // 키가 없으면 프록시 우회 로직 (유지)
         if (!m3u8Content.contains("#EXT-X-KEY") && !m3u8Content.contains("key7")) {
             println("[Anilife][Proxy] M3U8에 키 태그가 없습니다. 프록시 우회 직접 재생 적용.")
             callback(newExtractorLink(name, name, m3u8Url, ExtractorLinkType.M3U8) {
@@ -111,13 +114,13 @@ class AnilifeProxyExtractor : ExtractorApi() {
         val proxy = ProxyWebServer().apply { start() }
         currentProxyServer = proxy
 
-        runWebViewKeyFetcher(playerUrl, referer, ssid, actualTargetKeyUrl) { foundKey ->
+        // 웹뷰 실행 전 쿠키 및 타겟 세팅
+        runWebViewKeyFetcher(playerUrl, referer, ssid, cookies, actualTargetKeyUrl) { foundKey ->
             proxy.forceSetKey(foundKey)
         }
 
         try {
             val sb = StringBuilder()
-            
             for (line in m3u8Content.lines()) {
                 val trimmed = line.trim()
                 if (trimmed.isEmpty()) continue
@@ -125,6 +128,7 @@ class AnilifeProxyExtractor : ExtractorApi() {
                 if (trimmed.startsWith("#EXT-X-KEY")) {
                     val match = Regex("""URI="([^"]+)"""").find(trimmed)
                     if (match != null) {
+                        // 프록시 URL 구조 비디오 ID 포함 (유지)
                         val newKeyLine = trimmed.replace(match.groupValues[1], "http://127.0.0.1:${proxy.port}/$videoId/key.bin")
                         sb.append(newKeyLine).append("\n")
                     } else sb.append(trimmed).append("\n")
@@ -160,9 +164,9 @@ class AnilifeProxyExtractor : ExtractorApi() {
         }
     }
 
-    private fun runWebViewKeyFetcher(url: String, referer: String, ssid: String?, targetKeyUrl: String?, onKeyFound: (String) -> Unit) {
+    // [v1.5] 쿠키 인자(cookies) 추가 및 보안 설정 해제 웹뷰 로직
+    private fun runWebViewKeyFetcher(url: String, referer: String, ssid: String?, cookies: String, targetKeyUrl: String?, onKeyFound: (String) -> Unit) {
         val handler = Handler(Looper.getMainLooper())
-        
         val fetchTarget = targetKeyUrl ?: ""
         val ssidHeader = ssid ?: ""
 
@@ -170,24 +174,29 @@ class AnilifeProxyExtractor : ExtractorApi() {
             (function() {
                 if (window.ultimateHookDone) return;
                 window.ultimateHookDone = true;
-                console.log("Ultimate Hook Initialized.");
+                console.log("Ultimate Hook v1.5 Initialized.");
 
-                // 0. 강제 직접 Fetch 시도
                 if ("$fetchTarget" !== "" && "$fetchTarget" !== "null") {
                     console.log("Direct fetching target: $fetchTarget");
                     fetch("$fetchTarget", {
-                        headers: { "x-user-ssid": "$ssidHeader" }
+                        headers: { "x-user-ssid": "$ssidHeader" },
+                        credentials: "omit"
                     }).then(r => r.arrayBuffer()).then(buf => {
                         let hex = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
                         console.log("CapturedKeyHex:[DIRECT]" + hex);
-                    }).catch(e => console.log("Direct Fetch Failed"));
+                    }).catch(e => console.log("Direct Fetch Failed: " + e));
                 }
 
-                // 1. XMLHttpRequest 완벽 통제
+                // XHR 통제 (ArrayBuffer 강제 적용)
                 const origOpen = XMLHttpRequest.prototype.open;
                 XMLHttpRequest.prototype.open = function() {
+                    this._reqUrl = arguments[1] ? arguments[1].toString() : '';
+                    if (this._reqUrl.includes('key') || this._reqUrl.includes('.bin') || this._reqUrl.includes('st/')) {
+                        this.responseType = 'arraybuffer';
+                    }
                     return origOpen.apply(this, arguments);
                 };
+                
                 const origSend = XMLHttpRequest.prototype.send;
                 XMLHttpRequest.prototype.send = function() {
                     this.addEventListener('load', function() {
@@ -204,7 +213,6 @@ class AnilifeProxyExtractor : ExtractorApi() {
                     return origSend.apply(this, arguments);
                 };
 
-                // 2. Fetch API 통제 (신형 플레이어 대응)
                 const origFetch = window.fetch;
                 window.fetch = async function() {
                     const response = await origFetch.apply(this, arguments);
@@ -220,13 +228,10 @@ class AnilifeProxyExtractor : ExtractorApi() {
                     return response;
                 };
 
-                // 3. 자동 재생 트리거 딜레이 단축 (0.5초)
                 setInterval(function() {
                     try {
                         document.querySelectorAll('video').forEach(v => { v.muted = true; v.play(); });
                         document.querySelectorAll('.jw-video, .jw-button-color, .vjs-big-play-button, .plyr__control').forEach(b => b.click());
-                        let center = document.elementFromPoint(window.innerWidth/2, window.innerHeight/2);
-                        if(center) center.click();
                     } catch(e) {}
                 }, 500);
             })();
@@ -237,11 +242,21 @@ class AnilifeProxyExtractor : ExtractorApi() {
                 val context: Context = (AcraApplication.context ?: app) as Context
                 val webView = WebView(context)
                 
+                // [v1.5] WebView 내부 쿠키 강제 동기화 (403 Forbidden 방지)
+                val cookieManager = CookieManager.getInstance()
+                cookieManager.setAcceptCookie(true)
+                cookieManager.setAcceptThirdPartyCookies(webView, true)
+                cookieManager.setCookie("https://anilife.live", cookies)
+                cookieManager.setCookie("https://api.gcdn.app", cookies)
+                cookieManager.flush()
+
                 webView.settings.apply {
                     javaScriptEnabled = true
                     domStorageEnabled = true
                     userAgentString = DESKTOP_UA
                     mediaPlaybackRequiresUserGesture = false
+                    // [v1.5] 교차 출처 리소스 차단 해제
+                    mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                 }
 
                 webView.webChromeClient = object : WebChromeClient() {
@@ -272,6 +287,7 @@ class AnilifeProxyExtractor : ExtractorApi() {
                 println("[Anilife][Hook] 웹뷰 로드 시작: $url")
                 webView.loadUrl(url, mapOf("Referer" to referer))
                 
+                // 타임아웃 5초 유지 정책 적용
                 handler.postDelayed({ 
                     try { 
                         println("[Anilife][Hook] 웹뷰 파괴 완료 (5초 타임아웃 적용)")
@@ -353,7 +369,8 @@ class AnilifeProxyExtractor : ExtractorApi() {
                         
                         if (verifiedKey != null) {
                             println("[Anilife][Proxy] 키 반환 성공")
-                            out.write("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nAccess-Control-Allow-Origin: *\r\n\r\n".toByteArray())
+                            // [v1.5] CORS 허용 헤더 강화
+                            out.write("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\n\r\n".toByteArray())
                             out.write(verifiedKey!!)
                         } else {
                             println("[Anilife][Proxy] 키 반환 실패 (타임아웃)")
