@@ -1,4 +1,4 @@
-// v4.0 - True Ultra-Lightweight Hybrid Proxy (Memory Serving, No Dynamic Fetching)
+// v4.1 - True Ultra-Lightweight Hybrid Proxy (Memory Serving, Video ID Cache Collision Prevented)
 package com.anilife
 
 import android.util.Base64
@@ -54,7 +54,7 @@ class AnilifeProxyExtractor : ExtractorApi() {
         videoId: String = "unknown_id",
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("[Anilife][Extractor] v4.0 - True Ultra-Lightweight Memory Proxy 시작")
+        println("[Anilife][Extractor] v4.1 - True Ultra-Lightweight Memory Proxy 시작")
         
         val cleanHeaders = mapOf(
             "User-Agent" to DESKTOP_UA,
@@ -99,11 +99,9 @@ class AnilifeProxyExtractor : ExtractorApi() {
                 return false
             }
 
-            // [핵심 변경] 프록시를 띄우기 전에 모든 M3U8 통신 및 전처리(파싱)를 여기서 1회성으로 끝냅니다. (Movieking 방식)
             var m3u8Content = app.get(finalM3u8, headers = cleanHeaders).text
             var baseUri = try { URI(finalM3u8) } catch (e: Exception) { null }
 
-            // 만약 해상도 분기용 마스터 플레이리스트라면 최고 화질 서브 플레이리스트를 찾아 들어갑니다. (TVWiki 방식)
             if (m3u8Content.contains("#EXT-X-STREAM-INF")) {
                 val subUrlLine = m3u8Content.lines().lastOrNull { it.isNotBlank() && !it.startsWith("#") }
                 if (subUrlLine != null) {
@@ -113,7 +111,6 @@ class AnilifeProxyExtractor : ExtractorApi() {
                 }
             }
 
-            // 가짜 키 삭제 및 세그먼트 절대 주소 매핑
             val sb = StringBuilder()
             for (lineText in m3u8Content.lines()) {
                 val trimmed = lineText.trim()
@@ -125,7 +122,6 @@ class AnilifeProxyExtractor : ExtractorApi() {
                 } else if (trimmed.startsWith("#")) {
                     sb.append(trimmed).append("\n")
                 } else {
-                    // 세그먼트는 무조건 CDN 절대 주소로 다이렉트 처리 (프록시 안 거침)
                     val absUrl = resolveUrl(baseUri, finalM3u8, trimmed)
                     sb.append(absUrl).append("\n")
                 }
@@ -133,7 +129,6 @@ class AnilifeProxyExtractor : ExtractorApi() {
 
             val processedPlaylist = sb.toString()
 
-            // [초경량 프록시 구동] 사전 조립된 텍스트만 메모리로 전달
             synchronized(this) { currentProxyServer?.stop(); currentProxyServer = null }
             val proxy = ProxyWebServer().apply { 
                 updatePlaylist(processedPlaylist)
@@ -141,8 +136,8 @@ class AnilifeProxyExtractor : ExtractorApi() {
             }
             currentProxyServer = proxy
 
-            // ExoPlayer에게는 단순한 127.0.0.1 로컬 주소만 전달
-            val proxyUrl = "http://127.0.0.1:${proxy.port}/playlist.m3u8"
+            // [핵심 변경] TVWiki, Movieking과 동일하게 URL에 videoId를 주입하여 ExoPlayer 캐시 꼬임 원천 차단
+            val proxyUrl = "http://127.0.0.1:${proxy.port}/$videoId/playlist.m3u8"
             println("[Anilife][Extractor] 초경량 메모리 프록시 세팅 완료 URL: $proxyUrl")
             
             callback(newExtractorLink(name, name, proxyUrl, ExtractorLinkType.M3U8) {
@@ -167,7 +162,6 @@ class AnilifeProxyExtractor : ExtractorApi() {
         }
     }
 
-    // [초경량 구조 개편] 동적 통신(get)이 완전히 배제된 순수 메모리 서빙 프록시
     class ProxyWebServer {
         var port: Int = 0
         private var serverSocket: ServerSocket? = null
@@ -209,7 +203,7 @@ class AnilifeProxyExtractor : ExtractorApi() {
 
                 val out = socket.getOutputStream()
 
-                // 메모리에 올려둔 playlistData 문자열만 즉시 반환 (I/O 병목 없음)
+                // path가 포함하는 문자열로 판별하므로 videoId가 있어도 정상 서빙
                 if (path.contains("playlist.m3u8")) {
                     println("[Anilife][Proxy] 초경량 M3U8 메모리 서빙 수행")
                     out.write("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nAccess-Control-Allow-Origin: *\r\n\r\n".toByteArray())
