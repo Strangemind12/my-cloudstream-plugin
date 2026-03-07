@@ -1,8 +1,8 @@
 /**
- * DaddyLiveExtractor v9.0 (Physical WebView Cloudflare Bypass)
- * - [핵심 해결] OkHttp(app.get)의 TLS 핑거프린트가 Cloudflare에 봇으로 적발되어 캡챠(85KB)에 막히는 현상 해결.
- * - [우회 기술] 백그라운드에 실제 안드로이드 WebView를 띄워 Cloudflare JS 연산을 물리적으로 통과(Auto-solve)시킨 후 토큰을 탈취함.
- * - [Fix] 백업 플레이어(lovecdn 등) 재생 시 발생하던 ExoPlayer 403 차단(M3u8 must contains TS files) 에러를 맞춤형 동적 Referer 주입으로 해결.
+ * DaddyLiveExtractor v9.1 (Server Lookup Auth & Auto-Fallback Fix)
+ * - [Fix] server_lookup API 요청 시 Authorization(Bearer 토큰) 누락으로 인해 서버 키가 항상 'zeko'로 고정되어 일부 채널에서 ExoPlayer 2004 에러(404 Not Found)가 발생하던 치명적 버그 해결.
+ * - [Fix] 서버 상태에 따라 mono.css 와 mono.m3u8 을 혼용하는 현상을 극복하기 위해, 프록시 내부에서 404 에러 감지 시 즉시 확장자를 스왑하여 재요청하는 Auto-Fallback 로직 추가.
+ * - [Apply] WebView 키 요청 대기 타임아웃을 5초(5000ms)로 단축 적용.
  */
 package com.DaddyLive
 
@@ -32,7 +32,6 @@ object DaddyLiveProxy {
     data class ChannelState(val authToken: String, val channelSalt: String, val m3u8Url: String, val playerDomain: String)
     val activeChannels = mutableMapOf<String, ChannelState>()
     
-    // WebView가 Cloudflare를 뚫을 때 썼던 실제 브라우저 UA를 그대로 넘겨받아 핑거프린트 일치시킴
     var userAgent = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
 
     fun startServer() {
@@ -74,10 +73,14 @@ object DaddyLiveProxy {
                 val state = activeChannels[channelKey]
                 if (state == null) { send404(out); return }
                 
-                val responseText = try {
-                    runBlocking {
-                        val resp = app.get(
-                            state.m3u8Url, 
+                var responseText: String? = null
+                var finalM3u8Url = state.m3u8Url
+                
+                // 1차 M3U8 다운로드 시도
+                try {
+                    val resp = runBlocking {
+                        app.get(
+                            finalM3u8Url, 
                             headers = mapOf(
                                 "User-Agent" to userAgent,
                                 "Referer" to "${state.playerDomain}/",
@@ -87,18 +90,51 @@ object DaddyLiveProxy {
                                 "X-User-Agent" to userAgent,
                                 "Cache-Control" to "no-cache"
                             ),
-                            timeout = 15L
+                            timeout = 10L
                         )
-                        if (resp.isSuccessful) resp.text else null
                     }
-                } catch (e: Exception) { null }
+                    if (resp.isSuccessful) responseText = resp.text
+                } catch (e: Exception) {
+                    println("[DaddyLiveProxy] 1차 M3U8 요청 실패 (${finalM3u8Url}): ${e.message}")
+                }
                 
-                if (responseText == null) { send404(out); return }
+                // 1차 실패 시 (404/403) 파일명 확장자를 스왑하여 2차 재시도 (ExoPlayer 2004 에러 방지 핵심 로직)
+                if (responseText == null) {
+                    finalM3u8Url = if (finalM3u8Url.endsWith(".css")) finalM3u8Url.replace(".css", ".m3u8") else finalM3u8Url.replace(".m3u8", ".css")
+                    println("[DaddyLiveProxy] 확장자 스왑하여 2차 M3U8 재시도: $finalM3u8Url")
+                    
+                    try {
+                        val resp2 = runBlocking {
+                            app.get(
+                                finalM3u8Url, 
+                                headers = mapOf(
+                                    "User-Agent" to userAgent,
+                                    "Referer" to "${state.playerDomain}/",
+                                    "Origin" to state.playerDomain,
+                                    "Authorization" to "Bearer ${state.authToken}",
+                                    "X-Channel-Key" to channelKey,
+                                    "X-User-Agent" to userAgent,
+                                    "Cache-Control" to "no-cache"
+                                ),
+                                timeout = 10L
+                            )
+                        }
+                        if (resp2.isSuccessful) responseText = resp2.text
+                    } catch (e: Exception) {
+                        println("[DaddyLiveProxy] 2차 M3U8 재시도 실패: ${e.message}")
+                    }
+                }
+                
+                // 2차까지 모두 실패 시 404 반환 -> ExoPlayer에서 2004 에러 발생
+                if (responseText == null) { 
+                    println("[DaddyLiveProxy] 최종 M3U8 획득 실패. 404 반환.")
+                    send404(out)
+                    return 
+                }
                 
                 var m3u8Body = responseText
-                val baseUrl = state.m3u8Url.substringBeforeLast("/") + "/"
+                val baseUrl = finalM3u8Url.substringBeforeLast("/") + "/"
                 
-                // M3U8 내부의 AES 키 요청 주소만 내 로컬 프록시로 변조
                 m3u8Body = m3u8Body.replace(Regex("""URI="([^"]+)"""")) { match ->
                     val uri = match.groupValues[1]
                     val km = Regex("""/key/[^/]+/(\d+)""").find(uri)
@@ -109,7 +145,6 @@ object DaddyLiveProxy {
                     }
                 }
 
-                // 상대 경로로 된 영상 TS 조각들을 절대 경로(원본 CDN)로 변환
                 val lines = m3u8Body.lines().map { line ->
                     val trimmed = line.trim()
                     if (trimmed.isNotBlank() && !trimmed.startsWith("#")) {
@@ -223,7 +258,7 @@ class DaddyLiveExtractor : ExtractorApi() {
 
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val links = AppUtils.tryParseJson<List<Pair<String, String>>>(url) ?: return
-        println("[DaddyLiveExt] v9.0 물리적 WebView Cloudflare 캡챠 우회 엔진 가동")
+        println("[DaddyLiveExt] v9.1 Server Lookup Auth & Auto-Fallback 엔진 가동")
 
         for ((name, link) in links) {
             val idMatch = Regex("""(?:stream-|id=)(\d+)""").find(link)
@@ -233,7 +268,6 @@ class DaddyLiveExtractor : ExtractorApi() {
                 val channelKey = "premium$channelId"
                 
                 try {
-                    // WebView를 띄워 Cloudflare를 완벽히 통과시키고 토큰을 가져옴
                     val credentialsData = fetchAuthCredentialsWithWebView(channelId)
                     
                     if (credentialsData != null) {
@@ -243,9 +277,23 @@ class DaddyLiveExtractor : ExtractorApi() {
                         var serverKey = "zeko"
                         try {
                             val lookupUrl = "https://chevy.vovlacosa.sbs/server_lookup?channel_id=$channelKey"
-                            val lookupJson = app.get(lookupUrl, headers = mapOf("User-Agent" to DaddyLiveProxy.userAgent, "Referer" to "$playerDomain/")).text
+                            
+                            // [Fix] 2004 에러의 핵심 원인: Authorization 헤더 누락 수정
+                            val lookupJson = app.get(
+                                lookupUrl, 
+                                headers = mapOf(
+                                    "User-Agent" to DaddyLiveProxy.userAgent, 
+                                    "Referer" to "$playerDomain/",
+                                    "Origin" to playerDomain,
+                                    "Authorization" to "Bearer $authToken"
+                                )
+                            ).text
+                            
                             serverKey = Regex(""""server_key"\s*:\s*"([^"]+)"""").find(lookupJson)?.groupValues?.get(1) ?: "zeko"
-                        } catch (e: Exception) {}
+                            println("[DaddyLiveExt] server_lookup 성공. 할당된 서버 키: $serverKey")
+                        } catch (e: Exception) {
+                            println("[DaddyLiveExt] server_lookup API 예외 발생(403 등). 기본값(zeko) 사용: ${e.message}")
+                        }
                         
                         val m3u8Url = if (serverKey == "top1/cdn") {
                             "https://chevy.soyspace.cyou/proxy/top1/cdn/$channelKey/mono.css"
@@ -269,14 +317,13 @@ class DaddyLiveExtractor : ExtractorApi() {
                         })
                         break
                     } else {
-                        println("[DaddyLiveExt] [$channelKey] 메인 토큰 획득 실패 (WebView 타임아웃). 백업 우회 경로를 탐색합니다.")
+                        println("[DaddyLiveExt] [$channelKey] 메인 토큰 획득 실패. 백업 우회 경로를 탐색합니다.")
                     }
                 } catch (e: Exception) {
                     println("[DaddyLiveExt] [$channelKey] 메인 프로세스 예외: ${e.message}")
                 }
             }
             
-            // 메인 추출 실패 시 백업 AnyPlayer 탐색 (안전한 Referer 강제 주입 포함)
             val fallbackStreamUrl = if (channelId != null) getAnyPlayerStreamForId(channelId) else null
             
             if (fallbackStreamUrl != null) {
@@ -293,7 +340,7 @@ class DaddyLiveExtractor : ExtractorApi() {
                 
                 callback(newExtractorLink(name, name, fallbackStreamUrl, type = ExtractorLinkType.M3U8) {
                     this.quality = Qualities.Unknown.value
-                    this.referer = targetReferer // ExoPlayer의 M3u8 must contain TS files 에러 원천 차단
+                    this.referer = targetReferer 
                     this.headers = mapOf(
                         "User-Agent" to DaddyLiveProxy.userAgent,
                         "Origin" to targetReferer.trimEnd('/'),
@@ -306,7 +353,6 @@ class DaddyLiveExtractor : ExtractorApi() {
     }
 
     private suspend fun fetchAuthCredentialsWithWebView(channelId: String): Triple<String, String, String>? {
-        // 1. 동적 iframe(메인 플레이어) 주소 탐색
         val paths = listOf("stream", "cast", "watch", "plus", "player")
         val watchUrl = "$mainUrl/watch.php?id=$channelId"
         var playerDomain = "https://adffdafdsafds.sbs"
@@ -326,7 +372,6 @@ class DaddyLiveExtractor : ExtractorApi() {
             } catch (e: Exception) {}
         }
         
-        // 2. 실제 안드로이드 브라우저 렌더러(WebView)를 띄워 Cloudflare 물리적 돌파
         return suspendCancellableCoroutine { cont ->
             val handler = Handler(Looper.getMainLooper())
             handler.post {
@@ -338,13 +383,10 @@ class DaddyLiveExtractor : ExtractorApi() {
                     webView.settings.apply {
                         javaScriptEnabled = true
                         domStorageEnabled = true
-                        // WebView 본연의 브라우저 UA를 그대로 사용하여 Cloudflare 핑거프린팅 완벽 회피
                     }
                     
-                    // 향후 Proxy 통신 시 일치시킬 용도로 UA 기록
                     DaddyLiveProxy.userAgent = webView.settings.userAgentString
 
-                    // 1초 단위로 Javascript를 주입하여 토큰(authToken)이 복호화되었는지 렌더링된 HTML을 스캔
                     val checkRunnable = object : Runnable {
                         override fun run() {
                             if (isFinished) return
@@ -355,7 +397,7 @@ class DaddyLiveExtractor : ExtractorApi() {
                                 
                                 if (at != null && cs != null && !isFinished) {
                                     isFinished = true
-                                    println("[DaddyLiveExt] WebView 루프 검사로 Cloudflare 캡챠 돌파 및 토큰 탈취 성공!")
+                                    println("[DaddyLiveExt] WebView 루프 검사로 Cloudflare 통과 및 토큰 획득 성공!")
                                     handler.post { webView.destroy() }
                                     if (cont.isActive) cont.resume(Triple(at, cs, playerDomain))
                                 } else {
@@ -373,7 +415,7 @@ class DaddyLiveExtractor : ExtractorApi() {
                                 val cs = extractCredential(unescaped, "channelSalt")
                                 if (at != null && cs != null && !isFinished) {
                                     isFinished = true
-                                    println("[DaddyLiveExt] WebView 로드 직후 캡챠 돌파 및 토큰 탈취 성공!")
+                                    println("[DaddyLiveExt] WebView 로드 직후 캡챠 돌파 및 토큰 획득 성공!")
                                     handler.post { webView.destroy() }
                                     if (cont.isActive) cont.resume(Triple(at, cs, playerDomain))
                                 }
@@ -381,22 +423,21 @@ class DaddyLiveExtractor : ExtractorApi() {
                         }
                     }
                     
-                    // 메인 서버로 접속 (이 때 백그라운드에서 CF 캡챠가 자동으로 풀림)
                     webView.loadUrl(playerUrl, mutableMapOf("Referer" to "$mainUrl/"))
-                    handler.postDelayed(checkRunnable, 2000) // 2초 후부터 HTML 스캔 시작
+                    handler.postDelayed(checkRunnable, 1000) 
 
-                    // 15초(충분한 캡챠 대기시간) 초과 시 타임아웃
+                    // [Fix] 사용자 설정: WebView 키 요청 대기 타임아웃을 정확히 5초(5000ms)로 적용
                     handler.postDelayed({
                         if (!isFinished && cont.isActive) {
                             isFinished = true
-                            println("[DaddyLiveExt] WebView Cloudflare 우회 타임아웃 (15초 초과)")
+                            println("[DaddyLiveExt] WebView Cloudflare 우회 타임아웃 (5초 초과)")
                             webView.destroy()
                             cont.resume(null)
                         }
-                    }, 15000)
+                    }, 5000)
                     
                 } catch (e: Exception) {
-                    println("[DaddyLiveExt] WebView 에러 발생: ${e.message}")
+                    println("[DaddyLiveExt] WebView 예외 발생: ${e.message}")
                     if (cont.isActive) cont.resume(null)
                 }
             }
