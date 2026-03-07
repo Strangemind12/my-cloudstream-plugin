@@ -1,4 +1,4 @@
-// v3.1 - Fixed Coroutine Suspend Context & Unresolved reference build errors
+// v3.2 - Fixed JSON escaped slashes (\/) in apiUrl causing API fetch failure
 package com.anilife
 
 import android.util.Base64
@@ -55,7 +55,7 @@ class AnilifeProxyExtractor : ExtractorApi() {
         videoId: String = "unknown_id",
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("[Anilife][Extractor] v3.1 - Recursive Fake Key Stripping Proxy 시작")
+        println("[Anilife][Extractor] v3.2 - Recursive Fake Key Stripping Proxy 시작")
         
         val cleanHeaders = mapOf(
             "User-Agent" to DESKTOP_UA,
@@ -65,7 +65,6 @@ class AnilifeProxyExtractor : ExtractorApi() {
         )
 
         try {
-            // 1. _aldata 추출을 통한 찐 M3U8 확보 (Github 방식 완벽 이식)
             var finalM3u8 = ""
             val playerHtml = app.get(playerUrl, headers = cleanHeaders).text
             val aldataRegex = Regex("""_aldata\s*=\s*['"]([^'"]+)['"]""")
@@ -82,25 +81,30 @@ class AnilifeProxyExtractor : ExtractorApi() {
                     apiUrl = vid720Regex.find(decoded)?.groupValues?.get(1)
                 }
                 
+                // [핵심 수정] JSON 내부에 이스케이프 처리된 \/ 문자를 /로 원복하여 정상적인 URL로 만듦
+                apiUrl = apiUrl?.replace("\\/", "/")
+                
                 if (!apiUrl.isNullOrBlank() && apiUrl != "none") {
                     val fullApiUrl = if (apiUrl.startsWith("http")) apiUrl else "https://$apiUrl"
-                    println("[Anilife][Extractor] API 호출: $fullApiUrl")
+                    println("[Anilife][Extractor] API 정상 호출: $fullApiUrl")
+                    
                     val apiRes = app.get(fullApiUrl, headers = cleanHeaders).text
                     val urlRegex = Regex(""""url"\s*:\s*"([^"]+)"""")
                     val extractedUrl = urlRegex.find(apiRes)?.groupValues?.get(1)
+                    
                     if (!extractedUrl.isNullOrBlank()) {
                         finalM3u8 = extractedUrl.replace("\\/", "/")
-                        println("[Anilife][Extractor] _aldata에서 찐 M3U8 추출 완료: $finalM3u8")
+                        println("[Anilife][Extractor] 찐 M3U8 추출 완료: $finalM3u8")
                     }
                 }
             }
 
             if (finalM3u8.isBlank()) {
-                println("[Anilife][Extractor] M3U8 주소 확보 실패")
+                println("[Anilife][Extractor] M3U8 주소 확보 실패 (API 통신 오류 또는 _aldata 파싱 실패)")
                 return false
             }
 
-            // 2. 가짜 키(Fake Key) 스트리핑 로컬 프록시 구동
+            // 가짜 키(Fake Key) 스트리핑 로컬 프록시 구동
             synchronized(this) { currentProxyServer?.stop(); currentProxyServer = null }
             val proxy = FakeKeyStripperProxy().apply { start() }
             currentProxyServer = proxy
@@ -110,7 +114,7 @@ class AnilifeProxyExtractor : ExtractorApi() {
 
             println("[Anilife][Extractor] 프록시 URL 전달: $proxyUrl")
             
-            // 3. 군더더기 없는 헤더와 프록시 URL을 ExoPlayer로 전달
+            // 군더더기 없는 헤더와 프록시 URL을 ExoPlayer로 전달
             callback(newExtractorLink(name, name, proxyUrl, ExtractorLinkType.M3U8) {
                 this.referer = "https://anilife.live/"
                 this.headers = cleanHeaders
@@ -145,7 +149,6 @@ class AnilifeProxyExtractor : ExtractorApi() {
 
         fun stop() { isRunning = false; server?.close() }
 
-        // [수정] 클래스 내부로 이동하여 Unresolved reference 에러 해결
         private fun resolveUrl(baseUri: URI?, baseUrlStr: String, target: String): String {
             if (target.startsWith("http")) return target
             return try { baseUri?.resolve(target).toString() } catch (e: Exception) {
@@ -174,7 +177,6 @@ class AnilifeProxyExtractor : ExtractorApi() {
                     
                     println("[Anilife][Proxy] 원본 M3U8 요청 수신 (타겟: $targetUrl)")
 
-                    // [수정] 일반 Thread 내부이므로 runBlocking을 통해 Suspend 함수 호출 강제
                     val m3u8Content = try {
                         runBlocking {
                             app.get(
