@@ -14,7 +14,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
 
 class StreamedProvider : MainAPI() {
-    override var mainUrl = "https://streamed.pk"
+    override var mainUrl = "https://streamed.st"
     override var name = "Streamed"
     override val hasMainPage = true
     override var lang = "en"
