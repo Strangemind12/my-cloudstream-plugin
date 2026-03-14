@@ -152,7 +152,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val lists = mutableListOf<HomePageList>()
         
         // v1.29: 3개씩 청크로 묶어 무분별한 병렬 요청 방지 (Thundering Herd 병목 해결)
-        targetCatalogs.chunked(3).forEachIndexed { index, chunk ->
+        targetCatalogs.chunked(9).forEachIndexed { index, chunk ->
             val chunkStartTime = System.currentTimeMillis()
             println("[StremioC v1.29] 청크 ${index + 1}/${(targetCatalogs.size + 2) / 3} 그룹 처리 중...")
             
