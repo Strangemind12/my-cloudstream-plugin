@@ -26,7 +26,7 @@ import kotlinx.coroutines.delay
  */
 class TVWiki : MainAPI() {
     companion object {
-        var currentMainUrl = "https://tvwiki7.net" 
+        var currentMainUrl = "https://tvwiki6.net" 
         var isDomainChecked = false 
         private val domainMutex = Mutex()
         private const val PREFS_NAME = "TVWiki_Domain_Cache"
