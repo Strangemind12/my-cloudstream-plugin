@@ -1,7 +1,8 @@
-// v1.22
+// v1.24
 package com.hsp1020
 
 import com.fasterxml.jackson.annotation.JsonProperty
+import com.google.gson.Gson
 import com.lagradost.cloudstream3.AcraApplication
 import com.lagradost.cloudstream3.Actor
 import com.lagradost.cloudstream3.ActorData
@@ -71,7 +72,9 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     }
 
     private fun baseUrl(): String {
-        return mainUrl.substringBefore("?").trimEnd('/')
+        return mainUrl.substringBefore("?")
+            .replace("/manifest.json", "")
+            .trimEnd('/')
     }
 
     private fun querySuffix(): String {
@@ -96,7 +99,10 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     }
 
     private suspend fun getManifest(): Manifest? {
-        val currentUrl = buildUrl("/manifest.json")
+        // manifest.json은 항상 원본 URL 포맷에서 파생되도록 별도 처리
+        val originalBase = mainUrl.substringBefore("?").trimEnd('/')
+        val currentUrl = if (originalBase.endsWith("manifest.json")) originalBase else "$originalBase/manifest.json"
+        
         val now = System.currentTimeMillis()
         val cacheAge = now - lastCacheTime
         val isExpired = cacheAge > 24 * 60 * 60 * 1000
@@ -266,47 +272,35 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("[디버그] === loadLinks 시작 ===")
         val loadData = try { parseJson<LoadData>(data) } catch (e: Exception) { null } ?: return false
         val normalizedId = try { normalizeId(loadData.id) } catch (e: Exception) { loadData.id ?: "" }
         val encodedId = try { URLEncoder.encode(normalizedId, "UTF-8") } catch (e: Exception) { normalizedId }
         
-        // 스트림 탐색 및 자막 탐색 독립 병렬 호출 (1.19 버전 원복 로직)
         runAllAsync(
             {
-                // 1. 메인 API 영상 스트림 및 비디오 내장 자막 병렬 로드
                 try {
                     val url = buildUrl("/stream/${loadData.type}/$encodedId.json")
                     val request = app.get(url, timeout = 120L)
                     val res = if (request.isSuccessful) request.parsedSafe<StreamsResponse>() else null
 
                     if (!res?.streams.isNullOrEmpty()) {
-                        println("[디버그] 메인 API 스트림 발견, 개수: ${res?.streams?.size}")
                         res?.streams?.forEach { stream ->
                             stream.runCallback(subtitleCallback, callback) 
                         }
                     } else {
-                        println("[디버그] 메인 API 스트림 없음, StremioX 폴백 실행")
-                        invokeStremioX(loadData.type, loadData.id, subtitleCallback, callback)
+                        invokeStremioX(loadData.type, loadData.id, loadData.season, loadData.episode, subtitleCallback, callback)
                     }
                 } catch (e: Exception) {
-                    println("[디버그] 영상 스트림 로드 실패 - ${e.message}")
                 }
             },
             {
-                // 2. Watchsomuch 자막 API 병렬 로드
-                println("[디버그] Watchsomuch 자체 API 자막 로드 요청")
                 invokeWatchsomuch(loadData.imdbId, loadData.season, loadData.episode, subtitleCallback)
             },
             {
-                // 3. OpenSubs 자막 API 병렬 로드
-                println("[디버그] OpenSubs 자체 API 자막 로드 요청")
                 invokeOpenSubs(loadData.imdbId, loadData.season, loadData.episode, subtitleCallback)
             },
             {
-                // 4. Stremio 전역 자막 애드온 API 병렬 로드
-                println("[디버그] Stremio 자막 애드온 전역 로드 요청 시작")
-                invokeStremioSubtitles(loadData.type, loadData.id, subtitleCallback)
+                invokeStremioSubtitles(loadData.type, loadData.id, loadData.season, loadData.episode, subtitleCallback)
             }
         )
 
@@ -316,113 +310,84 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     private suspend fun invokeStremioX(
         type: String?,
         id: String?,
+        season: Int?,
+        episode: Int?,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        println("[디버그] === invokeStremioX 진입 ===")
         val sites = AcraApplication.getKey<Array<CustomSite>>(USER_PROVIDER_API)?.toMutableList() ?: mutableListOf()
         val filteredSites = sites.filter { it.parentJavaClass == "StremioX" || it.parentJavaClass == "StremioC" }
-        println("[디버그] invokeStremioX 실행 대상 사이트 개수(StremioX/C): ${filteredSites.size}")
         
         filteredSites.amap { site ->
             try {
-                val url = "${site.url.fixSourceUrl()}/stream/$type/$id.json"
-                println("[디버그] invokeStremioX 스트림 요청 URL: $url")
+                val api = site.url.fixSourceUrl().substringBefore("?").replace("/manifest.json", "").trimEnd('/')
+                val url = if (season != null && episode != null) {
+                    "$api/stream/series/$id:$season:$episode.json"
+                } else {
+                    "$api/stream/movie/$id.json"
+                }
+                
                 val req = app.get(url, timeout = 120L)
                 val res = req.parsedSafe<StreamsResponse>()
                 if (res?.streams != null) {
-                    println("[디버그] invokeStremioX 스트림 발견: ${res.streams.size}개")
                     res.streams.forEach { stream ->
                         stream.runCallback(subtitleCallback, callback)
                     }
-                } else {
-                    println("[디버그] invokeStremioX 스트림 응답이 비어 있습니다.")
                 }
             } catch (e: Exception) {
-                println("[디버그] invokeStremioX 단일 사이트 요청 실패 - ${site.url} - ${e.message}")
             }
         }
-        println("[디버그] === invokeStremioX 종료 ===")
     }
 
+    // CineStream과 동일한 구조의 Gson 파싱용 데이터 클래스
     private data class StremioSubtitleResponse(val subtitles: List<Subtitle>?)
-
+    
     private suspend fun invokeStremioSubtitles(
         type: String?,
         id: String?,
+        season: Int?,
+        episode: Int?,
         subtitleCallback: (SubtitleFile) -> Unit
     ) {
-        println("[디버그] === invokeStremioSubtitles 진입 ===")
         val sites = AcraApplication.getKey<Array<CustomSite>>(USER_PROVIDER_API)?.toMutableList() ?: mutableListOf()
-        println("[디버그] USER_PROVIDER_API 내 전체 저장된 사이트 총 개수: ${sites.size}")
+        val addonUrls = mutableSetOf<String>()
         
-        // 원인 파악을 위해 저장된 모든 사이트의 이름과 클래스를 출력합니다.
-        sites.forEachIndexed { index, site ->
-            println("[디버그] 사이트[$index] -> name: ${site.name}, class: ${site.parentJavaClass}, url: ${site.url}")
+        // 현재 메인 URL을 클린업하여 추가 (fallback 역할 통합)
+        addonUrls.add(baseUrl())
+        
+        sites.filter { it.parentJavaClass == "StremioX" || it.parentJavaClass == "StremioC" }.forEach { site ->
+            val cleanUrl = site.url.fixSourceUrl().substringBefore("?").replace("/manifest.json", "").trimEnd('/')
+            addonUrls.add(cleanUrl)
         }
 
-        val filteredSites = sites.filter { it.parentJavaClass == "StremioX" || it.parentJavaClass == "StremioC" }
-        println("[디버그] 필터링(StremioX/C 조건) 후 남은 사이트 개수: ${filteredSites.size}")
+        val gson = Gson()
 
-        // 만약 커스텀 애드온이 비어있다면, 현재 확장프로그램 메인 주소로 폴백 요청을 찔러봅니다.
-        if (filteredSites.isEmpty()) {
-            println("[디버그] 경고: 실행할 Stremio 자막 애드온이 없습니다! 현재 메인 URL(${this.mainUrl})로 폴백을 시도합니다.")
+        addonUrls.amap { api ->
             try {
-                val fallbackUrl = buildUrl("/subtitles/$type/$id.json")
-                println("[디버그] 폴백 자막 요청 URL: $fallbackUrl")
-                val req = app.get(fallbackUrl, timeout = 30L)
-                println("[디버그] 폴백 자막 응답 코드: ${req.code}")
-                val res = req.parsedSafe<StremioSubtitleResponse>()
-                if (res?.subtitles != null) {
-                    println("[디버그] 폴백 자막 파싱 성공, 추출된 자막 수: ${res.subtitles.size}")
-                    res.subtitles.forEach { sub ->
-                        if (!sub.url.isNullOrBlank()) {
-                            subtitleCallback.invoke(
-                                newSubtitleFile(
-                                    SubtitleHelper.fromTagToEnglishLanguageName(sub.lang ?: "") ?: sub.lang ?: "Unknown",
-                                    sub.url
-                                )
-                            )
-                        }
-                    }
+                val url = if (season != null && episode != null) {
+                    "$api/subtitles/series/$id:$season:$episode.json"
                 } else {
-                    println("[디버그] 폴백 자막 파싱 결과가 비어있습니다.")
+                    "$api/subtitles/movie/$id.json"
+                }
+
+                val json = app.get(url, timeout = 30L).text
+                val subtitleResponse = gson.fromJson(json, StremioSubtitleResponse::class.java)
+
+                subtitleResponse?.subtitles?.forEach { sub ->
+                    val lang = sub.lang ?: sub.lang_code
+                    val fileUrl = sub.url
+                    if (!lang.isNullOrBlank() && !fileUrl.isNullOrBlank()) {
+                        subtitleCallback.invoke(
+                            newSubtitleFile(
+                                SubtitleHelper.fromTagToEnglishLanguageName(lang) ?: lang,
+                                fileUrl
+                            )
+                        )
+                    }
                 }
             } catch (e: Exception) {
-                println("[디버그] 폴백 자막 요청 중 예외 발생: ${e.message}")
             }
         }
-
-        filteredSites.amap { site ->
-            try {
-                val url = "${site.url.fixSourceUrl()}/subtitles/$type/$id.json"
-                println("[디버그] 애드온 자막 요청 URL: $url")
-                
-                val req = app.get(url, timeout = 30L)
-                println("[디버그] 애드온 자막 응답 코드: ${req.code}, 응답 텍스트 길이: ${req.text.length}")
-                
-                val res = req.parsedSafe<StremioSubtitleResponse>()
-                
-                if (res?.subtitles != null) {
-                    println("[디버그] 애드온 자막 파싱 성공, 추출된 개수: ${res.subtitles.size}")
-                    res.subtitles.forEach { sub ->
-                        if (!sub.url.isNullOrBlank()) {
-                            subtitleCallback.invoke(
-                                newSubtitleFile(
-                                    SubtitleHelper.fromTagToEnglishLanguageName(sub.lang ?: "") ?: sub.lang ?: "Unknown",
-                                    sub.url
-                                )
-                            )
-                        }
-                    }
-                } else {
-                    println("[디버그] 애드온 자막 파싱 결과가 null 입니다. (응답 규격 불일치 또는 데이터 없음)")
-                }
-            } catch (e: Exception) {
-                println("[디버그] 애드온 자막 요청 실패 - 사이트: ${site.url} - 사유: ${e.message}")
-            }
-        }
-        println("[디버그] === invokeStremioSubtitles 종료 ===")
     }
 
     data class LoadData(
@@ -869,6 +834,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     private data class Subtitle(
         val url: String?,
         val lang: String?,
+        val lang_code: String?,
         val id: String?,
     )
 
@@ -911,10 +877,10 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     }
                 )
                 subtitles.map { sub ->
+                    val lang = sub.lang ?: sub.lang_code ?: "Unknown"
                     subtitleCallback.invoke(
                         newSubtitleFile(
-                            SubtitleHelper.fromTagToEnglishLanguageName(sub.lang ?: "") ?: sub.lang
-                            ?: "",
+                            SubtitleHelper.fromTagToEnglishLanguageName(lang) ?: lang,
                             sub.url ?: return@map
                         )
                     )
