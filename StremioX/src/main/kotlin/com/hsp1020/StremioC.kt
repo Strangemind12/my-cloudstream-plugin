@@ -151,7 +151,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val catalogsStartTime = System.currentTimeMillis()
         val lists = mutableListOf<HomePageList>()
         
-        targetCatalogs.chunked(5).forEachIndexed { index, chunk ->
+        targetCatalogs.chunked(9).forEachIndexed { index, chunk ->
             val chunkStartTime = System.currentTimeMillis()
             println("[StremioC v1.30] 청크 ${index + 1}/${(targetCatalogs.size + 4) / 5} 그룹 처리 중...")
             
