@@ -1,7 +1,8 @@
-// v1.26
+// v1.27
 package com.hsp1020
 
 import com.fasterxml.jackson.annotation.JsonProperty
+import com.google.gson.Gson
 import com.lagradost.cloudstream3.AcraApplication
 import com.lagradost.cloudstream3.Actor
 import com.lagradost.cloudstream3.ActorData
@@ -270,6 +271,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        println("[디버그] === loadLinks 시작 ===")
+        println("[디버그] 전달된 data: $data")
         val loadData = try { parseJson<LoadData>(data) } catch (e: Exception) { null } ?: return false
         val normalizedId = try { normalizeId(loadData.id) } catch (e: Exception) { loadData.id ?: "" }
         val encodedId = try { URLEncoder.encode(normalizedId, "UTF-8") } catch (e: Exception) { normalizedId }
@@ -313,6 +316,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
+        println("[디버그] === invokeStremioX 시작 ===")
         val sites = AcraApplication.getKey<Array<CustomSite>>(USER_PROVIDER_API)?.toMutableList() ?: mutableListOf()
         val filteredSites = sites.filter { it.parentJavaClass == "StremioX" || it.parentJavaClass == "StremioC" }
         
@@ -325,6 +329,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     "$api/stream/movie/$id.json"
                 }
                 
+                println("[디버그] 애드온 스트림 요청 URL: $url")
                 val req = app.get(url, timeout = 120L)
                 val res = req.parsedSafe<StreamsResponse>()
                 if (res?.streams != null) {
@@ -333,6 +338,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     }
                 }
             } catch (e: Exception) {
+                println("[디버그] invokeStremioX 예외 발생: ${e.message}")
             }
         }
     }
@@ -348,6 +354,9 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         episode: Int?,
         subtitleCallback: (SubtitleFile) -> Unit
     ) {
+        println("[디버그] === invokeStremioSubtitles 시작 ===")
+        println("[디버그] 파라미터 확인: type=$type, id=$id, season=$season, episode=$episode")
+        
         val sites = AcraApplication.getKey<Array<CustomSite>>(USER_PROVIDER_API)?.toMutableList() ?: mutableListOf()
         val addonUrls = mutableSetOf<String>()
         
@@ -358,7 +367,9 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             addonUrls.add(cleanUrl)
         }
 
-        // Set은 amap이 지원되지 않으므로 List로 변환하여 호출
+        println("[디버그] 수집된 자막 애드온 URL 개수: ${addonUrls.size}")
+        val gson = Gson()
+
         addonUrls.toList().amap { api ->
             try {
                 val url = if (season != null && episode != null) {
@@ -367,23 +378,34 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     "$api/subtitles/movie/$id.json"
                 }
 
-                val res = app.get(url, timeout = 30L).parsedSafe<StremioSubtitleResponse>()
+                println("[디버그] 애드온 자막 요청 URL: $url")
+                val req = app.get(url, timeout = 30L)
+                println("[디버그] 애드온 자막 응답 코드: ${req.code}, 응답 본문 일부: ${req.text.take(300)}")
+                
+                val subtitleResponse = gson.fromJson(req.text, StremioSubtitleResponse::class.java)
 
-                res?.subtitles?.forEach { sub ->
-                    val lang = sub.lang ?: sub.lang_code ?: "Unknown"
-                    val fileUrl = sub.url
-                    if (!fileUrl.isNullOrBlank()) {
-                        subtitleCallback.invoke(
-                            newSubtitleFile(
-                                SubtitleHelper.fromTagToEnglishLanguageName(lang) ?: lang,
-                                fileUrl
+                if (subtitleResponse?.subtitles != null) {
+                    println("[디버그] 애드온 자막 파싱 성공 개수: ${subtitleResponse.subtitles.size}")
+                    subtitleResponse.subtitles.forEach { sub ->
+                        val lang = sub.lang ?: sub.lang_code ?: "Unknown"
+                        val fileUrl = sub.url
+                        if (!fileUrl.isNullOrBlank()) {
+                            subtitleCallback.invoke(
+                                newSubtitleFile(
+                                    SubtitleHelper.fromTagToEnglishLanguageName(lang) ?: lang,
+                                    fileUrl
+                                )
                             )
-                        )
+                        }
                     }
+                } else {
+                    println("[디버그] 애드온 자막 파싱 결과(subtitles)가 null입니다.")
                 }
             } catch (e: Exception) {
+                println("[디버그] 애드온 자막 처리 중 예외 발생: ${e.message}")
             }
         }
+        println("[디버그] === invokeStremioSubtitles 종료 ===")
     }
 
     data class LoadData(
