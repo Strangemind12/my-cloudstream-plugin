@@ -1,4 +1,4 @@
-// v1.30
+// v1.29
 package com.hsp1020
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -51,8 +51,11 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     override val supportedTypes = setOf(TvType.Others)
     override val hasMainPage = true
      
-    // v1.30: 메모리 캐시 변수(pageContentCache, cachedManifest 등) 제거
+    private var cachedManifest: Manifest? = null
+    private var lastManifestUrl: String = ""
+    private var lastCacheTime: Long = 0
     private val catalogSentIds = mutableMapOf<String, MutableSet<String>>()
+    private val pageContentCache = mutableMapOf<String, List<SearchResponse>>()
     
     companion object {
         private const val cinemeta = "https://aiometadata.elfhosted.com/stremio/b7cb164b-074b-41d5-b458-b3a834e197bb"
@@ -99,54 +102,34 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val originalBase = mainUrl.substringBefore("?").trimEnd('/')
         val currentUrl = if (originalBase.endsWith("manifest.json")) originalBase else "$originalBase/manifest.json"
         
-        // v1.30: Manifest 디스크 캐싱 (12시간 유지)
-        val cacheKey = "stremio_man_${currentUrl.hashCode()}"
-        val cachedTime = AcraApplication.getKey<Long>("${cacheKey}_time") ?: 0L
         val now = System.currentTimeMillis()
-        val isCacheValid = (now - cachedTime) < 12L * 60L * 60L * 1000L
+        val cacheAge = now - lastCacheTime
+        val isExpired = cacheAge > 24 * 60 * 60 * 1000
 
-        if (isCacheValid) {
-            val cachedJson = AcraApplication.getKey<String>(cacheKey)
-            if (!cachedJson.isNullOrBlank()) {
-                try {
-                    val res = parseJson<Manifest>(cachedJson)
-                    if (res.catalogs.isNotEmpty()) {
-                        println("[StremioC v1.30] Manifest 디스크 캐시 적중 (0ms 예상): $currentUrl")
-                        return res
-                    }
-                } catch (e: Exception) {
-                    println("[StremioC v1.30] Manifest 캐시 파싱 실패: ${e.message}")
-                }
-            }
+        if (cachedManifest != null && 
+            lastManifestUrl == currentUrl && 
+            !isExpired && 
+            !cachedManifest?.catalogs.isNullOrEmpty()) {
+            return cachedManifest
         }
 
-        println("[StremioC v1.30] Manifest 신규 네트워크 요청 시작: $currentUrl")
-        val reqStartTime = System.currentTimeMillis()
-        val req = app.get(currentUrl, timeout = 120L)
-        println("[StremioC v1.30] Manifest 가져오기 소요 시간: ${System.currentTimeMillis() - reqStartTime}ms")
-        
-        if (req.isSuccessful) {
-            try {
-                val res = parseJson<Manifest>(req.text)
-                if (res.catalogs.isNotEmpty()) {
-                    AcraApplication.setKey(cacheKey, req.text) // 원본 JSON String 저장
-                    AcraApplication.setKey("${cacheKey}_time", now)
-                    println("[StremioC v1.30] Manifest 데이터를 12시간 디스크 캐싱 완료: $currentUrl")
-                    catalogSentIds.clear() // 매니페스트 갱신 시 중복 검사 맵 초기화
-                    return res
-                }
-            } catch (e: Exception) {
-                println("[StremioC v1.30] Manifest JSON 파싱 실패: ${e.message}")
-            }
-        }
-        return null
+        val res = app.get(currentUrl, timeout = 120L).parsedSafe<Manifest>()
+
+        if (res != null && res.catalogs.isNotEmpty()) {
+            cachedManifest = res
+            lastManifestUrl = currentUrl
+            lastCacheTime = now
+            pageContentCache.clear()
+            catalogSentIds.clear()
+        }      
+        return res ?: cachedManifest
     }
 
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-        println("[StremioC v1.30] getMainPage 시작: page=$page")
+        println("[StremioC v1.29] getMainPage 시작: page=$page")
         val startTime = System.currentTimeMillis()
         
         if (mainUrl.isEmpty()) throw IllegalArgumentException("Configure in Extension Settings\n")
@@ -158,23 +141,43 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
         val skip = (page - 1) * 100
         
+        val manifestStartTime = System.currentTimeMillis()
         val manifest = getManifest()
+        println("[StremioC v1.29] Manifest 가져오기 소요 시간: ${System.currentTimeMillis() - manifestStartTime}ms")
         
         val targetCatalogs = manifest?.catalogs?.filter { !it.isSearchRequired() } ?: emptyList()
-        println("[StremioC v1.30] 처리 대상 카탈로그 개수: ${targetCatalogs.size}. 동시성 제어(Chunked) 병렬 호출 시작.")
+        println("[StremioC v1.29] 처리 대상 카탈로그 개수: ${targetCatalogs.size}. 동시성 제어(Chunked) 병렬 호출 시작.")
         
         val catalogsStartTime = System.currentTimeMillis()
         val lists = mutableListOf<HomePageList>()
         
+        // v1.29: 3개씩 청크로 묶어 무분별한 병렬 요청 방지 (Thundering Herd 병목 해결)
         targetCatalogs.chunked(5).forEachIndexed { index, chunk ->
             val chunkStartTime = System.currentTimeMillis()
-            println("[StremioC v1.30] 청크 ${index + 1}/${(targetCatalogs.size + 4) / 5} 그룹 처리 중...")
+            println("[StremioC v1.29] 청크 ${index + 1}/${(targetCatalogs.size + 2) / 3} 그룹 처리 중...")
             
             val chunkResults = chunk.amap { catalog ->
                 val catalogKey = "${catalog.id}-${catalog.type}"
+                val cacheKey = "${catalogKey}_$skip"
+
+                val cachedItems = pageContentCache[cacheKey]
                 
-                // v1.30: 캐싱 로직을 toHomePageList 내부로 위임하여 코드를 간결화
-                val row = catalog.toHomePageList(provider = this@StremioC, skip = skip)
+                val row = if (cachedItems != null) {
+                    println("[StremioC v1.29] 캐시 적중: $catalogKey")
+                    val displayType = catalog.type?.replaceFirstChar { it.uppercase() } ?: ""
+                    val catalogName = "${catalog.name ?: catalog.id} - $displayType"
+                    HomePageList(catalogName, cachedItems)
+                } else {
+                    println("[StremioC v1.29] 신규 카탈로그 네트워크 요청 시작: $catalogKey")
+                    val itemStartTime = System.currentTimeMillis()
+                    val freshRow = catalog.toHomePageList(provider = this, skip = skip)
+                    println("[StremioC v1.29] 신규 카탈로그 응답 완료 ($catalogKey) 소요 시간: ${System.currentTimeMillis() - itemStartTime}ms")
+                    
+                    if (freshRow.list.isNotEmpty()) {
+                        pageContentCache[cacheKey] = freshRow.list
+                    }
+                    freshRow
+                }
                 
                 val seenForThisCatalog = catalogSentIds.getOrPut(catalogKey) { mutableSetOf() }
                 val filteredItems = row.list.filter { item ->
@@ -185,11 +188,11 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             }.filter { it.list.isNotEmpty() }
             
             lists.addAll(chunkResults)
-            println("[StremioC v1.30] 청크 ${index + 1} 처리 완료 소요 시간: ${System.currentTimeMillis() - chunkStartTime}ms")
+            println("[StremioC v1.29] 청크 ${index + 1} 처리 완료 소요 시간: ${System.currentTimeMillis() - chunkStartTime}ms")
         }
 
-        println("[StremioC v1.30] 모든 카탈로그 데이터 수집 완료. 총 소요 시간: ${System.currentTimeMillis() - catalogsStartTime}ms")
-        println("[StremioC v1.30] getMainPage 전체 로직 소요 시간: ${System.currentTimeMillis() - startTime}ms")
+        println("[StremioC v1.29] 모든 카탈로그 데이터 수집 완료. 총 소요 시간: ${System.currentTimeMillis() - catalogsStartTime}ms")
+        println("[StremioC v1.29] getMainPage 전체 로직 소요 시간: ${System.currentTimeMillis() - startTime}ms")
 
         return newHomePageResponse(
             lists,
@@ -198,7 +201,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        println("[StremioC v1.30] search 시작: query=$query")
+        println("[StremioC v1.29] search 시작: query=$query")
         val startTime = System.currentTimeMillis()
         
         mainUrl = mainUrl.fixSourceUrl()
@@ -206,12 +209,13 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val supportedCatalogs = manifest?.catalogs?.filter { it.supportsSearch() } ?: emptyList()
         
         val addonResults = mutableListOf<SearchResponse>()
+        // v1.29: 검색 요청 시에도 병렬 폭주를 막기 위해 chunked 제어 도입
         supportedCatalogs.chunked(3).forEach { chunk ->
             addonResults.addAll(chunk.amap { catalog -> catalog.search(query, this) }.flatten())
         }
         
         val distinctAddonResults = addonResults.distinctBy { it.url }
-        println("[StremioC v1.30] search 애드온 탐색 완료 소요 시간: ${System.currentTimeMillis() - startTime}ms")
+        println("[StremioC v1.29] search 애드온 탐색 완료 소요 시간: ${System.currentTimeMillis() - startTime}ms")
         
         if (distinctAddonResults.isNotEmpty()) {
             return distinctAddonResults
@@ -354,6 +358,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val filteredSites = sites.filter { it.parentJavaClass == "StremioX" || it.parentJavaClass == "StremioC" }
         
         val stremioId = if (type == "series" && season != null && episode != null) {
+            // 중복 방지 로직: id가 이미 :season:episode로 끝나는지 확인
             if (id?.endsWith(":$season:$episode") == true) id else "$id:$season:$episode"
         } else {
             id
@@ -400,6 +405,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val gson = Gson()
         
         val stremioId = if (type == "series" && season != null && episode != null) {
+            // 중복 방지 로직: id가 이미 :season:episode로 끝나는지 확인
             if (id?.endsWith(":$season:$episode") == true) id else "$id:$season:$episode"
         } else {
             id
@@ -503,49 +509,13 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     "/catalog/$type/$id.json"
                 }
                 val url = provider.buildUrl(path)
-                
-                // v1.30: HTTP 응답 결과를 원본 문자열 그대로 디스크에 12시간 동안 캐싱
-                val cacheKey = "stremio_cat_${url.hashCode()}"
-                val cachedTime = AcraApplication.getKey<Long>("${cacheKey}_time") ?: 0L
-                val now = System.currentTimeMillis()
-                val isCacheValid = (now - cachedTime) < 12L * 60L * 60L * 1000L
-                
-                var metas: List<CatalogEntry>? = null
-                
-                if (isCacheValid) {
-                    val cachedJson = AcraApplication.getKey<String>(cacheKey)
-                    if (!cachedJson.isNullOrBlank()) {
-                        println("[StremioC v1.30] 카탈로그 디스크 캐시 적중 (0ms 예상): $url")
-                        try {
-                            val res = parseJson<CatalogResponse>(cachedJson)
-                            metas = res.metas
-                        } catch (e: Exception) {
-                            println("[StremioC v1.30] 카탈로그 디스크 캐시 파싱 실패: ${e.message}")
-                        }
-                    }
-                }
 
-                if (metas == null) {
-                    println("[StremioC v1.30] 신규 카탈로그 네트워크 요청 시작: $url")
-                    val reqStartTime = System.currentTimeMillis()
-                    val req = app.get(url, timeout = 120L)
-                    println("[StremioC v1.30] 카탈로그 네트워크 요청 완료 ($url) 소요 시간: ${System.currentTimeMillis() - reqStartTime}ms")
-                    
-                    if (req.isSuccessful) {
-                        val jsonRaw = req.text
-                        AcraApplication.setKey(cacheKey, jsonRaw)
-                        AcraApplication.setKey("${cacheKey}_time", now)
-                        println("[StremioC v1.30] 카탈로그 데이터를 12시간 디스크 캐싱 완료: $url")
-                        
-                        try {
-                            metas = parseJson<CatalogResponse>(jsonRaw).metas
-                        } catch (e: Exception) {
-                            println("[StremioC v1.30] 카탈로그 JSON 파싱 실패: ${e.message}")
-                        }
-                    }
-                }
+                println("[StremioC v1.29] HTTP GET 시작: $url")
+                val reqStartTime = System.currentTimeMillis()
+                val res = app.get(url, timeout = 120L).parsedSafe<CatalogResponse>()
+                println("[StremioC v1.29] HTTP GET 완료 ($url) 소요 시간: ${System.currentTimeMillis() - reqStartTime}ms")
                 
-                metas ?: emptyList()
+                res?.metas ?: emptyList()
             }.flatten()
 
             val distinctEntries = allMetas.distinctBy { it.id }.map { it.toSearchResponse(provider) }
@@ -685,6 +655,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
                         val rawVideos = detailRes.videos?.results ?: emptyList()
                         
+                        // 기존 코드 유지: 개봉일이 가장 빠른 예고편(Trailer)을 우선 선택 로직
                         fetchedTrailers = rawVideos.filter { 
                             it.type == "Trailer" || it.type == "Teaser" 
                         }.sortedWith(compareBy(
