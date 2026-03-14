@@ -1,4 +1,4 @@
-// v1.28
+// v1.29
 package com.hsp1020
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -129,6 +129,9 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
+        println("[StremioC v1.29] getMainPage 시작: page=$page")
+        val startTime = System.currentTimeMillis()
+        
         if (mainUrl.isEmpty()) throw IllegalArgumentException("Configure in Extension Settings\n")
         mainUrl = mainUrl.fixSourceUrl()
 
@@ -137,34 +140,59 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         }
 
         val skip = (page - 1) * 100
+        
+        val manifestStartTime = System.currentTimeMillis()
         val manifest = getManifest()
+        println("[StremioC v1.29] Manifest 가져오기 소요 시간: ${System.currentTimeMillis() - manifestStartTime}ms")
+        
         val targetCatalogs = manifest?.catalogs?.filter { !it.isSearchRequired() } ?: emptyList()
-
-        val lists = targetCatalogs.amap { catalog ->
-            val catalogKey = "${catalog.id}-${catalog.type}"
-            val cacheKey = "${catalogKey}_$skip"
-
-            val cachedItems = pageContentCache[cacheKey]
+        println("[StremioC v1.29] 처리 대상 카탈로그 개수: ${targetCatalogs.size}. 동시성 제어(Chunked) 병렬 호출 시작.")
+        
+        val catalogsStartTime = System.currentTimeMillis()
+        val lists = mutableListOf<HomePageList>()
+        
+        // v1.29: 3개씩 청크로 묶어 무분별한 병렬 요청 방지 (Thundering Herd 병목 해결)
+        targetCatalogs.chunked(3).forEachIndexed { index, chunk ->
+            val chunkStartTime = System.currentTimeMillis()
+            println("[StremioC v1.29] 청크 ${index + 1}/${(targetCatalogs.size + 2) / 3} 그룹 처리 중...")
             
-            val row = if (cachedItems != null) {
-                val displayType = catalog.type?.replaceFirstChar { it.uppercase() } ?: ""
-                val catalogName = "${catalog.name ?: catalog.id} - $displayType"
-                HomePageList(catalogName, cachedItems)
-            } else {
-                val freshRow = catalog.toHomePageList(provider = this, skip = skip)
-                if (freshRow.list.isNotEmpty()) {
-                    pageContentCache[cacheKey] = freshRow.list
+            val chunkResults = chunk.amap { catalog ->
+                val catalogKey = "${catalog.id}-${catalog.type}"
+                val cacheKey = "${catalogKey}_$skip"
+
+                val cachedItems = pageContentCache[cacheKey]
+                
+                val row = if (cachedItems != null) {
+                    println("[StremioC v1.29] 캐시 적중: $catalogKey")
+                    val displayType = catalog.type?.replaceFirstChar { it.uppercase() } ?: ""
+                    val catalogName = "${catalog.name ?: catalog.id} - $displayType"
+                    HomePageList(catalogName, cachedItems)
+                } else {
+                    println("[StremioC v1.29] 신규 카탈로그 네트워크 요청 시작: $catalogKey")
+                    val itemStartTime = System.currentTimeMillis()
+                    val freshRow = catalog.toHomePageList(provider = this, skip = skip)
+                    println("[StremioC v1.29] 신규 카탈로그 응답 완료 ($catalogKey) 소요 시간: ${System.currentTimeMillis() - itemStartTime}ms")
+                    
+                    if (freshRow.list.isNotEmpty()) {
+                        pageContentCache[cacheKey] = freshRow.list
+                    }
+                    freshRow
                 }
-                freshRow
-            }
+                
+                val seenForThisCatalog = catalogSentIds.getOrPut(catalogKey) { mutableSetOf() }
+                val filteredItems = row.list.filter { item ->
+                    seenForThisCatalog.add(item.url)
+                }
+                
+                row.copy(list = filteredItems)
+            }.filter { it.list.isNotEmpty() }
             
-            val seenForThisCatalog = catalogSentIds.getOrPut(catalogKey) { mutableSetOf() }
-            val filteredItems = row.list.filter { item ->
-                seenForThisCatalog.add(item.url)
-            }
-            
-            row.copy(list = filteredItems)
-        }.filter { it.list.isNotEmpty() }
+            lists.addAll(chunkResults)
+            println("[StremioC v1.29] 청크 ${index + 1} 처리 완료 소요 시간: ${System.currentTimeMillis() - chunkStartTime}ms")
+        }
+
+        println("[StremioC v1.29] 모든 카탈로그 데이터 수집 완료. 총 소요 시간: ${System.currentTimeMillis() - catalogsStartTime}ms")
+        println("[StremioC v1.29] getMainPage 전체 로직 소요 시간: ${System.currentTimeMillis() - startTime}ms")
 
         return newHomePageResponse(
             lists,
@@ -173,12 +201,24 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
+        println("[StremioC v1.29] search 시작: query=$query")
+        val startTime = System.currentTimeMillis()
+        
         mainUrl = mainUrl.fixSourceUrl()
         val manifest = getManifest()
         val supportedCatalogs = manifest?.catalogs?.filter { it.supportsSearch() } ?: emptyList()
-        val addonResults = supportedCatalogs.amap { catalog -> catalog.search(query, this) }.flatten().distinctBy { it.url }
-        if (addonResults.isNotEmpty()) {
-            return addonResults
+        
+        val addonResults = mutableListOf<SearchResponse>()
+        // v1.29: 검색 요청 시에도 병렬 폭주를 막기 위해 chunked 제어 도입
+        supportedCatalogs.chunked(3).forEach { chunk ->
+            addonResults.addAll(chunk.amap { catalog -> catalog.search(query, this) }.flatten())
+        }
+        
+        val distinctAddonResults = addonResults.distinctBy { it.url }
+        println("[StremioC v1.29] search 애드온 탐색 완료 소요 시간: ${System.currentTimeMillis() - startTime}ms")
+        
+        if (distinctAddonResults.isNotEmpty()) {
+            return distinctAddonResults
         }
         return searchTMDb(query)
     }
@@ -470,7 +510,11 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 }
                 val url = provider.buildUrl(path)
 
+                println("[StremioC v1.29] HTTP GET 시작: $url")
+                val reqStartTime = System.currentTimeMillis()
                 val res = app.get(url, timeout = 120L).parsedSafe<CatalogResponse>()
+                println("[StremioC v1.29] HTTP GET 완료 ($url) 소요 시간: ${System.currentTimeMillis() - reqStartTime}ms")
+                
                 res?.metas ?: emptyList()
             }.flatten()
 
@@ -611,6 +655,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
                         val rawVideos = detailRes.videos?.results ?: emptyList()
                         
+                        // 기존 코드 유지: 개봉일이 가장 빠른 예고편(Trailer)을 우선 선택 로직
                         fetchedTrailers = rawVideos.filter { 
                             it.type == "Trailer" || it.type == "Teaser" 
                         }.sortedWith(compareBy(
