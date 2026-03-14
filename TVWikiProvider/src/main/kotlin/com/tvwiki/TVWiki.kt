@@ -13,23 +13,27 @@ import com.fasterxml.jackson.annotation.JsonProperty
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
 
-// [v1.11 추가] 동시성 제어 및 지연을 위한 라이브러리 추가
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.delay
 
 /**
- * TVWiki Provider v1.11
- * [v1.11 수정 사항]
- * - v1.7 ~ v1.9의 모든 수정 사항 폐기 및 원본 v1.6 구조로 완벽 롤백
- * - 앱의 12개 카테고리 동시 요청으로 인한 서버의 404/차단 회피를 위해 Mutex Lock 및 무작위 Delay 로직만 추가
- * [v1.6 수정 사항]
- * - 상세 페이지 포스터 Fallback 정규식 강화 (tvwiki숫자.net 형태의 메인 URL 무효화 처리)
- * - 플롯(줄거리) 추출 시 빈 값(Empty)일 경우 "다시보기" 텍스트로 치환되도록 방어 로직 추가
- * - 주요 실행 흐름 추적을 위한 디버깅 로그 추가
+ * TVWiki Provider v2.1
+ * [v2.1 수정 사항]
+ * - Update: HTTP 301/302 리다이렉트 발생 시 res.url을 추출하여 현재 도메인을 갱신하는 팩트 체크 로직 추가
+ * - Update: 단순 HTTP 200 응답뿐만 아니라 실제 본문 데이터(list_type) 유무 이중 확인
+ * - Update: 메인 페이지 로드 결과가 0건일 시 도메인 체크 플래그(isDomainChecked) 자동 초기화 추가
+ * [v2.0 수정 사항]
+ * - Update: 도메인 자동 갱신 로직 추가 (tvwiki숫자.net 순차 스캔)
+ * - Update: 과거 북마크 링크 진입 시 최신 도메인으로 URL 자동 치환 기능 추가
  */
 class TVWiki : MainAPI() {
-    override var mainUrl = "https://tvwiki5.net"
+    companion object {
+        var currentMainUrl = "https://tvwiki7.net" 
+        var isDomainChecked = false 
+    }
+
+    override var mainUrl = currentMainUrl
     override var name = "TVWiki"
     override val hasMainPage = true
     override var lang = "ko"
@@ -53,10 +57,7 @@ class TVWiki : MainAPI() {
         "Upgrade-Insecure-Requests" to "1"
     )
 
-    // 태그 내용 정제용 정규식
     private val tagCleanRegex = Regex("""\s*(한국|해외)?영화\s*\(\d{4}\).*""")
-
-    // [v1.11 추가] 동시 다발적인 카테고리 요청을 한 줄로 세우기 위한 자물쇠 객체
     private val requestMutex = Mutex()
 
     data class SessionResponse(
@@ -81,21 +82,90 @@ class TVWiki : MainAPI() {
         "/old_drama" to "추억의 드라마"
     )
 
+    // v2.1: 동적 도메인 탐색 및 리다이렉트 갱신 로직 (본문 검증 + URL 변조 검증)
+    private suspend fun checkAndUpdateDomain() {
+        if (isDomainChecked) {
+            println("[TVWiki v2.1] 도메인 체크 완료 상태. 현재 도메인 유지: $currentMainUrl")
+            return
+        }
+        
+        println("[TVWiki v2.1] 도메인 유효성 검사 시작: $currentMainUrl")
+        
+        try {
+            val res = app.get(currentMainUrl, headers = commonHeaders)
+            val finalUrl = res.url.trimEnd('/')
+            
+            // v2.1: 실제 데이터 구조(list_type)가 있는지 팩트 체크
+            if (res.isSuccessful && res.text.contains("list_type")) {
+                if (currentMainUrl != finalUrl) {
+                    println("[TVWiki v2.1] HTTP 리다이렉트 감지. 도메인 강제 갱신: $currentMainUrl -> $finalUrl")
+                    currentMainUrl = finalUrl
+                    mainUrl = currentMainUrl
+                } else {
+                    println("[TVWiki v2.1] 현재 도메인이 유효하고 실제 데이터가 존재합니다: $currentMainUrl")
+                }
+                isDomainChecked = true
+                return
+            } else {
+                println("[TVWiki v2.1] 접속은 성공했으나 데이터가 없습니다(JS 리다이렉트/차단 페이지 의심). 새 도메인 탐색을 시작합니다.")
+            }
+        } catch (e: Exception) {
+            println("[TVWiki v2.1] 현재 도메인 접속 실패, 새 도메인 탐색을 시작합니다. 에러: ${e.message}")
+        }
+
+        // 탐색 단계: 숫자 증가 브루트포스 스캔
+        val match = Regex("tvwiki(\\d+)").find(currentMainUrl)
+        val startNum = match?.groupValues?.get(1)?.toIntOrNull() ?: 5
+        
+        println("[TVWiki v2.1] 도메인 번호 순차 스캔 시작 (tvwiki$startNum 부터)")
+        for (i in startNum..startNum + 20) {
+            val testUrl = "https://tvwiki$i.net"
+            println("[TVWiki v2.1] 도메인 스캔 시도: $testUrl")
+            try {
+                val res = app.get(testUrl, headers = commonHeaders, timeout = 3L)
+                val testFinalUrl = res.url.trimEnd('/')
+                if (res.isSuccessful && res.text.contains("list_type")) {
+                    println("[TVWiki v2.1] 새 도메인 스캔 성공 및 데이터 확인!: $testFinalUrl")
+                    currentMainUrl = testFinalUrl
+                    mainUrl = currentMainUrl
+                    isDomainChecked = true
+                    return
+                }
+            } catch (e: Exception) {
+                println("[TVWiki v2.1] 스캔 실패: $testUrl (${e.message})")
+            }
+        }
+        
+        println("[TVWiki v2.1] 도메인 탐색을 완료했지만 찾을 수 없습니다. 기존 도메인을 유지합니다.")
+        isDomainChecked = true 
+    }
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        checkAndUpdateDomain()
         val url = "$mainUrl${request.data}?page=$page"
         
         return try {
-            // [v1.11 수정] 1.6 원본 로직을 유지하되, 뮤텍스 락을 걸어 서버에 한 번에 하나씩만 요청하도록 제어
             val doc = requestMutex.withLock {
                 val randomDelay = (200..800).random().toLong()
-                println("[TVWiki v1.11] 카테고리 로드 대기: ${request.name} | ${randomDelay}ms 지연 후 요청: $url")
+                println("[TVWiki v2.1] 카테고리 로드 대기: ${request.name} | ${randomDelay}ms 지연 후 요청: $url")
                 delay(randomDelay)
                 app.get(url, headers = commonHeaders).document
             }
             
             val list = doc.select("#list_type ul li").mapNotNull { it.toSearchResponse() }
+            
+            // v2.1: 아이템이 비어있다면 도메인이 막혔거나 구조가 바뀐 것이므로 플래그 강제 초기화
+            if (list.isEmpty()) {
+                println("[TVWiki v2.1] 메인 페이지 데이터 로드 결과가 0건입니다. 도메인 체크 플래그를 초기화합니다.")
+                isDomainChecked = false
+            } else {
+                println("[TVWiki v2.1] 메인 페이지 로드 성공. 아이템 개수: ${list.size}")
+            }
+            
             newHomePageResponse(request.name, list, hasNext = list.isNotEmpty())
         } catch (e: Exception) {
+            println("[TVWiki v2.1] Main page error: ${e.message}")
+            isDomainChecked = false
             newHomePageResponse(request.name, emptyList(), hasNext = false)
         }
     }
@@ -114,7 +184,6 @@ class TVWiki : MainAPI() {
             ?: imgTag?.attr("src")
             ?: ""
 
-        // [v1.5 수정] 포스터가 상대 경로일 경우 절대 경로로 변환하여 전달 (중요)
         if (rawPoster.startsWith("/")) {
             rawPoster = "$mainUrl$rawPoster"
         }
@@ -134,21 +203,13 @@ class TVWiki : MainAPI() {
 
         return when (type) {
             TvType.Movie, TvType.AnimeMovie -> newMovieSearchResponse(
-                title,
-                link,
-                type
+                title, link, type
             ) { this.posterUrl = fixedPoster }
-
             TvType.Anime -> newAnimeSearchResponse(
-                title,
-                link,
-                TvType.Anime
+                title, link, TvType.Anime
             ) { this.posterUrl = fixedPoster }
-
             else -> newTvSeriesSearchResponse(
-                title,
-                link,
-                TvType.TvSeries
+                title, link, TvType.TvSeries
             ) { this.posterUrl = fixedPoster }
         }
     }
@@ -164,47 +225,61 @@ class TVWiki : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
+        checkAndUpdateDomain() 
         val searchUrl = "$mainUrl/search?stx=$query"
-        val doc = app.get(searchUrl, headers = commonHeaders).document
-        
-        var items = doc.select("ul#mov_con_list li").mapNotNull { it.toSearchResponse() }
-        if (items.isEmpty()) {
-             items = doc.select("#list_type ul li").mapNotNull { it.toSearchResponse() }
+        println("[TVWiki v2.1] search: $searchUrl")
+        return try {
+            val doc = app.get(searchUrl, headers = commonHeaders).document
+            
+            var items = doc.select("ul#mov_con_list li").mapNotNull { it.toSearchResponse() }
+            if (items.isEmpty()) {
+                 items = doc.select("#list_type ul li").mapNotNull { it.toSearchResponse() }
+            }
+            if (items.isEmpty()) {
+                println("[TVWiki v2.1] 검색 결과가 없거나 데이터 파싱에 실패했습니다. (검색어: $query)")
+            }
+            items
+        } catch (e: Exception) { 
+            println("[TVWiki v2.1] Search 에러: ${e.message}")
+            emptyList() 
         }
-        return items
     }
 
     private fun getEpisodeNumber(name: String): Int {
         return try {
             val numberString = name.replace(Regex("[^0-9]"), "")
             if (numberString.isNotEmpty()) numberString.toInt() else Int.MAX_VALUE
-        } catch (e: Exception) {
-            Int.MAX_VALUE
-        }
+        } catch (e: Exception) { Int.MAX_VALUE }
     }
 
     override suspend fun load(url: String): LoadResponse {
-        println("[TVWiki v1.6] load 시작 - URL: $url")
+        checkAndUpdateDomain() 
+        
+        var targetUrl = url
+        if (!targetUrl.startsWith(mainUrl) && targetUrl.contains("tvwiki")) {
+            val path = targetUrl.replace(Regex("https?://[^/]+"), "")
+            targetUrl = mainUrl + path
+            println("[TVWiki v2.1] 과거 도메인 주소 감지. 최신 도메인으로 치환: $targetUrl")
+        }
 
-        // 1. URL 파라미터(cw_poster) 복원
+        println("[TVWiki v2.1] load 시작 - URL: $targetUrl")
+
         var passedPoster: String? = null
-        var realUrl = url
+        var realUrl = targetUrl
 
         try {
             val regex = Regex("[?&]cw_poster=([^&]+)")
-            val match = regex.find(url)
+            val match = regex.find(targetUrl)
             if (match != null) {
                 val encoded = match.groupValues[1]
                 passedPoster = URLDecoder.decode(encoded, "UTF-8")
-                realUrl = url.replace(match.value, "")
+                realUrl = targetUrl.replace(match.value, "")
                 if (realUrl.endsWith("?") || realUrl.endsWith("&")) {
                     realUrl = realUrl.dropLast(1)
                 }
-                println("[TVWiki v1.6] 터널링 포스터 복원 완료: $passedPoster")
+                println("[TVWiki v2.1] 터널링 포스터 복원 완료: $passedPoster")
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
+        } catch (e: Exception) { e.printStackTrace() }
 
         val doc = app.get(realUrl, headers = commonHeaders).document
 
@@ -228,57 +303,44 @@ class TVWiki : MainAPI() {
             }
         }
 
-        // 2. 상세 페이지 포스터 추출
         var poster = doc.selectFirst("#bo_v_poster img")?.attr("src")
             ?: doc.selectFirst("meta[property='og:image']")?.attr("content")
             ?: ""
 
-        // [v1.6 핵심 수정] 포스터 유효성 검사 (정규식 기반 와일드카드 도메인 차단)
         val tvwikiMainUrlRegex = Regex("""^https?://tvwiki\d*\.net/?$""")
         val isInvalidPoster = poster.isEmpty() 
             || poster.contains("no3.png") 
             || poster.contains("no_image")
             || tvwikiMainUrlRegex.matches(poster)
-            || poster.endsWith("/") // 디렉토리 경로만 있는 경우
+            || poster.endsWith("/")
 
-        println("[TVWiki v1.6] 포스터 유효성 검사 - 추출된포스터: $poster / 무효판정여부: $isInvalidPoster")
+        println("[TVWiki v2.1] 포스터 유효성 검사 - 추출된포스터: $poster / 무효판정여부: $isInvalidPoster")
 
-        if (isInvalidPoster) {
-            if (passedPoster != null) {
-                println("[TVWiki v1.6] 상세페이지 포스터 무효 확인. 터널링된 포스터 우선 적용 진행.")
-                poster = passedPoster
-            }
+        if (isInvalidPoster && passedPoster != null) {
+            println("[TVWiki v2.1] 상세페이지 포스터 무효 확인. 터널링된 포스터 우선 적용 진행.")
+            poster = passedPoster
         }
 
-        // 태그 처리
         val tagsList = mutableListOf<String>()
         
         doc.select(".bo_v_info dd").forEach { dd ->
-            var text = dd.text().trim()
+            val text = dd.text().trim()
             if (text.isNotEmpty() && !text.startsWith("제목")) {
                 val renamedText = text.replace("개봉년도:", "공개일:")
                 val cleanedText = renamedText.replace(tagCleanRegex, "").trim()
-                
-                if (cleanedText.isNotEmpty()) {
-                    tagsList.add(cleanedText)
-                }
+                if (cleanedText.isNotEmpty()) tagsList.add(cleanedText)
             }
         }
 
         val genreList = doc.select(".tags dd a").filter {
-            val txt = it.text()
-            !txt.contains("트레일러") && !it.hasClass("btn_watch")
+            !it.text().contains("트레일러") && !it.hasClass("btn_watch")
         }.map { it.text().trim().replace(tagCleanRegex, "") }
 
-        if (genreList.isNotEmpty()) {
-            val genreTag = "장르: ${genreList.joinToString(", ")}"
-            tagsList.add(genreTag)
-        }
+        if (genreList.isNotEmpty()) tagsList.add("장르: ${genreList.joinToString(", ")}")
 
         val castList = doc.select(".slider_act .item .name").map { it.text().trim().replace(tagCleanRegex, "") }
         if (castList.isNotEmpty() && castList.none { it.contains("운영팀") }) {
-            val castTag = "출연: ${castList.joinToString(", ")}"
-            tagsList.add(castTag)
+            tagsList.add("출연: ${castList.joinToString(", ")}")
         }
 
         var story = doc.selectFirst("#bo_v_con")?.text()?.trim()
@@ -286,12 +348,11 @@ class TVWiki : MainAPI() {
             ?: doc.selectFirst("meta[name='description']")?.attr("content")
             ?: "다시보기"
 
-        // [v1.6 핵심 수정] 줄거리가 빈 문자열인 경우 또는 쓸모없는 텍스트일 경우 확실히 처리
         if (story.isEmpty() || (story.contains("다시보기") && story.contains("무료"))) {
             story = "다시보기"
         }
         
-        println("[TVWiki v1.6] 최종 적용된 줄거리(Plot) 텍스트 길이: ${story.length}")
+        println("[TVWiki v2.1] 최종 적용된 줄거리(Plot) 텍스트 길이: ${story.length}")
         
         val episodes = doc.select("#other_list ul li").mapNotNull { li ->
             val aTag = li.selectFirst("a.ep-link") ?: return@mapNotNull null
@@ -307,9 +368,7 @@ class TVWiki : MainAPI() {
                 this.name = epName
                 this.posterUrl = fixUrl(epThumb ?: "")
             }
-        }.sortedBy { 
-            getEpisodeNumber(it.name ?: "") 
-        }
+        }.sortedBy { getEpisodeNumber(it.name ?: "") }
         
         val type = determineTypeFromUrl(realUrl)
 
@@ -322,7 +381,6 @@ class TVWiki : MainAPI() {
                     this.tags = tagsList
                 }
             }
-
             else -> {
                 newTvSeriesLoadResponse(title, realUrl, type, episodes) {
                     this.posterUrl = fixUrl(poster)
@@ -339,10 +397,18 @@ class TVWiki : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // 기존 코드 유지
-        val doc = app.get(data, headers = commonHeaders).document
+        checkAndUpdateDomain()
+        
+        var targetData = data
+        if (!targetData.startsWith(mainUrl) && targetData.contains("tvwiki")) {
+            val path = targetData.replace(Regex("https?://[^/]+"), "")
+            targetData = mainUrl + path
+            println("[TVWiki v2.1] loadLinks 과거 도메인 치환: $targetData")
+        }
 
-        if (extractFromApi(doc, data, subtitleCallback, callback)) {
+        val doc = app.get(targetData, headers = commonHeaders).document
+
+        if (extractFromApi(doc, targetData, subtitleCallback, callback)) {
             return true
         }
 
@@ -350,7 +416,7 @@ class TVWiki : MainAPI() {
         if (iframe != null) {
             val playerUrl = iframe.attr("src")
             if (playerUrl.contains("player.bunny-frame.online")) {
-                 val extracted = BunnyPoorCdn().extract(fixUrl(playerUrl).replace("&amp;", "&"), data, subtitleCallback, callback, null)
+                 val extracted = BunnyPoorCdn().extract(fixUrl(playerUrl).replace("&amp;", "&"), targetData, subtitleCallback, callback, null)
                  if(extracted) return true
             }
         }
@@ -360,20 +426,18 @@ class TVWiki : MainAPI() {
                 Regex("bunny-frame|googleapis"), 
                 timeout = 15000L
             )
-            val response = app.get(data, headers = commonHeaders, interceptor = webViewInterceptor)
+            val response = app.get(targetData, headers = commonHeaders, interceptor = webViewInterceptor)
             val webViewDoc = response.document
             
             val wbIframe = webViewDoc.selectFirst("iframe#view_iframe") ?: webViewDoc.selectFirst("iframe[src*='bunny-frame']")
             if (wbIframe != null) {
                 val playerUrl = wbIframe.attr("src")
                 if (playerUrl.contains("player.bunny-frame.online")) {
-                     val extracted = BunnyPoorCdn().extract(fixUrl(playerUrl).replace("&amp;", "&"), data, subtitleCallback, callback, null)
+                     val extracted = BunnyPoorCdn().extract(fixUrl(playerUrl).replace("&amp;", "&"), targetData, subtitleCallback, callback, null)
                      if(extracted) return true
                 }
             }
-        } catch (e: Exception) {
-            // e.printStackTrace()
-        }
+        } catch (e: Exception) { }
 
         val thumbnailHint = extractThumbnailHint(doc)
         if (thumbnailHint != null) {
