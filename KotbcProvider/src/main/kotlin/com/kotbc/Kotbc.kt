@@ -50,7 +50,7 @@ class Kotbc : MainAPI() {
             val prefs = AcraApplication.context?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             val cachedDomain = prefs?.getString(PREF_KEY, null)
 
-            if (cachedDomain != null && currentMainUrl == "https://m143.kotbc2.com") {
+            if (cachedDomain != null && currentMainUrl == "https://m142.kotbc2.com") {
                 println("[Kotbc v4.3] 디스크 캐시에서 도메인 로드 완료: $cachedDomain")
                 currentMainUrl = cachedDomain
                 mainUrl = currentMainUrl
