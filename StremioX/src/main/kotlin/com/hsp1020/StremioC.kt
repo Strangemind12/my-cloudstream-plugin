@@ -1,8 +1,7 @@
-// v1.24
+// v1.25
 package com.hsp1020
 
 import com.fasterxml.jackson.annotation.JsonProperty
-import com.google.gson.Gson
 import com.lagradost.cloudstream3.AcraApplication
 import com.lagradost.cloudstream3.Actor
 import com.lagradost.cloudstream3.ActorData
@@ -99,7 +98,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     }
 
     private suspend fun getManifest(): Manifest? {
-        // manifest.json은 항상 원본 URL 포맷에서 파생되도록 별도 처리
         val originalBase = mainUrl.substringBefore("?").trimEnd('/')
         val currentUrl = if (originalBase.endsWith("manifest.json")) originalBase else "$originalBase/manifest.json"
         
@@ -339,8 +337,9 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         }
     }
 
-    // CineStream과 동일한 구조의 Gson 파싱용 데이터 클래스
-    private data class StremioSubtitleResponse(val subtitles: List<Subtitle>?)
+    private data class StremioSubtitleResponse(
+        @JsonProperty("subtitles") val subtitles: List<Subtitle>?
+    )
     
     private suspend fun invokeStremioSubtitles(
         type: String?,
@@ -352,15 +351,12 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val sites = AcraApplication.getKey<Array<CustomSite>>(USER_PROVIDER_API)?.toMutableList() ?: mutableListOf()
         val addonUrls = mutableSetOf<String>()
         
-        // 현재 메인 URL을 클린업하여 추가 (fallback 역할 통합)
         addonUrls.add(baseUrl())
         
         sites.filter { it.parentJavaClass == "StremioX" || it.parentJavaClass == "StremioC" }.forEach { site ->
             val cleanUrl = site.url.fixSourceUrl().substringBefore("?").replace("/manifest.json", "").trimEnd('/')
             addonUrls.add(cleanUrl)
         }
-
-        val gson = Gson()
 
         addonUrls.amap { api ->
             try {
@@ -370,13 +366,12 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     "$api/subtitles/movie/$id.json"
                 }
 
-                val json = app.get(url, timeout = 30L).text
-                val subtitleResponse = gson.fromJson(json, StremioSubtitleResponse::class.java)
+                val res = app.get(url, timeout = 30L).parsedSafe<StremioSubtitleResponse>()
 
-                subtitleResponse?.subtitles?.forEach { sub ->
-                    val lang = sub.lang ?: sub.lang_code
+                res?.subtitles?.forEach { sub ->
+                    val lang = sub.lang ?: sub.lang_code ?: "Unknown"
                     val fileUrl = sub.url
-                    if (!lang.isNullOrBlank() && !fileUrl.isNullOrBlank()) {
+                    if (!fileUrl.isNullOrBlank()) {
                         subtitleCallback.invoke(
                             newSubtitleFile(
                                 SubtitleHelper.fromTagToEnglishLanguageName(lang) ?: lang,
@@ -830,34 +825,37 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         }
     }
 
-    private data class StreamsResponse(val streams: List<Stream>)
+    private data class StreamsResponse(
+        @JsonProperty("streams") val streams: List<Stream>
+    )
+    
     private data class Subtitle(
-        val url: String?,
-        val lang: String?,
-        val lang_code: String?,
-        val id: String?,
+        @JsonProperty("url") val url: String?,
+        @JsonProperty("lang") val lang: String?,
+        @JsonProperty("lang_code") val lang_code: String?,
+        @JsonProperty("id") val id: String?,
     )
 
     private data class ProxyHeaders(
-        val request: Map<String, String>?,
+        @JsonProperty("request") val request: Map<String, String>?,
     )
 
     private data class BehaviorHints(
-        val proxyHeaders: ProxyHeaders?,
-        val headers: Map<String, String>?,
+        @JsonProperty("proxyHeaders") val proxyHeaders: ProxyHeaders?,
+        @JsonProperty("headers") val headers: Map<String, String>?,
     )
 
     private data class Stream(
-        val name: String?,
-        val title: String?,
-        val url: String?,
-        val description: String?,
-        val ytId: String?,
-        val externalUrl: String?,
-        val behaviorHints: BehaviorHints?,
-        val infoHash: String?,
-        val sources: List<String> = emptyList(),
-        val subtitles: List<Subtitle> = emptyList()
+        @JsonProperty("name") val name: String?,
+        @JsonProperty("title") val title: String?,
+        @JsonProperty("url") val url: String?,
+        @JsonProperty("description") val description: String?,
+        @JsonProperty("ytId") val ytId: String?,
+        @JsonProperty("externalUrl") val externalUrl: String?,
+        @JsonProperty("behaviorHints") val behaviorHints: BehaviorHints?,
+        @JsonProperty("infoHash") val infoHash: String?,
+        @JsonProperty("sources") val sources: List<String> = emptyList(),
+        @JsonProperty("subtitles") val subtitles: List<Subtitle> = emptyList()
     ) {
         suspend fun runCallback(
             subtitleCallback: (SubtitleFile) -> Unit,
