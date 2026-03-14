@@ -15,7 +15,7 @@ import kotlinx.coroutines.sync.withLock
  */
 class Kotbc : MainAPI() {
     companion object {
-        var currentMainUrl = "https://m143.kotbc2.com" 
+        var currentMainUrl = "https://m142.kotbc2.com" 
         var isDomainChecked = false 
         private val domainMutex = Mutex()
         private const val PREFS_NAME = "Kotbc_Domain_Cache"
