@@ -1,4 +1,4 @@
-// v1.15
+// v1.16
 package com.hsp1020
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -284,7 +284,11 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             runAllAsync(
                     {
                         invokeStremioX(loadData.type, loadData.id, subtitleCallback, callback)
-                    },{
+                    },
+                    {
+                        invokeCustomSubtitles(loadData.type, loadData.id, subtitleCallback)
+                    },
+                    {
                         invokeTorrentio(loadData.imdbId, loadData.season, loadData.episode, callback)
                     },
                     {
@@ -330,6 +334,39 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             ).parsedSafe<StreamsResponse>()
             res?.streams?.forEach { stream ->
                 stream.runCallback(subtitleCallback, callback)
+            }
+        }
+    }
+
+    private suspend fun invokeCustomSubtitles(
+        type: String?,
+        id: String?,
+        subtitleCallback: (SubtitleFile) -> Unit
+    ) {
+        val sites = AcraApplication.getKey<Array<CustomSite>>(USER_PROVIDER_API)?.toMutableList()
+            ?: mutableListOf()
+        sites.filter { it.parentJavaClass == "StremioX" }.amap { site ->
+            println("Debugging invokeCustomSubtitles: Fetching subtitles from ${site.name} for id $id")
+            try {
+                val res = app.get(
+                    "${site.url.fixSourceUrl()}/subtitles/${type}/${id}.json",
+                    timeout = 120L
+                ).parsedSafe<SubsResponse>()
+                
+                res?.subtitles?.forEach { sub ->
+                    val lang = sub.lang ?: sub.langCode ?: "Unknown"
+                    val fileUrl = sub.url
+                    if (fileUrl != null) {
+                        subtitleCallback.invoke(
+                            newSubtitleFile(
+                                SubtitleHelper.fromTagToEnglishLanguageName(lang) ?: lang,
+                                fileUrl
+                            )
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                println("Debugging invokeCustomSubtitles: Error fetching from ${site.name} - ${e.message}")
             }
         }
     }
@@ -774,11 +811,13 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         }
     }
 
+    private data class SubsResponse(val subtitles: List<Subtitle>?)
     private data class StreamsResponse(val streams: List<Stream>)
     private data class Subtitle(
         val url: String?,
         val lang: String?,
         val id: String?,
+        @JsonProperty("lang_code") val langCode: String? = null
     )
 
     private data class ProxyHeaders(
@@ -1290,4 +1329,6 @@ suspend fun invokeTorrentio(
             }
         )
     }
+}
+
 }
