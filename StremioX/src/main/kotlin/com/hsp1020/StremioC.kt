@@ -1,4 +1,4 @@
-// v1.18
+// v1.17
 package com.hsp1020
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -40,10 +40,12 @@ import com.lagradost.cloudstream3.utils.USER_PROVIDER_API
 import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import com.hsp1020.StremioC.Companion.TRACKER_LIST_URLS
 import com.hsp1020.SubsExtractors.invokeOpenSubs
 import com.hsp1020.SubsExtractors.invokeWatchsomuch
 import org.json.JSONObject
 import java.net.URLEncoder
+import java.util.Locale
 
 class StremioC(override var mainUrl: String, override var name: String) : MainAPI() {
     override val supportedTypes = setOf(TvType.Others)
@@ -59,6 +61,10 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         private const val cinemeta = "https://aiometadata.elfhosted.com/stremio/b7cb164b-074b-41d5-b458-b3a834e197bb"
         private const val cinemetav3 = "https://v3-cinemeta.strem.io"
 
+        val TRACKER_LIST_URLS = listOf(
+            "https://raw.githubusercontent.com/ngosang/trackerslist/refs/heads/master/trackers_best.txt",
+            "https://raw.githubusercontent.com/ngosang/trackerslist/refs/heads/master/trackers_best_ip.txt",
+        )
         private const val TRACKER_LIST_URL = "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt"
         private const val tmdbAPI = "https://api.themoviedb.org/3"
         private const val apiKey = "cc9982c4801545a1481d167137ea7b53"
@@ -260,6 +266,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        println("디버그 로그: loadLinks 호출됨. Data: $data")
         val loadData = parseJson<LoadData>(data)
         val normalizedId = normalizeId(loadData.id)
         val encodedId = URLEncoder.encode(normalizedId, "UTF-8")
@@ -271,33 +278,39 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             null
 
         if (!res?.streams.isNullOrEmpty()) {
-            res.streams.forEach { stream ->
+            println("디버그 로그: 메인 API 내장 스트림 발견, 개수: ${res?.streams?.size}")
+            res?.streams?.forEach { stream ->
                 stream.runCallback(subtitleCallback, callback)
             }
         } else {
+            println("디버그 로그: 메인 API 스트림이 없어 커스텀 사이트/자막 병렬 로드를 시작합니다.")
             runAllAsync(
-                    {
-                        invokeStremioX(loadData.type, loadData.id, subtitleCallback, callback)
-                    },
-                    {
-                        invokeCustomSubtitles(loadData.type, loadData.id, subtitleCallback)
-                    },
-                    {
-                        invokeWatchsomuch(
-                            loadData.imdbId,
-                            loadData.season,
-                            loadData.episode,
-                            subtitleCallback
-                        )
-                    },
-                    {
-                        invokeOpenSubs(
-                            loadData.imdbId,
-                            loadData.season,
-                            loadData.episode,
-                            subtitleCallback
-                        )
-                    }
+                {
+                    println("디버그 로그: StremioX 스트림/영상 로드 요청 (invokeStremioX)")
+                    invokeStremioX(loadData.type, loadData.id, subtitleCallback, callback)
+                },
+                {
+                    println("디버그 로그: Watchsomuch 자체 API 자막 로드 요청 (invokeWatchsomuch)")
+                    invokeWatchsomuch(
+                        loadData.imdbId,
+                        loadData.season,
+                        loadData.episode,
+                        subtitleCallback
+                    )
+                },
+                {
+                    println("디버그 로그: OpenSubs 자체 API 자막 로드 요청 (invokeOpenSubs)")
+                    invokeOpenSubs(
+                        loadData.imdbId,
+                        loadData.season,
+                        loadData.episode,
+                        subtitleCallback
+                    )
+                },
+                {
+                    println("디버그 로그: Stremio 자막 전역 애드온 데이터 로드 요청 (invokeStremioSubtitlesGlobal)")
+                    invokeStremioSubtitlesGlobal(loadData.type, loadData.id, subtitleCallback)
+                }
             )
         }
 
@@ -323,35 +336,43 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         }
     }
 
-    private suspend fun invokeCustomSubtitles(
+    private suspend fun invokeStremioSubtitlesGlobal(
         type: String?,
         id: String?,
         subtitleCallback: (SubtitleFile) -> Unit
     ) {
-        val sites = AcraApplication.getKey<Array<CustomSite>>(USER_PROVIDER_API)?.toMutableList()
-            ?: mutableListOf()
-        sites.filter { it.parentJavaClass == "StremioX" }.amap { site ->
-            println("Debugging invokeCustomSubtitles: Fetching subtitles from ${site.name} for id $id")
+        val sites = AcraApplication.getKey<Array<CustomSite>>(USER_PROVIDER_API)?.toMutableList() ?: mutableListOf()
+        sites.filter { it.parentJavaClass == "StremioX" }.forEach { site ->
             try {
-                val res = app.get(
-                    "${site.url.fixSourceUrl()}/subtitles/${type}/${id}.json",
-                    timeout = 120L
-                ).parsedSafe<SubsResponse>()
+                val url = "${site.url.fixSourceUrl()}/subtitles/${type}/${id}.json"
+                println("디버그 로그: Stremio 전역 자막 요청 URL = $url")
                 
-                res?.subtitles?.forEach { sub ->
-                    val lang = sub.lang ?: sub.langCode ?: "Unknown"
-                    val fileUrl = sub.url
-                    if (fileUrl != null) {
-                        subtitleCallback.invoke(
-                            newSubtitleFile(
-                                SubtitleHelper.fromTagToEnglishLanguageName(lang) ?: lang,
-                                fileUrl
-                            )
-                        )
+                val responseText = app.get(url, timeout = 120L).text
+                if (responseText.isNotBlank()) {
+                    val jsonObject = JSONObject(responseText)
+                    if (jsonObject.has("subtitles")) {
+                        val subtitlesArray = jsonObject.getJSONArray("subtitles")
+                        for (i in 0 until subtitlesArray.length()) {
+                            val subObj = subtitlesArray.getJSONObject(i)
+                            val subUrl = subObj.optString("url")
+                            val subLang = subObj.optString("lang", "Unknown")
+                            
+                            if (subUrl.isNotBlank()) {
+                                println("디버그 로그: 자막 데이터 추출 성공 - 언어: $subLang, URL: $subUrl")
+                                subtitleCallback.invoke(
+                                    newSubtitleFile(
+                                        SubtitleHelper.fromTagToEnglishLanguageName(subLang) ?: subLang,
+                                        subUrl
+                                    )
+                                )
+                            }
+                        }
+                    } else {
+                        println("디버그 로그: 응답 JSON에 'subtitles' 키가 없습니다.")
                     }
                 }
             } catch (e: Exception) {
-                println("Debugging invokeCustomSubtitles: Error fetching from ${site.name} - ${e.message}")
+                println("디버그 로그: 전역 자막 요청/파싱 실패 (JSONObject 구조 방식) - ${e.message}")
             }
         }
     }
@@ -796,13 +817,11 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         }
     }
 
-    private data class SubsResponse(val subtitles: List<Subtitle>?)
     private data class StreamsResponse(val streams: List<Stream>)
     private data class Subtitle(
         val url: String?,
         val lang: String?,
         val id: String?,
-        @JsonProperty("lang_code") val langCode: String? = null
     )
 
     private data class ProxyHeaders(
