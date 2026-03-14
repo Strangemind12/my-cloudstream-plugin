@@ -1,25 +1,22 @@
 package com.kotbc
 
-import android.content.Context
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Element
 
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
-
 /**
- * Kotbc Provider v4.3
- * - Fix: 앱 재시작 시 초기 도메인부터 재스캔하는 문제 해결을 위해 SharedPreferences(디스크 캐싱) 적용
- * - Fix: 멀티 스레드 병렬 로드 시 발생하는 중복 스캔을 차단하기 위해 domainMutex 자물쇠 동기화 적용
+ * Kotbc Provider v4.2
+ * - Version: v4.2
+ * - Update: HTTP 301/302 리다이렉트 발생 시 res.url을 추출하여 현재 도메인을 갱신하는 팩트 체크 로직 추가
+ * - Update: 초기 도메인을 m143으로 갱신
+ * - Version: v4.1
+ * - Update: 도메인 유효성 검증 강화 (단순 HTTP 200 응답뿐만 아니라 실제 본문 데이터 유무 확인)
+ * - Update: 메인 페이지 로드 실패 시 도메인 체크 플래그(isDomainChecked) 자동 초기화 로직 추가
  */
 class Kotbc : MainAPI() {
     companion object {
-        var currentMainUrl = "https://m143.kotbc2.com" 
-        var isDomainChecked = false 
-        private val domainMutex = Mutex()
-        private const val PREFS_NAME = "Kotbc_Domain_Cache"
-        private const val PREF_KEY = "current_domain"
+        var currentMainUrl = "https://m143.kotbc2.com" // v4.2: 초기 도메인 갱신
+        var isDomainChecked = false // 세션 당 1회만 체크하기 위한 플래그
     }
 
     override var mainUrl = currentMainUrl
@@ -40,111 +37,102 @@ class Kotbc : MainAPI() {
         "mid" to "해외드라마"
     )
 
+    // v4.2: 동적 도메인 탐색 및 리다이렉트 갱신 로직 (본문 검증 + URL 변조 검증)
     private suspend fun checkAndUpdateDomain() {
-        if (isDomainChecked) return
-
-        domainMutex.withLock {
-            if (isDomainChecked) return@withLock
+        if (isDomainChecked) {
+            println("[Kotbc v4.2] 도메인 체크 완료 상태. 현재 도메인 유지: $currentMainUrl")
+            return
+        }
+        
+        println("[Kotbc v4.2] 도메인 유효성 검사 시작: $currentMainUrl")
+        
+        try {
+            val res = app.get(currentMainUrl)
+            val finalUrl = res.url.trimEnd('/')
             
-            // v4.3: 디스크 캐시에서 저장된 최신 도메인 불러오기
-            val prefs = AcraApplication.context?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            val cachedDomain = prefs?.getString(PREF_KEY, null)
-
-            if (cachedDomain != null && currentMainUrl == "https://m143.kotbc2.com") {
-                println("[Kotbc v4.3] 디스크 캐시에서 도메인 로드 완료: $cachedDomain")
-                currentMainUrl = cachedDomain
-                mainUrl = currentMainUrl
-            }
-            
-            println("[Kotbc v4.3] 도메인 유효성 검사 시작: $currentMainUrl")
-            
-            try {
-                val res = app.get(currentMainUrl)
-                val finalUrl = res.url.trimEnd('/')
-                
-                if (res.isSuccessful && res.text.contains("list-box")) {
-                    if (currentMainUrl != finalUrl) {
-                        println("[Kotbc v4.3] 리다이렉트 감지. 도메인 강제 갱신 및 디스크 저장: $currentMainUrl -> $finalUrl")
-                        currentMainUrl = finalUrl
-                        mainUrl = currentMainUrl
-                        prefs?.edit()?.putString(PREF_KEY, currentMainUrl)?.apply()
-                    } else {
-                        println("[Kotbc v4.3] 현재 도메인이 유효합니다: $currentMainUrl")
-                    }
-                    isDomainChecked = true
-                    return@withLock
+            // v4.2: HTTP 통신 성공 후 실제 데이터 구조가 있는지 팩트 체크
+            if (res.isSuccessful && res.text.contains("list-box")) {
+                // 초기에 요청한 주소와 최종 응답을 받은 주소가 다르다면 리다이렉트가 발생한 것임
+                if (currentMainUrl != finalUrl) {
+                    println("[Kotbc v4.2] HTTP 리다이렉트 감지. 도메인 강제 갱신: $currentMainUrl -> $finalUrl")
+                    currentMainUrl = finalUrl
+                    mainUrl = currentMainUrl
                 } else {
-                    println("[Kotbc v4.3] 접속은 성공했으나 데이터가 없습니다. 새 도메인 스캔을 시작합니다.")
+                    println("[Kotbc v4.2] 현재 도메인이 유효하고 실제 데이터가 존재합니다: $currentMainUrl")
                 }
-            } catch (e: Exception) {
-                println("[Kotbc v4.3] 접속 실패, 새 도메인 스캔을 시작합니다. 에러: ${e.message}")
+                isDomainChecked = true
+                return
+            } else {
+                println("[Kotbc v4.2] 접속은 성공했으나 데이터가 없습니다(JS 리다이렉트/차단 페이지 의심). 새 도메인 탐색을 시작합니다.")
             }
+        } catch (e: Exception) {
+            println("[Kotbc v4.2] 현재 도메인 접속 실패, 새 도메인 탐색을 시작합니다. 에러: ${e.message}")
+        }
 
+        // 탐색 1단계: 베이스 도메인 리다이렉트 검사
+        try {
+            println("[Kotbc v4.2] 베이스 도메인(kotbc2.com) 리다이렉트 추적 시도...")
+            val redirectRes = app.get("https://kotbc2.com")
+            val baseFinalUrl = redirectRes.url.trimEnd('/')
+            if (redirectRes.isSuccessful && baseFinalUrl.contains("kotbc2.com") && redirectRes.text.contains("list-box")) {
+                currentMainUrl = baseFinalUrl
+                mainUrl = currentMainUrl
+                isDomainChecked = true
+                println("[Kotbc v4.2] 베이스 도메인 리다이렉트를 통해 새 도메인 및 데이터 확보: $currentMainUrl")
+                return
+            }
+        } catch (e: Exception) {
+            println("[Kotbc v4.2] 베이스 도메인 리다이렉트 추적 실패: ${e.message}")
+        }
+
+        // 탐색 2단계: 숫자 증가 브루트포스 스캔
+        val match = Regex("m(\\d+)").find(currentMainUrl)
+        val startNum = match?.groupValues?.get(1)?.toIntOrNull() ?: 142
+        
+        println("[Kotbc v4.2] 도메인 번호 순차 스캔 시작 (m$startNum 부터)")
+        for (i in startNum..startNum + 20) {
+            val testUrl = "https://m$i.kotbc2.com"
+            println("[Kotbc v4.2] 도메인 스캔 시도: $testUrl")
             try {
-                println("[Kotbc v4.3] 베이스 도메인(kotbc2.com) 리다이렉트 추적 시도...")
-                val redirectRes = app.get("https://kotbc2.com")
-                val baseFinalUrl = redirectRes.url.trimEnd('/')
-                if (redirectRes.isSuccessful && baseFinalUrl.contains("kotbc2.com") && redirectRes.text.contains("list-box")) {
-                    currentMainUrl = baseFinalUrl
+                val res = app.get(testUrl, timeout = 3L)
+                val testFinalUrl = res.url.trimEnd('/')
+                if (res.isSuccessful && res.text.contains("list-box")) {
+                    println("[Kotbc v4.2] 새 도메인 스캔 성공 및 데이터 확인!: $testFinalUrl")
+                    currentMainUrl = testFinalUrl
                     mainUrl = currentMainUrl
                     isDomainChecked = true
-                    println("[Kotbc v4.3] 베이스 도메인 리다이렉트를 통해 새 도메인 확보 및 디스크 저장: $currentMainUrl")
-                    prefs?.edit()?.putString(PREF_KEY, currentMainUrl)?.apply()
-                    return@withLock
+                    return
                 }
             } catch (e: Exception) {
-                println("[Kotbc v4.3] 베이스 도메인 추적 실패: ${e.message}")
+                println("[Kotbc v4.2] 스캔 실패: $testUrl (${e.message})")
             }
-
-            val match = Regex("m(\\d+)").find(currentMainUrl)
-            val startNum = match?.groupValues?.get(1)?.toIntOrNull() ?: 142
-            
-            println("[Kotbc v4.3] 도메인 번호 순차 스캔 시작 (m$startNum 부터)")
-            for (i in startNum..startNum + 20) {
-                val testUrl = "https://m$i.kotbc2.com"
-                println("[Kotbc v4.3] 스캔 시도: $testUrl")
-                try {
-                    val res = app.get(testUrl, timeout = 3L)
-                    val testFinalUrl = res.url.trimEnd('/')
-                    if (res.isSuccessful && res.text.contains("list-box")) {
-                        println("[Kotbc v4.3] 새 도메인 스캔 성공!: $testFinalUrl")
-                        currentMainUrl = testFinalUrl
-                        mainUrl = currentMainUrl
-                        isDomainChecked = true
-                        
-                        println("[Kotbc v4.3] 찾은 도메인을 디스크 캐시에 영구 저장합니다.")
-                        prefs?.edit()?.putString(PREF_KEY, currentMainUrl)?.apply()
-                        
-                        return@withLock
-                    }
-                } catch (e: Exception) {
-                    println("[Kotbc v4.3] 스캔 실패: $testUrl (${e.message})")
-                }
-            }
-            
-            println("[Kotbc v4.3] 도메인 탐색을 완료했지만 찾을 수 없습니다.")
-            isDomainChecked = true 
         }
+        
+        println("[Kotbc v4.2] 도메인 탐색을 완료했지만 찾을 수 없습니다. 기존 도메인을 유지합니다.")
+        isDomainChecked = true // 무한 재귀 방지
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         checkAndUpdateDomain()
         val url = "$mainUrl/bbs/board.php?bo_table=${request.data}&page=$page"
-        println("[Kotbc v4.3] getMainPage 요청: $url")
+        println("[Kotbc v4.2] getMainPage 요청: $url")
         return try {
             val doc = app.get(url).document
             val elements = doc.select(".list-body .list-row .list-box")
             val list = elements.mapNotNull { element -> element.toSearchResponse() }
             
+            // v4.2: 아이템이 비어있다면 도메인이 막혔거나 구조가 바뀐 것이므로 플래그 강제 초기화
             if (list.isEmpty()) {
-                println("[Kotbc v4.3] 메인 페이지 데이터 로드 결과가 0건입니다.")
+                println("[Kotbc v4.2] 메인 페이지 데이터 로드 결과가 0건입니다. 도메인 체크 플래그를 초기화합니다.")
+                isDomainChecked = false
             } else {
-                println("[Kotbc v4.3] 메인 페이지 로드 성공. 아이템 개수: ${list.size}")
+                println("[Kotbc v4.2] 메인 페이지 로드 성공. 아이템 개수: ${list.size}")
             }
             
             newHomePageResponse(request.name, list, hasNext = list.isNotEmpty())
         } catch (e: Exception) {
-            println("[Kotbc v4.3] Main page error 발생 사유: ${e.message}")
+            println("[Kotbc v4.2] Main page error 발생. 도메인 체크 플래그 초기화. 사유: ${e.message}")
+            isDomainChecked = false
             newHomePageResponse(request.name, emptyList(), hasNext = false)
         }
     }
@@ -152,18 +140,18 @@ class Kotbc : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         checkAndUpdateDomain()
         val url = "$mainUrl/bbs/search.php?sfl=wr_subject&stx=$query"
-        println("[Kotbc v4.3] search 요청: $url")
+        println("[Kotbc v4.2] search 요청: $url")
         return try {
             val doc = app.get(url).document
             val elements = doc.select(".list-body .list-row .list-box")
             val list = elements.mapNotNull { element -> element.toSearchResponse() }
             
             if (list.isEmpty()) {
-                println("[Kotbc v4.3] 검색 결과가 없거나 데이터 파싱에 실패했습니다. (검색어: $query)")
+                println("[Kotbc v4.2] 검색 결과가 없거나 데이터 파싱에 실패했습니다. (검색어: $query)")
             }
             list
         } catch (e: Exception) {
-            println("[Kotbc v4.3] Search 에러: ${e.message}")
+            println("[Kotbc v4.2] Search 에러: ${e.message}")
             emptyList()
         }
     }
@@ -195,10 +183,10 @@ class Kotbc : MainAPI() {
         if (!targetUrl.startsWith(mainUrl)) {
             val path = targetUrl.replace(Regex("https?://[^/]+"), "")
             targetUrl = mainUrl + path
-            println("[Kotbc v4.3] 과거 도메인 주소 감지. 최신 도메인으로 치환: $targetUrl")
+            println("[Kotbc v4.2] 과거 도메인 주소 감지. 최신 도메인으로 치환: $targetUrl")
         }
         
-        println("[Kotbc v4.3] load 상세 페이지 요청: $targetUrl")
+        println("[Kotbc v4.2] load 상세 페이지 요청: $targetUrl")
         val doc = app.get(targetUrl).document
         val title = doc.selectFirst(".view-title h1")?.text()?.trim()?.replace(Regex("\\s*\\(\\d{4}\\)$"), "") ?: "Unknown"
         val poster = doc.selectFirst(".view-info .image img")?.attr("src")?.let { resolvePosterUrl(it) }
@@ -229,7 +217,7 @@ class Kotbc : MainAPI() {
         val episodeItems = doc.select(".serial-list .list-body .list-item")
         
         if (episodeItems.isNotEmpty()) {
-            println("[Kotbc v4.3] 에피소드 리스트 발견: ${episodeItems.size}개")
+            println("[Kotbc v4.2] 에피소드 리스트 발견: ${episodeItems.size}개")
             episodeItems.forEach { item ->
                 val linkEl = item.selectFirst("a.item-subject")
                 val epHref = linkEl?.attr("href")
@@ -245,7 +233,7 @@ class Kotbc : MainAPI() {
                 }
             }
         } else {
-            println("[Kotbc v4.3] 에피소드 리스트 없음. 현재 페이지를 단일 에피소드로 처리.")
+            println("[Kotbc v4.2] 에피소드 리스트 없음. 현재 페이지를 단일 에피소드로 처리.")
             episodes.add(newEpisode(targetUrl) { 
                 this.name = title
                 this.posterUrl = poster 
@@ -256,7 +244,7 @@ class Kotbc : MainAPI() {
         
         if (type == TvType.Movie) {
             val movieDataUrl = episodes.firstOrNull()?.data ?: targetUrl
-            println("[Kotbc v4.3] Movie 타입 로드 완료. Data URL: $movieDataUrl")
+            println("[Kotbc v4.2] Movie 타입 로드 완료. Data URL: $movieDataUrl")
             
             return newMovieLoadResponse(title, targetUrl, TvType.Movie, movieDataUrl) {
                 this.posterUrl = poster
@@ -264,7 +252,7 @@ class Kotbc : MainAPI() {
                 this.tags = tags
             }
         } else {
-            println("[Kotbc v4.3] TVSeries 타입 로드 완료.")
+            println("[Kotbc v4.2] TVSeries 타입 로드 완료.")
             return newTvSeriesLoadResponse(title, targetUrl, TvType.TvSeries, episodes.sortedBy { it.episode ?: 0 }) {
                 this.posterUrl = poster
                 this.plot = description
@@ -279,7 +267,7 @@ class Kotbc : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("[Kotbc v4.3] loadLinks 영상 링크 요청: $data")
+        println("[Kotbc v4.2] loadLinks 영상 링크 요청: $data")
         try {
             val doc = app.get(data).document
             val form = doc.selectFirst("form.tt2") ?: doc.selectFirst("form.tt")
@@ -288,7 +276,7 @@ class Kotbc : MainAPI() {
                 val vParam = form.selectFirst("input[name=v]")?.attr("value")
                 if (action.isNotEmpty() && !vParam.isNullOrEmpty()) {
                     val targetUrl = "$action?v=$vParam"
-                    println("[Kotbc v4.3] Extractor 호출 시작: $targetUrl")
+                    println("[Kotbc v4.2] Extractor 호출 시작: $targetUrl")
                     val extractor = KotbcExtractor()
                     extractor.getUrl(targetUrl, mainUrl, subtitleCallback, callback)
                     return true
@@ -298,13 +286,13 @@ class Kotbc : MainAPI() {
             doc.select("iframe").forEach { iframe ->
                 val src = iframe.attr("src")
                 if (src.contains("nnmo0oi1") || src.contains("glamov")) {
-                     println("[Kotbc v4.3] Iframe 감지, Extractor 직접 호출: $src")
+                     println("[Kotbc v4.2] Iframe 감지, Extractor 직접 호출: $src")
                      val extractor = KotbcExtractor()
                      extractor.getUrl(fixUrl(src), mainUrl, subtitleCallback, callback)
                 }
             }
         } catch (e: Exception) { 
-            println("[Kotbc v4.3] loadLinks 에러: ${e.message}")
+            println("[Kotbc v4.2] loadLinks 에러: ${e.message}")
             e.printStackTrace() 
         }
         return true
