@@ -1,4 +1,4 @@
-// v1.25
+// v1.26
 package com.hsp1020
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -358,7 +358,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             addonUrls.add(cleanUrl)
         }
 
-        addonUrls.amap { api ->
+        // Set은 amap이 지원되지 않으므로 List로 변환하여 호출
+        addonUrls.toList().amap { api ->
             try {
                 val url = if (season != null && episode != null) {
                     "$api/subtitles/series/$id:$season:$episode.json"
