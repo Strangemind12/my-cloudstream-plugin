@@ -18,14 +18,10 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.delay
 
 /**
- * TVWiki Provider v2.1
- * [v2.1 수정 사항]
- * - Update: HTTP 301/302 리다이렉트 발생 시 res.url을 추출하여 현재 도메인을 갱신하는 팩트 체크 로직 추가
- * - Update: 단순 HTTP 200 응답뿐만 아니라 실제 본문 데이터(list_type) 유무 이중 확인
- * - Update: 메인 페이지 로드 결과가 0건일 시 도메인 체크 플래그(isDomainChecked) 자동 초기화 추가
- * [v2.0 수정 사항]
- * - Update: 도메인 자동 갱신 로직 추가 (tvwiki숫자.net 순차 스캔)
- * - Update: 과거 북마크 링크 진입 시 최신 도메인으로 URL 자동 치환 기능 추가
+ * TVWiki Provider v2.2
+ * [v2.2 수정 사항]
+ * - Fix: 도메인 팩트 체크 시 최상위 루트(/)가 아닌 구조가 보장된 카테고리(/popular) 경로를 찌르도록 변경 (False Negative 해결)
+ * - Update: 리다이렉트 발생 시 정규식을 이용해 응답 URL에서 순수 도메인 부분만 안전하게 추출하도록 로직 보강
  */
 class TVWiki : MainAPI() {
     companion object {
@@ -82,61 +78,64 @@ class TVWiki : MainAPI() {
         "/old_drama" to "추억의 드라마"
     )
 
-    // v2.1: 동적 도메인 탐색 및 리다이렉트 갱신 로직 (본문 검증 + URL 변조 검증)
+    // v2.2: 동적 도메인 탐색 및 리다이렉트 갱신 로직 (경로 기반 검증으로 수정)
     private suspend fun checkAndUpdateDomain() {
         if (isDomainChecked) {
-            println("[TVWiki v2.1] 도메인 체크 완료 상태. 현재 도메인 유지: $currentMainUrl")
+            println("[TVWiki v2.2] 도메인 체크 완료 상태. 현재 도메인 유지: $currentMainUrl")
             return
         }
         
-        println("[TVWiki v2.1] 도메인 유효성 검사 시작: $currentMainUrl")
+        val testPath = "/popular" // v2.2: list_type 태그가 보장된 카테고리 경로
+        println("[TVWiki v2.2] 도메인 유효성 검사 시작: $currentMainUrl$testPath")
         
         try {
-            val res = app.get(currentMainUrl, headers = commonHeaders)
-            val finalUrl = res.url.trimEnd('/')
+            val res = app.get("$currentMainUrl$testPath", headers = commonHeaders)
+            // 응답된 전체 URL에서 정규식을 통해 순수 도메인 부분(예: https://tvwiki7.net)만 안전하게 추출
+            val finalUrl = Regex("^https?://[^/]+").find(res.url)?.value ?: currentMainUrl
             
-            // v2.1: 실제 데이터 구조(list_type)가 있는지 팩트 체크
+            // v2.2: 실제 데이터 구조(list_type)가 있는지 팩트 체크
             if (res.isSuccessful && res.text.contains("list_type")) {
                 if (currentMainUrl != finalUrl) {
-                    println("[TVWiki v2.1] HTTP 리다이렉트 감지. 도메인 강제 갱신: $currentMainUrl -> $finalUrl")
+                    println("[TVWiki v2.2] HTTP 리다이렉트 감지. 도메인 강제 갱신: $currentMainUrl -> $finalUrl")
                     currentMainUrl = finalUrl
                     mainUrl = currentMainUrl
                 } else {
-                    println("[TVWiki v2.1] 현재 도메인이 유효하고 실제 데이터가 존재합니다: $currentMainUrl")
+                    println("[TVWiki v2.2] 현재 도메인이 유효하고 실제 데이터가 존재합니다: $currentMainUrl")
                 }
                 isDomainChecked = true
                 return
             } else {
-                println("[TVWiki v2.1] 접속은 성공했으나 데이터가 없습니다(JS 리다이렉트/차단 페이지 의심). 새 도메인 탐색을 시작합니다.")
+                println("[TVWiki v2.2] 접속은 성공했으나 데이터가 없습니다(JS 리다이렉트/차단 페이지 의심). 새 도메인 탐색을 시작합니다.")
             }
         } catch (e: Exception) {
-            println("[TVWiki v2.1] 현재 도메인 접속 실패, 새 도메인 탐색을 시작합니다. 에러: ${e.message}")
+            println("[TVWiki v2.2] 현재 도메인 접속 실패, 새 도메인 탐색을 시작합니다. 에러: ${e.message}")
         }
 
         // 탐색 단계: 숫자 증가 브루트포스 스캔
         val match = Regex("tvwiki(\\d+)").find(currentMainUrl)
-        val startNum = match?.groupValues?.get(1)?.toIntOrNull() ?: 5
+        val startNum = match?.groupValues?.get(1)?.toIntOrNull() ?: 7
         
-        println("[TVWiki v2.1] 도메인 번호 순차 스캔 시작 (tvwiki$startNum 부터)")
+        println("[TVWiki v2.2] 도메인 번호 순차 스캔 시작 (tvwiki$startNum 부터)")
         for (i in startNum..startNum + 20) {
-            val testUrl = "https://tvwiki$i.net"
-            println("[TVWiki v2.1] 도메인 스캔 시도: $testUrl")
+            val testDomain = "https://tvwiki$i.net"
+            val testUrl = "$testDomain$testPath"
+            println("[TVWiki v2.2] 도메인 스캔 시도: $testUrl")
             try {
                 val res = app.get(testUrl, headers = commonHeaders, timeout = 3L)
-                val testFinalUrl = res.url.trimEnd('/')
+                val testFinalUrl = Regex("^https?://[^/]+").find(res.url)?.value ?: testDomain
                 if (res.isSuccessful && res.text.contains("list_type")) {
-                    println("[TVWiki v2.1] 새 도메인 스캔 성공 및 데이터 확인!: $testFinalUrl")
+                    println("[TVWiki v2.2] 새 도메인 스캔 성공 및 데이터 확인!: $testFinalUrl")
                     currentMainUrl = testFinalUrl
                     mainUrl = currentMainUrl
                     isDomainChecked = true
                     return
                 }
             } catch (e: Exception) {
-                println("[TVWiki v2.1] 스캔 실패: $testUrl (${e.message})")
+                println("[TVWiki v2.2] 스캔 실패: $testUrl (${e.message})")
             }
         }
         
-        println("[TVWiki v2.1] 도메인 탐색을 완료했지만 찾을 수 없습니다. 기존 도메인을 유지합니다.")
+        println("[TVWiki v2.2] 도메인 탐색을 완료했지만 찾을 수 없습니다. 기존 도메인을 유지합니다.")
         isDomainChecked = true 
     }
 
@@ -147,24 +146,23 @@ class TVWiki : MainAPI() {
         return try {
             val doc = requestMutex.withLock {
                 val randomDelay = (200..800).random().toLong()
-                println("[TVWiki v2.1] 카테고리 로드 대기: ${request.name} | ${randomDelay}ms 지연 후 요청: $url")
+                println("[TVWiki v2.2] 카테고리 로드 대기: ${request.name} | ${randomDelay}ms 지연 후 요청: $url")
                 delay(randomDelay)
                 app.get(url, headers = commonHeaders).document
             }
             
             val list = doc.select("#list_type ul li").mapNotNull { it.toSearchResponse() }
             
-            // v2.1: 아이템이 비어있다면 도메인이 막혔거나 구조가 바뀐 것이므로 플래그 강제 초기화
             if (list.isEmpty()) {
-                println("[TVWiki v2.1] 메인 페이지 데이터 로드 결과가 0건입니다. 도메인 체크 플래그를 초기화합니다.")
+                println("[TVWiki v2.2] 메인 페이지 데이터 로드 결과가 0건입니다. 도메인 체크 플래그를 초기화합니다.")
                 isDomainChecked = false
             } else {
-                println("[TVWiki v2.1] 메인 페이지 로드 성공. 아이템 개수: ${list.size}")
+                println("[TVWiki v2.2] 메인 페이지 로드 성공. 아이템 개수: ${list.size}")
             }
             
             newHomePageResponse(request.name, list, hasNext = list.isNotEmpty())
         } catch (e: Exception) {
-            println("[TVWiki v2.1] Main page error: ${e.message}")
+            println("[TVWiki v2.2] Main page error: ${e.message}")
             isDomainChecked = false
             newHomePageResponse(request.name, emptyList(), hasNext = false)
         }
@@ -227,7 +225,7 @@ class TVWiki : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         checkAndUpdateDomain() 
         val searchUrl = "$mainUrl/search?stx=$query"
-        println("[TVWiki v2.1] search: $searchUrl")
+        println("[TVWiki v2.2] search: $searchUrl")
         return try {
             val doc = app.get(searchUrl, headers = commonHeaders).document
             
@@ -236,11 +234,11 @@ class TVWiki : MainAPI() {
                  items = doc.select("#list_type ul li").mapNotNull { it.toSearchResponse() }
             }
             if (items.isEmpty()) {
-                println("[TVWiki v2.1] 검색 결과가 없거나 데이터 파싱에 실패했습니다. (검색어: $query)")
+                println("[TVWiki v2.2] 검색 결과가 없거나 데이터 파싱에 실패했습니다. (검색어: $query)")
             }
             items
         } catch (e: Exception) { 
-            println("[TVWiki v2.1] Search 에러: ${e.message}")
+            println("[TVWiki v2.2] Search 에러: ${e.message}")
             emptyList() 
         }
     }
@@ -259,10 +257,10 @@ class TVWiki : MainAPI() {
         if (!targetUrl.startsWith(mainUrl) && targetUrl.contains("tvwiki")) {
             val path = targetUrl.replace(Regex("https?://[^/]+"), "")
             targetUrl = mainUrl + path
-            println("[TVWiki v2.1] 과거 도메인 주소 감지. 최신 도메인으로 치환: $targetUrl")
+            println("[TVWiki v2.2] 과거 도메인 주소 감지. 최신 도메인으로 치환: $targetUrl")
         }
 
-        println("[TVWiki v2.1] load 시작 - URL: $targetUrl")
+        println("[TVWiki v2.2] load 시작 - URL: $targetUrl")
 
         var passedPoster: String? = null
         var realUrl = targetUrl
@@ -277,7 +275,7 @@ class TVWiki : MainAPI() {
                 if (realUrl.endsWith("?") || realUrl.endsWith("&")) {
                     realUrl = realUrl.dropLast(1)
                 }
-                println("[TVWiki v2.1] 터널링 포스터 복원 완료: $passedPoster")
+                println("[TVWiki v2.2] 터널링 포스터 복원 완료: $passedPoster")
             }
         } catch (e: Exception) { e.printStackTrace() }
 
@@ -314,10 +312,10 @@ class TVWiki : MainAPI() {
             || tvwikiMainUrlRegex.matches(poster)
             || poster.endsWith("/")
 
-        println("[TVWiki v2.1] 포스터 유효성 검사 - 추출된포스터: $poster / 무효판정여부: $isInvalidPoster")
+        println("[TVWiki v2.2] 포스터 유효성 검사 - 추출된포스터: $poster / 무효판정여부: $isInvalidPoster")
 
         if (isInvalidPoster && passedPoster != null) {
-            println("[TVWiki v2.1] 상세페이지 포스터 무효 확인. 터널링된 포스터 우선 적용 진행.")
+            println("[TVWiki v2.2] 상세페이지 포스터 무효 확인. 터널링된 포스터 우선 적용 진행.")
             poster = passedPoster
         }
 
@@ -352,7 +350,7 @@ class TVWiki : MainAPI() {
             story = "다시보기"
         }
         
-        println("[TVWiki v2.1] 최종 적용된 줄거리(Plot) 텍스트 길이: ${story.length}")
+        println("[TVWiki v2.2] 최종 적용된 줄거리(Plot) 텍스트 길이: ${story.length}")
         
         val episodes = doc.select("#other_list ul li").mapNotNull { li ->
             val aTag = li.selectFirst("a.ep-link") ?: return@mapNotNull null
@@ -403,7 +401,7 @@ class TVWiki : MainAPI() {
         if (!targetData.startsWith(mainUrl) && targetData.contains("tvwiki")) {
             val path = targetData.replace(Regex("https?://[^/]+"), "")
             targetData = mainUrl + path
-            println("[TVWiki v2.1] loadLinks 과거 도메인 치환: $targetData")
+            println("[TVWiki v2.2] loadLinks 과거 도메인 치환: $targetData")
         }
 
         val doc = app.get(targetData, headers = commonHeaders).document
