@@ -1,247 +1,301 @@
 package com.movieking
 
-import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.loadExtractor
-import org.jsoup.nodes.Element
-import java.net.URLDecoder
-import java.net.URLEncoder
+import android.util.Base64
+import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.SubtitleFile
+import java.io.*
+import java.net.*
+import javax.crypto.Cipher
+import javax.crypto.spec.IvParameterSpec
+import javax.crypto.spec.SecretKeySpec
+import kotlin.concurrent.thread
 
 /**
- * MovieKing Provider v1.3
+ * v124-6: 비디오 ID 파싱 정규식 개선 및 동적 호스트 지원
  * [변경 이력]
- * - v1.0: 초기 버전
- * - v1.1: 상세 페이지 정보를 태그(Tags)로 분리하고 줄거리(Plot)를 소개 내용으로 한정함.
- * - v1.2: 메인 페이지 구조 변경에 따른 사이트 도메인 갱신 및 경로 파싱 로직, 검색 URL 수정.
- * - v1.3: 상세 페이지 제목 파싱 오류(Unknown) 수정 및 아이템 제목에서 (연도) 뒷부분 전체 제거 로직 적용.
+ * - v124-6: /v1/, /v2/, /v99/ 등 모든 버전 숫자에 동적으로 대응하도록 정규식(Regex("/v\\d+/")) 적용.
+ * - v124-5: 도메인에 맞게 Referer/Origin 헤더 동적 생성.
+ * - v124-4: 비디오 ID 파싱 디버깅 로그 추가.
  */
-class MovieKing : MainAPI() {
-    override var mainUrl = "https://mvking.net"
-    override var name = "MovieKing"
-    override val hasMainPage = true
-    override var lang = "ko"
+class BcbcRedExtractor : ExtractorApi() {
+    override val name = "MovieKingPlayer"
+    override val mainUrl = "https://player-v2.bcbc.red"
+    override val requiresReferer = true
+    private val DESKTOP_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
-    override val supportedTypes = setOf(
-        TvType.TvSeries,
-        TvType.Movie,
-        TvType.AsianDrama,
-        TvType.Anime
-    )
+    companion object {
+        private var proxyServer: ProxyWebServer? = null
+    }
 
-    private val commonHeaders = mapOf(
-        "Referer" to "$mainUrl/"
-    )
-
-    // v1.3 수정: (연도) 및 그 뒤에 오는 모든 문자열을 매칭하여 제거
-    private val titleRegex = Regex("""\s*\(\d{4}\).*""")
-    // 태그 내용 정제용 정규식 (국가/연도 중복 표기 제거)
-    private val tagCleanRegex = Regex("""\s*(한국|해외)?영화\s*\(?\d{4}\)?.*""")
-
-    override val mainPage = mainPageOf(
-        "/video/영화" to "영화",
-        "/video/드라마" to "드라마",
-        "/video/TV예능" to "예능",
-        "/video/애니" to "애니",
-        "/video/시사다큐" to "시사/다큐"
-    )
-
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val separator = if (request.data.contains("?")) "&" else "?"
-        val url = "$mainUrl${request.data}${separator}page=$page"
-        println("[MovieKing][v1.3] getMainPage 요청: $url")
+    override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
+        println("=== [MovieKing v124-6] getUrl Start (Hybrid Proxy 구조) ===")
+        println("[MovieKing v124-6] [DEBUG] 플레이어 원본 URL: $url")
         
-        return try {
-            val doc = app.get(url, headers = commonHeaders).document
-            println("[MovieKing][v1.3] 메인 페이지 문서 파싱 완료")
-            val list = doc.select(".video-card").mapNotNull { it.toSearchResponse(request.name) }
-            println("[MovieKing][v1.3] 메인 아이템 검색 성공: ${list.size}건")
-            newHomePageResponse(request.name, list, hasNext = list.isNotEmpty())
-        } catch (e: Exception) {
-            println("[MovieKing][v1.3] 메인 페이지 로드 에러: ${e.message}")
-            newHomePageResponse(request.name, emptyList(), hasNext = false)
-        }
-    }
-
-    private fun Element.toSearchResponse(categoryName: String? = null): SearchResponse? {
-        println("[MovieKing][v1.3] toSearchResponse 파싱 시작")
-        val linkTag = this.selectFirst(".video-card-image a") ?: return null
-        val titleTag = this.selectFirst(".video-title a") ?: return null
-        
-        val href = fixUrl(linkTag.attr("href"))
-        val rawTitle = titleTag.text().trim()
-        val title = rawTitle.replace(titleRegex, "").trim()
-        println("[MovieKing][v1.3] 메인/검색 원본 제목: $rawTitle -> 추출된 제목: $title, 원본 링크: $href")
-
-        val imgTag = this.selectFirst("img")
-        val rawPoster = imgTag?.attr("src") ?: imgTag?.attr("data-src")
-        val fixedPoster = fixUrl(rawPoster ?: "")
-        println("[MovieKing][v1.3] 추출된 포스터: $fixedPoster")
-
-        var finalHref = href
-        if (fixedPoster.isNotEmpty()) {
-            try {
-                val encodedPoster = URLEncoder.encode(fixedPoster, "UTF-8")
-                finalHref = "$href&poster_url=$encodedPoster"
-            } catch (e: Exception) {
-                println("[MovieKing][v1.3] 포스터 URL 인코딩 에러: ${e.message}")
-                e.printStackTrace()
-            }
-        }
-
-        val isMovie = categoryName == "영화" || href.contains("movie") || href.contains("영화")
-        val type = if (isMovie) TvType.Movie else TvType.TvSeries
-        println("[MovieKing][v1.3] 아이템 타입 판별 완료: $type")
-
-        return if (type == TvType.Movie) {
-            newMovieSearchResponse(title, finalHref, TvType.Movie) {
-                this.posterUrl = fixedPoster
-            }
-        } else {
-            newTvSeriesSearchResponse(title, finalHref, TvType.TvSeries) {
-                this.posterUrl = fixedPoster
-            }
-        }
-    }
-
-    override suspend fun search(query: String): List<SearchResponse> {
-        println("[MovieKing][v1.3] 검색 요청: $query")
-        val searchUrl = "$mainUrl/search?k=$query"
-        println("[MovieKing][v1.3] 생성된 검색 URL: $searchUrl")
-        return try {
-            val doc = app.get(searchUrl, headers = commonHeaders).document
-            println("[MovieKing][v1.3] 검색 페이지 문서 파싱 완료")
-            val results = doc.select(".video-card").mapNotNull { it.toSearchResponse() }
-            println("[MovieKing][v1.3] 검색 결과 수: ${results.size}")
-            results
-        } catch (e: Exception) {
-            println("[MovieKing][v1.3] 검색 페이지 로드 에러: ${e.message}")
-            emptyList()
-        }
-    }
-
-    override suspend fun load(url: String): LoadResponse {
-        println("[MovieKing][v1.3] 상세 페이지 로드 시작: $url")
-        var passedPoster: String? = null
-        var realUrl = url
-
         try {
-            val match = Regex("""[&?]poster_url=([^&]+)""").find(url)
-            if (match != null) {
-                val encodedPoster = match.groupValues[1]
-                passedPoster = URLDecoder.decode(encodedPoster, "UTF-8")
-                realUrl = url.replace(match.value, "")
-                println("[MovieKing][v1.3] 전달된 포스터 URL 복원 성공: $passedPoster")
-            }
-        } catch (e: Exception) {
-            println("[MovieKing][v1.3] 포스터 파라미터 처리 에러: ${e.message}")
-        }
-
-        println("[MovieKing][v1.3] 실제 요청 URL: $realUrl")
-        val doc = app.get(realUrl, headers = commonHeaders).document
-        
-        // v1.3 수정: 상세 페이지 구조 변경에 따른 제목 파싱 로직 업데이트
-        val rawTitle = doc.selectFirst("h3.title")?.text()?.trim() 
-            ?: doc.selectFirst("h1.text-secondary")?.text()?.trim() 
-            ?: "Unknown"
+            val videoId = extractVideoIdDeep(url)
+            println("[MovieKing v124-6] [DEBUG] 최종 확정된 비디오 ID: $videoId")
             
-        val title = rawTitle.replace(titleRegex, "").trim()
-        println("[MovieKing][v1.3] 상세 원본 제목: $rawTitle -> 추출된 제목: $title")
-        
-        var poster = passedPoster
-        if (poster.isNullOrEmpty()) {
-            poster = doc.selectFirst(".single-video-left img")?.attr("src")
-                ?: doc.selectFirst("meta[property='og:image']")?.attr("content")
-            println("[MovieKing][v1.3] 문서 내 포스터 추출: $poster")
-        }
-
-        val infoContent = doc.selectFirst(".single-video-info-content")
-
-        fun getInfoText(keyword: String): String? {
-            val text = infoContent?.select("p:contains($keyword)")?.text()
-                ?.replace(keyword, "")?.replace(":", "")?.trim()
-            if (!text.isNullOrBlank()) {
-                println("[MovieKing][v1.3] 정보 추출 성공 [$keyword]: $text")
+            // v124-5 유지: 동적으로 호스트 추출하여 Referer와 Origin 설정
+            val uri = URI(url)
+            val hostUrl = "${uri.scheme}://${uri.host}"
+            println("[MovieKing v124-6] [DEBUG] 동적 추출된 호스트: $hostUrl")
+            
+            val baseHeaders = mutableMapOf("Referer" to "$hostUrl/", "Origin" to hostUrl, "User-Agent" to DESKTOP_UA)
+            
+            println("[MovieKing v124-6] 플레이어 HTML 및 원본 M3U8 요청 시작")
+            val playerHtml = app.get(url, headers = baseHeaders).text
+            val m3u8Url = Regex("""data-m3u8\s*=\s*['"]([^'"]+)['"]""").find(playerHtml)?.groupValues?.get(1)?.replace("\\/", "/") ?: return
+            val playlistRes = app.get(m3u8Url, headers = baseHeaders).text
+            
+            val keyMatch = Regex("""#EXT-X-KEY:METHOD=AES-128,URI="([^"]+)"(?:,IV=(0x[0-9a-fA-F]+))?""").find(playlistRes)
+            val hexIv = keyMatch?.groupValues?.get(2)
+            
+            val candidates = if (keyMatch != null) solveKeyCandidatesCombinatorial(baseHeaders, keyMatch.groupValues[1]) else emptyList()
+            
+            val lines = playlistRes.lines()
+            var currentSeq = Regex("""#EXT-X-MEDIA-SEQUENCE:(\d+)""").find(playlistRes)?.groupValues?.get(1)?.toLong() ?: 0L
+            val firstSeq = currentSeq
+            var firstSegmentUrl: String? = null
+            
+            for (line in lines) {
+                if (line.isNotBlank() && !line.startsWith("#")) {
+                    firstSegmentUrl = if (line.startsWith("http")) line else "${m3u8Url.substringBeforeLast("/")}/$line"
+                    break
+                }
             }
-            return text
-        }
 
-        // 데이터 추출
-        println("[MovieKing][v1.3] 데이터 추출 진행 중...")
-        val quality = getInfoText("화질")
-        val genre = getInfoText("장르")?.replace(tagCleanRegex, "")?.trim()
-        val country = getInfoText("나라")
-        val releaseDate = getInfoText("개봉")
-        val director = getInfoText("감독")
-        val cast = getInfoText("출연")
-        val intro = infoContent?.selectFirst("h6:contains(소개)")?.nextElementSibling()?.text()?.trim()
+            var confirmedKey = ByteArray(16)
+            var confirmedIvType = -1
 
-        println("[MovieKing][v1.3] 데이터 파싱 완료 - 태그 생성 시작")
-
-        // 태그 리스트 생성 (태그명: 태그내용 형식)
-        val tagsList = mutableListOf<String>()
-        if (!genre.isNullOrBlank()) tagsList.add("장르: $genre")
-        if (!country.isNullOrBlank()) tagsList.add("국가: $country")
-        if (!releaseDate.isNullOrBlank()) tagsList.add("공개일: $releaseDate")
-        if (!director.isNullOrBlank()) tagsList.add("감독(방송사): $director")
-        if (!cast.isNullOrBlank()) tagsList.add("출연: $cast")
-
-        val year = releaseDate?.replace(Regex("[^0-9-]"), "")?.take(4)?.toIntOrNull()
-
-        // 에피소드 파싱
-        println("[MovieKing][v1.3] 에피소드 파싱 시작")
-        val episodeList = doc.select(".video-slider-right-list .eps_a").map { element ->
-            val epHref = fixUrl(element.attr("href"))
-            val epName = element.text().trim()
-            println("[MovieKing][v1.3] 에피소드 발견: $epName -> $epHref")
-            newEpisode(epHref) {
-                this.name = epName
+            if (firstSegmentUrl != null && candidates.isNotEmpty()) {
+                try {
+                    println("[MovieKing v124-6] 정답 키 조합을 위해 첫 세그먼트 단발성 다운로드: $firstSegmentUrl")
+                    val firstSegBytes = app.get(firstSegmentUrl, headers = baseHeaders).body.bytes()
+                    val ivs = getIvList(firstSeq, hexIv)
+                    val checkSize = Math.min(firstSegBytes.size, 188 * 2)
+                    
+                    outer@ for ((keyIdx, key) in candidates.withIndex()) {
+                        for ((ivIdx, iv) in ivs.withIndex()) {
+                            try {
+                                val cipher = Cipher.getInstance("AES/CBC/NoPadding")
+                                cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+                                val head = cipher.update(firstSegBytes.take(checkSize).toByteArray())
+                                
+                                if (head.isNotEmpty() && head[0] == 0x47.toByte() && head.size > 188 && head[188] == 0x47.toByte()) {
+                                    println("[MovieKing v124-6] 정답 키 선행 검증 완료! Key#$keyIdx, IV_Type#$ivIdx")
+                                    confirmedKey = key
+                                    confirmedIvType = ivIdx
+                                    break@outer
+                                }
+                            } catch (e: Exception) {}
+                        }
+                    }
+                } catch (e: Exception) {
+                    println("[MovieKing v124-6] 세그먼트 선행 다운로드 또는 복호화 에러: ${e.message}")
+                }
             }
-        }.reversed()
 
-        println("[MovieKing][v1.3] 에피소드 개수: ${episodeList.size}")
+            proxyServer?.stop()
+            proxyServer = ProxyWebServer()
+            proxyServer!!.start()
 
-        val isMovie = episodeList.isEmpty() || episodeList.size == 1
-
-        return if (isMovie) {
-            println("[MovieKing][v1.3] Movie 타입으로 결과 반환")
-            newMovieLoadResponse(title, realUrl, TvType.Movie, realUrl) {
-                this.posterUrl = fixUrl(poster ?: "")
-                this.plot = intro // 줄거리는 소개 내용만
-                this.tags = tagsList // 나머지 정보는 태그로
-                this.year = year
+            val newLines = mutableListOf<String>()
+            for (line in lines) {
+                if (line.startsWith("#EXT-X-KEY")) {
+                    var newKeyLine = """#EXT-X-KEY:METHOD=AES-128,URI="http://127.0.0.1:${proxyServer!!.port}/key.bin""""
+                    
+                    if (confirmedIvType == 0 && hexIv != null) {
+                        newKeyLine += """,IV=$hexIv"""
+                    } else if (confirmedIvType == 2) {
+                        newKeyLine += """,IV=0x00000000000000000000000000000000"""
+                    }
+                    newLines.add(newKeyLine)
+                } else if (line.isNotBlank() && !line.startsWith("#")) {
+                    val segmentUrl = if (line.startsWith("http")) line else "${m3u8Url.substringBeforeLast("/")}/$line"
+                    newLines.add(segmentUrl)
+                } else {
+                    newLines.add(line)
+                }
             }
-        } else {
-            println("[MovieKing][v1.3] TvSeries 타입으로 결과 반환")
-            newTvSeriesLoadResponse(title, realUrl, TvType.TvSeries, episodeList) {
-                this.posterUrl = fixUrl(poster ?: "")
-                this.plot = intro // 줄거리는 소개 내용만
-                this.tags = tagsList // 나머지 정보는 태그로
-                this.year = year
-            }
+            
+            val finalM3u8 = newLines.joinToString("\n")
+            proxyServer!!.updateData(finalM3u8, confirmedKey)
+            
+            val finalUrl = "http://127.0.0.1:${proxyServer!!.port}/$videoId/playlist.m3u8"
+            println("[MovieKing v124-6] 클라우드스트림 플레이어로 하이브리드 링크 전달: $finalUrl")
+            
+            callback(newExtractorLink(name, name, finalUrl, ExtractorLinkType.M3U8) { 
+                this.referer = "$hostUrl/" 
+            })
+        } catch (e: Exception) { 
+            println("[MovieKing v124-6] FATAL Error: $e") 
         }
     }
 
-    override suspend fun loadLinks(
-        data: String,
-        isCasting: Boolean,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        println("[MovieKing][v1.3] loadLinks 실행: $data")
-        val doc = app.get(data, headers = commonHeaders).document
-        println("[MovieKing][v1.3] 플레이어 페이지 파싱 완료")
-        
-        val iframe = doc.selectFirst("iframe#view_iframe")
-        val src = iframe?.attr("src")
+    private fun extractVideoIdDeep(url: String): String {
+        println("[MovieKing v124-6] [DEBUG] extractVideoIdDeep 분석 시작. 입력 URL: $url")
+        try {
+            // v124-6: 정규식을 사용하여 /v1/, /v2/, /v99/ 등 동적인 버전에 완벽 대응
+            val parts = url.split(Regex("/v\\d+/"))
+            if (parts.size < 2) {
+                println("[MovieKing v124-6] [DEBUG] URL에 '/v숫자/' 패턴이 포함되어 있지 않습니다. 새로운 구조일 수 있습니다.")
+                return "ID_ERR"
+            }
+            
+            val tokenStr = parts[1]
+            println("[MovieKing v124-6] [DEBUG] /v숫자/ 이후 추출된 토큰 원본: $tokenStr")
+            
+            val tokenParts = tokenStr.split(".")
+            val payload = tokenParts.getOrNull(1)
+            
+            if (payload != null) {
+                println("[MovieKing v124-6] [DEBUG] JWT Payload 분리 성공: $payload")
+                
+                val decoded = String(Base64.decode(payload, Base64.URL_SAFE))
+                println("[MovieKing v124-6] [DEBUG] Base64 디코딩된 JSON 텍스트: $decoded")
+                
+                val idMatch = Regex(""""id"\s*:\s*(\d+)""").find(decoded)
+                if (idMatch != null) {
+                    val id = idMatch.groupValues[1]
+                    println("[MovieKing v124-6] [DEBUG] 'id' 정규식 매칭 성공: $id")
+                    return id
+                } else {
+                    println("[MovieKing v124-6] [DEBUG] 디코딩된 텍스트에서 '\"id\": 숫자' 패턴을 찾을 수 없습니다.")
+                }
+            } else {
+                println("[MovieKing v124-6] [DEBUG] 토큰이 '.'으로 분리되지 않습니다. JWT 형식이 아닐 수 있습니다.")
+            }
+        } catch (e: Exception) {
+            println("[MovieKing v124-6] [DEBUG] ID 파싱 중 예외 발생: ${e.message}")
+        }
+        return "ID_ERR"
+    }
 
-        return if (src != null) {
-            val fixedSrc = fixUrl(src)
-            println("[MovieKing][v1.3] iframe 발견: $fixedSrc")
-            loadExtractor(fixedSrc, data, subtitleCallback, callback)
-            true
-        } else {
-            println("[MovieKing][v1.3] iframe을 찾을 수 없음")
-            false
+    private fun getIvList(seq: Long, hexIv: String?): List<ByteArray> {
+        val ivs = mutableListOf<ByteArray>()
+        if (!hexIv.isNullOrEmpty()) {
+            try {
+                val hex = hexIv.removePrefix("0x")
+                val iv = ByteArray(16)
+                hex.chunked(2).take(16).forEachIndexed { i, s -> iv[i] = s.toInt(16).toByte() }
+                ivs.add(iv)
+            } catch(e:Exception) { ivs.add(ByteArray(16)) }
+        } else ivs.add(ByteArray(16))
+        
+        val seqIv = ByteArray(16)
+        for (i in 0..7) seqIv[15 - i] = (seq shr (i * 8)).toByte()
+        ivs.add(seqIv)
+        ivs.add(ByteArray(16))
+        return ivs
+    }
+
+    private suspend fun solveKeyCandidatesCombinatorial(h: Map<String, String>, kUrl: String): List<ByteArray> {
+        val list = mutableListOf<ByteArray>()
+        try {
+            val res = app.get(kUrl, headers = h).text
+            val json = if (res.startsWith("{")) res else String(Base64.decode(res, Base64.DEFAULT))
+            val encStr = Regex(""""encrypted_key"\s*:\s*"([^"]+)"""").find(json)?.groupValues?.get(1) ?: return emptyList()
+            val b64 = try { Base64.decode(encStr, Base64.DEFAULT) } catch (e: Exception) { byteArrayOf() }
+
+            if (b64.size == 16) list.add(b64)
+
+            if (b64.size >= 22) { 
+                val src = b64
+                val targetGaps = listOf(0, 2, 2, 2, 2)
+                val allPerms = generatePermutations(listOf(0, 1, 2, 3))
+
+                try {
+                    val segs = mutableListOf<ByteArray>()
+                    var idx = targetGaps[0]
+                    segs.add(src.copyOfRange(idx, idx + 4))
+                    idx += 4 + targetGaps[1]
+                    segs.add(src.copyOfRange(idx, idx + 4))
+                    idx += 4 + targetGaps[2]
+                    segs.add(src.copyOfRange(idx, idx + 4))
+                    idx += 4 + targetGaps[3]
+                    segs.add(src.copyOfRange(idx, idx + 4))
+
+                    for (perm in allPerms) {
+                        val k = ByteArray(16)
+                        for (j in 0 until 4) {
+                            System.arraycopy(segs[perm[j]], 0, k, j * 4, 4)
+                        }
+                        list.add(k)
+                    }
+                } catch (e: Exception) {}
+            }
+            return list.distinctBy { it.contentHashCode() }
+        } catch (e: Exception) {
+            return emptyList()
+        }
+    }
+
+    private fun generatePermutations(list: List<Int>): List<List<Int>> {
+        if (list.isEmpty()) return listOf(emptyList())
+        val result = mutableListOf<List<Int>>()
+        for (i in list.indices) {
+            val elem = list[i]
+            val rest = list.take(i) + list.drop(i + 1)
+            for (p in generatePermutations(rest)) {
+                result.add(listOf(elem) + p)
+            }
+        }
+        return result
+    }
+
+    class ProxyWebServer {
+        private var serverSocket: ServerSocket? = null
+        private var isRunning = false
+        var port: Int = 0
+        
+        @Volatile private var finalM3u8: String = ""
+        @Volatile private var finalKey: ByteArray = ByteArray(16)
+
+        fun updateData(m3u8: String, key: ByteArray) {
+            finalM3u8 = m3u8
+            finalKey = key
+        }
+
+        fun start() {
+            try {
+                serverSocket = ServerSocket(0)
+                port = serverSocket!!.localPort
+                isRunning = true
+                thread(isDaemon = true) { 
+                    while (isRunning && serverSocket != null && !serverSocket!!.isClosed) { 
+                        try { handleClient(serverSocket!!.accept()) } catch (e: Exception) {} 
+                    } 
+                }
+                println("[MovieKing v124-6] 초경량 하이브리드 서버 시작 완료 (Port: $port)")
+            } catch (e: Exception) { println("[MovieKing v124-6] Server Start Failed: $e") }
+        }
+
+        fun stop() {
+            isRunning = false
+            try { serverSocket?.close(); serverSocket = null } catch (e: Exception) {}
+        }
+        
+        private fun handleClient(socket: Socket) = thread {
+            try {
+                socket.soTimeout = 5000
+                val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
+                val line = reader.readLine() ?: return@thread
+                val path = line.split(" ")[1]
+                val output = socket.getOutputStream()
+
+                if (path.contains("/playlist.m3u8")) {
+                    val response = "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nAccess-Control-Allow-Origin: *\r\n\r\n" + finalM3u8
+                    output.write(response.toByteArray(charset("UTF-8")))
+                } else if (path.contains("/key.bin")) {
+                    output.write("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nAccess-Control-Allow-Origin: *\r\n\r\n".toByteArray())
+                    output.write(finalKey)
+                }
+                output.flush()
+            } catch (e: Exception) { 
+            } finally {
+                try { socket.close() } catch(e2:Exception){} 
+            }
         }
     }
 }
