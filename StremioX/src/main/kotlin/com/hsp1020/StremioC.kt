@@ -1,4 +1,4 @@
-// v1.34
+// v1.36
 package com.hsp1020
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -21,7 +21,6 @@ import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.addDate
-import com.lagradost.cloudstream3.amap
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.imdbUrlToIdNullable
 import com.lagradost.cloudstream3.newEpisode
@@ -48,6 +47,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import okhttp3.ConnectionPool
 import okhttp3.Dispatcher
 import org.json.JSONObject
@@ -68,9 +69,11 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     private val catalogSentIds = ConcurrentHashMap<String, MutableSet<String>>()
     private val pageContentCache = ConcurrentHashMap<String, List<SearchResponse>>()
     
-    // [v1.34] Dispatcher + ConnectionPool 동시 적용. 소켓 큐잉 방지
+    // [v1.36] 서버의 DDoS 오인을 막기 위한 슬라이딩 윈도우 동시성 제어기 (12개로 제한)
+    val catalogSemaphore = Semaphore(12)
+    
     private val customSession by lazy {
-        println("[StremioC v1.34] 커스텀 OkHttp 세션 초기화 (Dispatcher 100, ConnectionPool 100)")
+        println("[StremioC v1.36] 커스텀 OkHttp 세션 초기화 (Dispatcher 100, ConnectionPool 100)")
         Requests(
             app.baseClient.newBuilder()
                 .dispatcher(Dispatcher().apply {
@@ -154,7 +157,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-        println("[StremioC v1.34] getMainPage 시작: page=$page (Thread: ${Thread.currentThread().name})")
+        println("[StremioC v1.36] getMainPage 시작: page=$page (Thread: ${Thread.currentThread().name})")
         val startTime = System.currentTimeMillis()
         
         if (mainUrl.isEmpty()) throw IllegalArgumentException("Configure in Extension Settings\n")
@@ -168,15 +171,14 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         
         val manifestStartTime = System.currentTimeMillis()
         val manifest = getManifest()
-        println("[StremioC v1.34] Manifest 가져오기 소요 시간: ${System.currentTimeMillis() - manifestStartTime}ms")
+        println("[StremioC v1.36] Manifest 가져오기 소요 시간: ${System.currentTimeMillis() - manifestStartTime}ms")
         
         val targetCatalogs = manifest?.catalogs?.filter { !it.isSearchRequired() } ?: emptyList()
-        println("[StremioC v1.34] 처리 대상 카탈로그 개수: ${targetCatalogs.size}. 순수 비동기(coroutineScope) 병렬 로드 시작.")
+        println("[StremioC v1.36] 처리 대상 카탈로그 개수: ${targetCatalogs.size}. 스마트 스로틀링 병렬 로드 시작.")
         
         val catalogsStartTime = System.currentTimeMillis()
         val lists = mutableListOf<HomePageList>()
         
-        // [v1.34] amap 제거 후 coroutineScope + async(Dispatchers.IO) 적용. 
         val chunkResults = coroutineScope {
             targetCatalogs.map { catalog ->
                 async(Dispatchers.IO) {
@@ -185,7 +187,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                         val catalogKey = "${catalog.id}-${catalog.type}"
                         val cacheKey = "${catalogKey}_$skip"
                         
-                        println("[StremioC v1.34] 🚀 [시작] 카탈로그 [${catalog.id}] 데이터 처리 코루틴 진입 (Thread: ${Thread.currentThread().name})")
+                        println("[StremioC v1.36] 🚀 [시작] 카탈로그 [${catalog.id}] 데이터 처리 코루틴 진입 (Thread: ${Thread.currentThread().name})")
 
                         val cachedItems = pageContentCache[cacheKey]
                         
@@ -209,10 +211,10 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             seenForThisCatalog.add(item.url)
                         }
                         
-                        println("[StremioC v1.34] 🏁 [종료] 카탈로그 [${catalog.id}] 전체 완료 소요 시간: ${System.currentTimeMillis() - catalogStartTime}ms")
+                        println("[StremioC v1.36] 🏁 [종료] 카탈로그 [${catalog.id}] 전체 완료 소요 시간: ${System.currentTimeMillis() - catalogStartTime}ms")
                         row.copy(list = filteredItems)
                     } catch (e: Exception) {
-                        println("[StremioC v1.34] ❌ [에러] 카탈로그 로드 중 에러 발생: ${e.message}")
+                        println("[StremioC v1.36] ❌ [에러] 카탈로그 로드 중 에러 발생: ${e.message}")
                         null
                     }
                 }
@@ -221,8 +223,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         
         lists.addAll(chunkResults)
 
-        println("[StremioC v1.34] 모든 카탈로그 데이터 수집 완료. 총 소요 시간: ${System.currentTimeMillis() - catalogsStartTime}ms")
-        println("[StremioC v1.34] getMainPage 전체 로직 소요 시간: ${System.currentTimeMillis() - startTime}ms")
+        println("[StremioC v1.36] 모든 카탈로그 데이터 수집 완료. 총 소요 시간: ${System.currentTimeMillis() - catalogsStartTime}ms")
+        println("[StremioC v1.36] getMainPage 전체 로직 소요 시간: ${System.currentTimeMillis() - startTime}ms")
 
         return newHomePageResponse(
             lists,
@@ -238,7 +240,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val supportedCatalogs = manifest?.catalogs?.filter { it.supportsSearch() } ?: emptyList()
         
         val addonResults = mutableListOf<SearchResponse>()
-        println("[StremioC v1.34] 애드온 검색 시작 (동시 처리 개수: ${supportedCatalogs.size})")
+        println("[StremioC v1.36] 애드온 검색 시작 (동시 처리 개수: ${supportedCatalogs.size})")
         
         val searchResults = coroutineScope {
             supportedCatalogs.map { catalog ->
@@ -246,7 +248,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     try {
                         catalog.search(query, this@StremioC) 
                     } catch (e: Exception) {
-                        println("[StremioC v1.34] 검색 중 에러 발생: ${e.message}")
+                        println("[StremioC v1.36] 검색 중 에러 발생: ${e.message}")
                         emptyList()
                     }
                 }
@@ -255,7 +257,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         addonResults.addAll(searchResults)
         
         val distinctAddonResults = addonResults.distinctBy { it.url }
-        println("[StremioC v1.34] search 애드온 탐색 완료 소요 시간: ${System.currentTimeMillis() - startTime}ms")
+        println("[StremioC v1.36] search 애드온 탐색 완료 소요 시간: ${System.currentTimeMillis() - startTime}ms")
         
         if (distinctAddonResults.isNotEmpty()) {
             return distinctAddonResults
@@ -545,16 +547,18 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             val allMetas = coroutineScope {
                 types.map { type ->
                     async(Dispatchers.IO) {
-                        try {
-                            val searchUrl = provider.buildUrl("/catalog/${type}/${id}/search=${URLEncoder.encode(query, "UTF-8")}.json")
-                            val req = provider.customSession.get(searchUrl, timeout = 120L)
-                            val res = if (req.isSuccessful && req.text.isNotBlank()) {
-                                try { parseJson<CatalogResponse>(req.text) } catch (e: Exception) { null }
-                            } else null
-                            res?.metas ?: emptyList()
-                        } catch (e: Exception) {
-                            println("[StremioC v1.34] 카탈로그 검색 중 에러: ${e.message}")
-                            emptyList()
+                        provider.catalogSemaphore.withPermit {
+                            try {
+                                val searchUrl = provider.buildUrl("/catalog/${type}/${id}/search=${URLEncoder.encode(query, "UTF-8")}.json")
+                                val req = provider.customSession.get(searchUrl, timeout = 120L)
+                                val res = if (req.isSuccessful && req.text.isNotBlank()) {
+                                    try { parseJson<CatalogResponse>(req.text) } catch (e: Exception) { null }
+                                } else null
+                                res?.metas ?: emptyList()
+                            } catch (e: Exception) {
+                                println("[StremioC v1.36] 카탈로그 검색 중 에러: ${e.message}")
+                                emptyList()
+                            }
                         }
                     }
                 }.awaitAll().flatten()
@@ -570,31 +574,33 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             val allMetas = coroutineScope {
                 types.map { type ->
                     async(Dispatchers.IO) {
-                        try {
-                            val path = if (skip > 0) {
-                                "/catalog/$type/$id/skip=$skip.json"
-                            } else {
-                                "/catalog/$type/$id.json"
-                            }
-                            val url = provider.buildUrl(path)
-                            val currentThread = Thread.currentThread().name
-                            
-                            val reqStartTime = System.currentTimeMillis()
-                            println("[StremioC v1.34] 🌐 [네트워크 요청] URL: $url (Thread: $currentThread)")
-                            
-                            val req = provider.customSession.get(url, timeout = 120L)
-                            
-                            val reqEndTime = System.currentTimeMillis()
-                            println("[StremioC v1.34] 📡 [네트워크 수신] 순수 대기시간: ${reqEndTime - reqStartTime}ms (Thread: $currentThread)")
+                        provider.catalogSemaphore.withPermit {
+                            try {
+                                val path = if (skip > 0) {
+                                    "/catalog/$type/$id/skip=$skip.json"
+                                } else {
+                                    "/catalog/$type/$id.json"
+                                }
+                                val url = provider.buildUrl(path)
+                                val currentThread = Thread.currentThread().name
+                                
+                                val reqStartTime = System.currentTimeMillis()
+                                println("[StremioC v1.36] 🌐 [네트워크 요청] URL: $url (Thread: $currentThread)")
+                                
+                                val req = provider.customSession.get(url, timeout = 120L)
+                                
+                                val reqEndTime = System.currentTimeMillis()
+                                println("[StremioC v1.36] 📡 [네트워크 수신] 순수 대기시간: ${reqEndTime - reqStartTime}ms (Thread: $currentThread)")
 
-                            val res = if (req.isSuccessful && req.text.isNotBlank()) {
-                                try { parseJson<CatalogResponse>(req.text) } catch (e: Exception) { null }
-                            } else null
-                            
-                            res?.metas ?: emptyList()
-                        } catch (e: Exception) {
-                            println("[StremioC v1.34] ❌ 카탈로그 메타 로드 중 에러: ${e.message}")
-                            emptyList()
+                                val res = if (req.isSuccessful && req.text.isNotBlank()) {
+                                    try { parseJson<CatalogResponse>(req.text) } catch (e: Exception) { null }
+                                } else null
+                                
+                                res?.metas ?: emptyList()
+                            } catch (e: Exception) {
+                                println("[StremioC v1.36] ❌ 카탈로그 메타 로드 중 에러: ${e.message}")
+                                emptyList()
+                            }
                         }
                     }
                 }.awaitAll().flatten()
