@@ -1,4 +1,4 @@
-// v1.38
+// v1.36
 package com.hsp1020
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -21,7 +21,6 @@ import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.addDate
-import com.lagradost.cloudstream3.amap
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.imdbUrlToIdNullable
 import com.lagradost.cloudstream3.newEpisode
@@ -70,10 +69,11 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     private val catalogSentIds = ConcurrentHashMap<String, MutableSet<String>>()
     private val pageContentCache = ConcurrentHashMap<String, List<SearchResponse>>()
     
+    // [v1.36] 서버의 DDoS 오인을 막기 위한 슬라이딩 윈도우 동시성 제어기 (12개로 제한)
     val catalogSemaphore = Semaphore(12)
     
     private val customSession by lazy {
-        println("[StremioC v1.38] 커스텀 OkHttp 세션 초기화 (Dispatcher 100, ConnectionPool 100)")
+        println("[StremioC v1.36] 커스텀 OkHttp 세션 초기화 (Dispatcher 100, ConnectionPool 100)")
         Requests(
             app.baseClient.newBuilder()
                 .dispatcher(Dispatcher().apply {
@@ -157,6 +157,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
+        println("[StremioC v1.36] getMainPage 시작: page=$page (Thread: ${Thread.currentThread().name})")
         val startTime = System.currentTimeMillis()
         
         if (mainUrl.isEmpty()) throw IllegalArgumentException("Configure in Extension Settings\n")
@@ -168,18 +169,26 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
         val skip = (page - 1) * 100
         
+        val manifestStartTime = System.currentTimeMillis()
         val manifest = getManifest()
-        val targetCatalogs = manifest?.catalogs?.filter { !it.isSearchRequired() } ?: emptyList()
+        println("[StremioC v1.36] Manifest 가져오기 소요 시간: ${System.currentTimeMillis() - manifestStartTime}ms")
         
+        val targetCatalogs = manifest?.catalogs?.filter { !it.isSearchRequired() } ?: emptyList()
+        println("[StremioC v1.36] 처리 대상 카탈로그 개수: ${targetCatalogs.size}. 스마트 스로틀링 병렬 로드 시작.")
+        
+        val catalogsStartTime = System.currentTimeMillis()
         val lists = mutableListOf<HomePageList>()
         
         val chunkResults = coroutineScope {
             targetCatalogs.map { catalog ->
                 async(Dispatchers.IO) {
                     try {
+                        val catalogStartTime = System.currentTimeMillis()
                         val catalogKey = "${catalog.id}-${catalog.type}"
                         val cacheKey = "${catalogKey}_$skip"
                         
+                        println("[StremioC v1.36] 🚀 [시작] 카탈로그 [${catalog.id}] 데이터 처리 코루틴 진입 (Thread: ${Thread.currentThread().name})")
+
                         val cachedItems = pageContentCache[cacheKey]
                         
                         val row = if (cachedItems != null) {
@@ -202,8 +211,10 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             seenForThisCatalog.add(item.url)
                         }
                         
+                        println("[StremioC v1.36] 🏁 [종료] 카탈로그 [${catalog.id}] 전체 완료 소요 시간: ${System.currentTimeMillis() - catalogStartTime}ms")
                         row.copy(list = filteredItems)
                     } catch (e: Exception) {
+                        println("[StremioC v1.36] ❌ [에러] 카탈로그 로드 중 에러 발생: ${e.message}")
                         null
                     }
                 }
@@ -212,6 +223,9 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         
         lists.addAll(chunkResults)
 
+        println("[StremioC v1.36] 모든 카탈로그 데이터 수집 완료. 총 소요 시간: ${System.currentTimeMillis() - catalogsStartTime}ms")
+        println("[StremioC v1.36] getMainPage 전체 로직 소요 시간: ${System.currentTimeMillis() - startTime}ms")
+
         return newHomePageResponse(
             lists,
             hasNext = true
@@ -219,11 +233,14 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
+        val startTime = System.currentTimeMillis()
+        
         mainUrl = mainUrl.fixSourceUrl()
         val manifest = getManifest()
         val supportedCatalogs = manifest?.catalogs?.filter { it.supportsSearch() } ?: emptyList()
         
         val addonResults = mutableListOf<SearchResponse>()
+        println("[StremioC v1.36] 애드온 검색 시작 (동시 처리 개수: ${supportedCatalogs.size})")
         
         val searchResults = coroutineScope {
             supportedCatalogs.map { catalog ->
@@ -231,6 +248,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     try {
                         catalog.search(query, this@StremioC) 
                     } catch (e: Exception) {
+                        println("[StremioC v1.36] 검색 중 에러 발생: ${e.message}")
                         emptyList()
                     }
                 }
@@ -239,6 +257,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         addonResults.addAll(searchResults)
         
         val distinctAddonResults = addonResults.distinctBy { it.url }
+        println("[StremioC v1.36] search 애드온 탐색 완료 소요 시간: ${System.currentTimeMillis() - startTime}ms")
         
         if (distinctAddonResults.isNotEmpty()) {
             return distinctAddonResults
@@ -334,12 +353,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("[StremioC v1.38] === loadLinks 진입 ===")
-        println("[StremioC v1.38] 원본 LoadData JSON: $data")
-        
         val loadData = try { parseJson<LoadData>(data) } catch (e: Exception) { null } ?: return false
-        println("[StremioC v1.38] 파싱 결과 -> type: ${loadData.type}, id: ${loadData.id}, imdbId: ${loadData.imdbId}, season: ${loadData.season}, episode: ${loadData.episode}")
-        
         val normalizedId = try { normalizeId(loadData.id) } catch (e: Exception) { loadData.id ?: "" }
         val encodedId = try { URLEncoder.encode(normalizedId, "UTF-8") } catch (e: Exception) { normalizedId }
         
@@ -382,25 +396,18 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        println("[StremioC v1.38] === invokeStremioX 시작 ===")
         val sites = AcraApplication.getKey<Array<CustomSite>>(USER_PROVIDER_API)?.toMutableList() ?: mutableListOf()
         val filteredSites = sites.filter { it.parentJavaClass == "StremioX" || it.parentJavaClass == "StremioC" }
         
         val stremioId = if (type == "series" && season != null && episode != null) {
             when {
-                id?.startsWith("kitsu:") == true -> {
-                    val parts = id.split(":")
-                    val baseId = if (parts.size >= 2) "kitsu:${parts[1]}" else id
-                    "$baseId:$season:$episode"
-                }
+                id?.startsWith("kitsu:") == true -> if (id.endsWith(":$episode")) id else "$id:$episode"
                 id?.endsWith(":$season:$episode") == true -> id
                 else -> "$id:$season:$episode"
             }
         } else {
             id
         }
-        
-        println("[StremioC v1.38] 변환된 스트림 요청용 ID (stremioId): $stremioId")
 
         coroutineScope {
             filteredSites.map { site ->
@@ -408,20 +415,15 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     try {
                         val api = site.url.fixSourceUrl().substringBefore("?").replace("/manifest.json", "").trimEnd('/')
                         val url = "$api/stream/$type/$stremioId.json"
-                        println("[StremioC v1.38] 애드온 스트림 요청 URL: $url")
                         
                         val req = app.get(url, timeout = 120L)
-                        println("[StremioC v1.38] 애드온 스트림 응답 코드: ${req.code}")
-                        
                         val res = req.parsedSafe<StreamsResponse>()
                         if (res?.streams != null) {
-                            println("[StremioC v1.38] 파싱 성공, 발견된 스트림 수: ${res.streams.size}")
                             res.streams.forEach { stream ->
                                 stream.runCallback(subtitleCallback, callback)
                             }
                         }
                     } catch (e: Exception) {
-                        println("[StremioC v1.38] 스트림 요청 중 에러: ${e.message}")
                     }
                 }
             }.awaitAll()
@@ -439,7 +441,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         episode: Int?,
         subtitleCallback: (SubtitleFile) -> Unit
     ) {
-        println("[StremioC v1.38] === invokeStremioSubtitles 시작 ===")
         val sites = AcraApplication.getKey<Array<CustomSite>>(USER_PROVIDER_API)?.toMutableList() ?: mutableListOf()
         val addonUrls = mutableSetOf<String>()
         
@@ -451,7 +452,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         }
 
         val gson = Gson()
-        
+
         val stremioId = if (type == "series" && season != null && episode != null) {
             when {
                 id?.startsWith("kitsu:") == true -> {
@@ -465,45 +466,32 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         } else {
             id
         }
-        
-        println("[StremioC v1.38] 자막 서버에 요청할 최종 조합 ID (stremioId): $stremioId")
 
         coroutineScope {
             addonUrls.toList().map { api ->
                 async(Dispatchers.IO) {
                     try {
                         val url = "$api/subtitles/$type/$stremioId.json"
-                        println("[StremioC v1.38] 애드온 자막 요청 URL: $url")
-                        
-                        val req = app.get(url, timeout = 30L)
-                        println("[StremioC v1.38] 자막 응답 코드: ${req.code}, 응답 본문 일부: ${req.text.take(300)}")
-                        
-                        val subtitleResponse = gson.fromJson(req.text, StremioSubtitleResponse::class.java)
+                        val json = app.get(url, timeout = 30L).text
+                        val subtitleResponse = gson.fromJson(json, StremioSubtitleResponse::class.java)
 
-                        if (subtitleResponse?.subtitles != null) {
-                            println("[StremioC v1.38] 파싱 성공, 반환된 자막 수: ${subtitleResponse.subtitles.size}")
-                            subtitleResponse.subtitles.forEach { sub ->
-                                val lang = sub.lang ?: sub.lang_code ?: "Unknown"
-                                val fileUrl = sub.url
-                                if (!fileUrl.isNullOrBlank()) {
-                                    subtitleCallback.invoke(
-                                        newSubtitleFile(
-                                            SubtitleHelper.fromTagToEnglishLanguageName(lang) ?: lang,
-                                            fileUrl
-                                        )
+                        subtitleResponse?.subtitles?.forEach { sub ->
+                            val lang = sub.lang ?: sub.lang_code ?: "Unknown"
+                            val fileUrl = sub.url
+                            if (!fileUrl.isNullOrBlank()) {
+                                subtitleCallback.invoke(
+                                    newSubtitleFile(
+                                        SubtitleHelper.fromTagToEnglishLanguageName(lang) ?: lang,
+                                        fileUrl
                                     )
-                                }
+                                )
                             }
-                        } else {
-                            println("[StremioC v1.38] 파싱 실패 또는 반환된 subtitles가 null 입니다.")
                         }
                     } catch (e: Exception) {
-                        println("[StremioC v1.38] 자막 요청 중 에러: ${e.message}")
                     }
                 }
             }.awaitAll()
         }
-        println("[StremioC v1.38] === invokeStremioSubtitles 완료 ===")
     }
 
     data class LoadData(
@@ -572,6 +560,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                                 } else null
                                 res?.metas ?: emptyList()
                             } catch (e: Exception) {
+                                println("[StremioC v1.36] 카탈로그 검색 중 에러: ${e.message}")
                                 emptyList()
                             }
                         }
@@ -597,15 +586,23 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                                     "/catalog/$type/$id.json"
                                 }
                                 val url = provider.buildUrl(path)
+                                val currentThread = Thread.currentThread().name
+                                
+                                val reqStartTime = System.currentTimeMillis()
+                                println("[StremioC v1.36] 🌐 [네트워크 요청] URL: $url (Thread: $currentThread)")
                                 
                                 val req = provider.customSession.get(url, timeout = 120L)
                                 
+                                val reqEndTime = System.currentTimeMillis()
+                                println("[StremioC v1.36] 📡 [네트워크 수신] 순수 대기시간: ${reqEndTime - reqStartTime}ms (Thread: $currentThread)")
+
                                 val res = if (req.isSuccessful && req.text.isNotBlank()) {
                                     try { parseJson<CatalogResponse>(req.text) } catch (e: Exception) { null }
                                 } else null
                                 
                                 res?.metas ?: emptyList()
                             } catch (e: Exception) {
+                                println("[StremioC v1.36] ❌ 카탈로그 메타 로드 중 에러: ${e.message}")
                                 emptyList()
                             }
                         }
