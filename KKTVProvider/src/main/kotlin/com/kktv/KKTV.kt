@@ -92,7 +92,7 @@ class KingkongTv : MainAPI() {
 
         val fakeUrl = "$mainUrl/live_stream/$streamId?title=$encodedTitle&poster=$encodedPoster&ref=$encodedRef"
 
-        return newLiveSearchResponse(title, fakeUrl, TvType.Live) {
+        return newLiveSearchResponse(title, fakeUrl, TvType.Others) {
             this.posterUrl = thumbUrl
         }
     }
