@@ -1,4 +1,4 @@
-// v1.38
+// v1.39
 package com.hsp1020
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -43,10 +43,13 @@ import com.hsp1020.StremioC.Companion.TRACKER_LIST_URLS
 import com.hsp1020.SubsExtractors.invokeOpenSubs
 import com.hsp1020.SubsExtractors.invokeWatchsomuch
 import com.lagradost.nicehttp.Requests
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import okhttp3.ConnectionPool
 import okhttp3.Dispatcher
 import okhttp3.Protocol
@@ -68,9 +71,13 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     private val catalogSentIds = ConcurrentHashMap<String, MutableSet<String>>()
     private val pageContentCache = ConcurrentHashMap<String, List<SearchResponse>>()
     
+    // [v1.39] 중복 호출 방지를 위한 락(Mutex)과 활성 요청 상태 캐시 저장소
+    private val pageMutex = Mutex()
+    private val activePageRequests = mutableMapOf<Int, Deferred<HomePageResponse>>()
+    
     // [v1.38] HTTP/2 멀티플렉싱 병목을 제거하기 위해 무한 동시성을 허용하고 HTTP/1.1로 강제 다운그레이드
     private val customSession by lazy {
-        println("[StremioC v1.38] 커스텀 OkHttp 세션 초기화 (HTTP/1.1 강제, Dispatcher 100, ConnectionPool 100)")
+        println("[StremioC v1.39] 커스텀 OkHttp 세션 초기화 (HTTP/1.1 강제, Dispatcher 100, ConnectionPool 100)")
         Requests(
             app.baseClient.newBuilder()
                 .protocols(listOf(Protocol.HTTP_1_1))
@@ -151,28 +158,53 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         return res ?: cachedManifest
     }
 
+    // [v1.39] UI 측의 중복 호출을 막기 위한 동시성 제어기 래핑
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
+    ): HomePageResponse = coroutineScope {
+        println("[StremioC v1.39] getMainPage 요청 접수: page=$page (Thread: ${Thread.currentThread().name})")
+        
+        val deferred = pageMutex.withLock {
+            if (page <= 1) {
+                catalogSentIds.clear()
+                activePageRequests.clear()
+            }
+            // 현재 요청 중인 페이지라면 기존 Deferred 반환, 아니면 새로 코루틴 생성
+            activePageRequests.getOrPut(page) {
+                println("[StremioC v1.39] page=$page 최초 요청 확인. 실제 데이터 로드 시작.")
+                async { fetchMainPageData(page, request) }
+            }
+        }
+        
+        if (deferred.isCompleted) {
+            println("[StremioC v1.39] page=$page 이미 완료된 캐시 데이터 즉시 반환.")
+        } else {
+            println("[StremioC v1.39] page=$page 데이터를 기다리는 중 (중복 요청 시 대기)...")
+        }
+        
+        // 첫 번째 요청이든, 중복 대기 요청이든 여기서 완료를 기다림
+        deferred.await()
+    }
+
+    // [v1.39] 기존 로직 분리: 실제로 네트워크를 타고 데이터를 가져오는 함수
+    private suspend fun fetchMainPageData(
+        page: Int,
+        request: MainPageRequest
     ): HomePageResponse {
-        println("[StremioC v1.38] getMainPage 시작: page=$page (Thread: ${Thread.currentThread().name})")
         val startTime = System.currentTimeMillis()
         
         if (mainUrl.isEmpty()) throw IllegalArgumentException("Configure in Extension Settings\n")
         mainUrl = mainUrl.fixSourceUrl()
 
-        if (page <= 1) {
-            catalogSentIds.clear()
-        }
-
         val skip = (page - 1) * 100
         
         val manifestStartTime = System.currentTimeMillis()
         val manifest = getManifest()
-        println("[StremioC v1.38] Manifest 가져오기 소요 시간: ${System.currentTimeMillis() - manifestStartTime}ms")
+        println("[StremioC v1.39] Manifest 가져오기 소요 시간: ${System.currentTimeMillis() - manifestStartTime}ms")
         
         val targetCatalogs = manifest?.catalogs?.filter { !it.isSearchRequired() } ?: emptyList()
-        println("[StremioC v1.38] 처리 대상 카탈로그 개수: ${targetCatalogs.size}. 제한 없는 무한 병렬 로드 시작.")
+        println("[StremioC v1.39] 처리 대상 카탈로그 개수: ${targetCatalogs.size}. 제한 없는 무한 병렬 로드 시작.")
         
         val catalogsStartTime = System.currentTimeMillis()
         val lists = mutableListOf<HomePageList>()
@@ -185,7 +217,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                         val catalogKey = "${catalog.id}-${catalog.type}"
                         val cacheKey = "${catalogKey}_$skip"
                         
-                        println("[StremioC v1.38] 🚀 [시작] 카탈로그 [${catalog.id}] 데이터 처리 코루틴 진입 (Thread: ${Thread.currentThread().name})")
+                        println("[StremioC v1.39] 🚀 [시작] 카탈로그 [${catalog.id}] 데이터 처리 코루틴 진입 (Thread: ${Thread.currentThread().name})")
 
                         val cachedItems = pageContentCache[cacheKey]
                         
@@ -209,10 +241,10 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             seenForThisCatalog.add(item.url)
                         }
                         
-                        println("[StremioC v1.38] 🏁 [종료] 카탈로그 [${catalog.id}] 전체 완료 소요 시간: ${System.currentTimeMillis() - catalogStartTime}ms")
+                        println("[StremioC v1.39] 🏁 [종료] 카탈로그 [${catalog.id}] 전체 완료 소요 시간: ${System.currentTimeMillis() - catalogStartTime}ms")
                         row.copy(list = filteredItems)
                     } catch (e: Exception) {
-                        println("[StremioC v1.38] ❌ [에러] 카탈로그 로드 중 에러 발생: ${e.message}")
+                        println("[StremioC v1.39] ❌ [에러] 카탈로그 로드 중 에러 발생: ${e.message}")
                         null
                     }
                 }
@@ -221,8 +253,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         
         lists.addAll(chunkResults)
 
-        println("[StremioC v1.38] 모든 카탈로그 데이터 수집 완료. 총 소요 시간: ${System.currentTimeMillis() - catalogsStartTime}ms")
-        println("[StremioC v1.38] getMainPage 전체 로직 소요 시간: ${System.currentTimeMillis() - startTime}ms")
+        println("[StremioC v1.39] 모든 카탈로그 데이터 수집 완료. 총 소요 시간: ${System.currentTimeMillis() - catalogsStartTime}ms")
+        println("[StremioC v1.39] fetchMainPageData 전체 로직 소요 시간: ${System.currentTimeMillis() - startTime}ms")
 
         return newHomePageResponse(
             lists,
@@ -238,7 +270,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val supportedCatalogs = manifest?.catalogs?.filter { it.supportsSearch() } ?: emptyList()
         
         val addonResults = mutableListOf<SearchResponse>()
-        println("[StremioC v1.38] 애드온 검색 시작 (동시 처리 개수: ${supportedCatalogs.size})")
+        println("[StremioC v1.39] 애드온 검색 시작 (동시 처리 개수: ${supportedCatalogs.size})")
         
         val searchResults = coroutineScope {
             supportedCatalogs.map { catalog ->
@@ -246,7 +278,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     try {
                         catalog.search(query, this@StremioC) 
                     } catch (e: Exception) {
-                        println("[StremioC v1.38] 검색 중 에러 발생: ${e.message}")
+                        println("[StremioC v1.39] 검색 중 에러 발생: ${e.message}")
                         emptyList()
                     }
                 }
@@ -255,7 +287,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         addonResults.addAll(searchResults)
         
         val distinctAddonResults = addonResults.distinctBy { it.url }
-        println("[StremioC v1.38] search 애드온 탐색 완료 소요 시간: ${System.currentTimeMillis() - startTime}ms")
+        println("[StremioC v1.39] search 애드온 탐색 완료 소요 시간: ${System.currentTimeMillis() - startTime}ms")
         
         if (distinctAddonResults.isNotEmpty()) {
             return distinctAddonResults
@@ -399,7 +431,11 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         
         val stremioId = if (type == "series" && season != null && episode != null) {
             when {
-                id?.startsWith("kitsu:") == true -> if (id.endsWith(":$episode")) id else "$id:$episode"
+                id?.startsWith("kitsu:") == true -> {
+                    val parts = id.split(":")
+                    val baseId = if (parts.size >= 2) "kitsu:${parts[1]}" else id
+                    "$baseId:$season:$episode"
+                }
                 id?.endsWith(":$season:$episode") == true -> id
                 else -> "$id:$season:$episode"
             }
@@ -464,7 +500,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         } else {
             id
         }
-                
+
         coroutineScope {
             addonUrls.toList().map { api ->
                 async(Dispatchers.IO) {
@@ -557,7 +593,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             } else null
                             res?.metas ?: emptyList()
                         } catch (e: Exception) {
-                            println("[StremioC v1.38] 카탈로그 검색 중 에러: ${e.message}")
+                            println("[StremioC v1.39] 카탈로그 검색 중 에러: ${e.message}")
                             emptyList()
                         }
                     }
@@ -584,12 +620,12 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             val currentThread = Thread.currentThread().name
                             
                             val reqStartTime = System.currentTimeMillis()
-                            println("[StremioC v1.38] 🌐 [네트워크 요청] URL: $url (Thread: $currentThread)")
+                            println("[StremioC v1.39] 🌐 [네트워크 요청] URL: $url (Thread: $currentThread)")
                             
                             val req = provider.customSession.get(url, timeout = 120L)
                             
                             val reqEndTime = System.currentTimeMillis()
-                            println("[StremioC v1.38] 📡 [네트워크 수신] 순수 대기시간: ${reqEndTime - reqStartTime}ms (Thread: $currentThread)")
+                            println("[StremioC v1.39] 📡 [네트워크 수신] 순수 대기시간: ${reqEndTime - reqStartTime}ms (Thread: $currentThread)")
 
                             val res = if (req.isSuccessful && req.text.isNotBlank()) {
                                 try { parseJson<CatalogResponse>(req.text) } catch (e: Exception) { null }
@@ -597,7 +633,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             
                             res?.metas ?: emptyList()
                         } catch (e: Exception) {
-                            println("[StremioC v1.38] ❌ 카탈로그 메타 로드 중 에러: ${e.message}")
+                            println("[StremioC v1.39] ❌ 카탈로그 메타 로드 중 에러: ${e.message}")
                             emptyList()
                         }
                     }
