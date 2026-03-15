@@ -453,14 +453,18 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         
         val stremioId = if (type == "series" && season != null && episode != null) {
             when {
-                id?.startsWith("kitsu:") == true -> if (id.endsWith(":$episode")) id else "$id:$episode"
+                id?.startsWith("kitsu:") == true -> {
+                    val parts = id.split(":")
+                    val baseId = if (parts.size >= 2) "kitsu:${parts[1]}" else id
+                    "$baseId:$season:$episode"
+                }
                 id?.endsWith(":$season:$episode") == true -> id
                 else -> "$id:$season:$episode"
             }
         } else {
             id
         }
-
+                
         coroutineScope {
             addonUrls.toList().map { api ->
                 async(Dispatchers.IO) {
