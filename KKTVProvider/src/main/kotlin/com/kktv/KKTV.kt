@@ -1,4 +1,4 @@
-// v7.3 - 중요 경기(subject bold) 최상단 우선 정렬 및 강조(🔥) 로직 추가
+// v7.6 - LiveStreamLoadResponse 대신 단일 VOD 객체 구조를 차용하되, TvType.Others 카테고리는 원본대로 유지
 package com.KingkongTv
 
 import android.net.Uri
@@ -13,6 +13,8 @@ class KingkongTv : MainAPI() {
     override var name = "KKTV"
     override val hasMainPage = true
     override var lang = "ko"
+    
+    // [수정 포인트 v7.6] 사용자님의 의도대로 카테고리는 원래의 Others로 유지합니다.
     override val supportedTypes = setOf(TvType.Others)
 
     private val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
@@ -25,6 +27,7 @@ class KingkongTv : MainAPI() {
         val url = "$mainUrl${request.data}"
         
         try {
+            println("DEBUG [KingkongTv] v7.6: 메인 페이지 로드 시작 - $url")
             val mainDoc = app.get(url).document
             val iframeElement = mainDoc.selectFirst("iframe#broadcastFrame")
             var iframeSrc = iframeElement?.attr("src")
@@ -37,13 +40,13 @@ class KingkongTv : MainAPI() {
             val contentDoc = app.get(realUrl, referer = url).document
             val rows = contentDoc.select("div.sports_on_list table tbody tr")
 
-            // [추가 로직] 중요 경기(subject bold)를 먼저 오도록(true) 내림차순 우선 정렬
+            // [기존 로직 보존] 중요 경기(subject bold)를 먼저 오도록(true) 내림차순 우선 정렬
             val sortedRows = rows.sortedByDescending { row ->
                 val isImportant = row.selectFirst("td.subject")?.hasClass("bold") == true
                 isImportant
             }
             
-            println("DEBUG [KingkongTv] v7.3: 총 ${rows.size}개 경기 중 중요 경기(bold) 우선 정렬 완료")
+            println("DEBUG [KingkongTv] v7.6: 총 ${rows.size}개 경기 중 중요 경기(bold) 우선 정렬 완료")
 
             val home = sortedRows.mapNotNull { row ->
                 row.toSearchResult(realUrl)
@@ -58,6 +61,7 @@ class KingkongTv : MainAPI() {
                 hasNext = false
             )
         } catch (e: Exception) {
+            println("DEBUG [KingkongTv] v7.6: 메인 페이지 로드 실패 - ${e.message}")
             e.printStackTrace()
             return newHomePageResponse(request.name, emptyList())
         }
@@ -72,13 +76,12 @@ class KingkongTv : MainAPI() {
         
         if (title.isBlank() || streamId.isBlank()) return null
 
-        // [추가 로직] 중요 경기인 경우 시각적 식별을 위해 제목에 불꽃 이모지 추가
+        // [기존 로직 보존] 중요 경기인 경우 시각적 식별을 위해 제목에 불꽃 이모지 추가
         if (this.selectFirst("td.subject")?.hasClass("bold") == true) {
             title = "🔥 $title"
         }
 
-        // [수정 포인트] 썸네일 캐시 무효화 (Cache Busting)
-        // URL 뒤에 ?t=현재시간밀리초 를 붙여서 앱이 항상 새 이미지로 인식하게 함
+        // [기존 로직 보존] 썸네일 캐시 무효화 (Cache Busting)
         val thumbUrlRaw = this.selectFirst("td.thumb img")?.attr("src")
         val thumbUrl = if (thumbUrlRaw != null) {
             val fixedUrl = fixUrl(refererUrl, thumbUrlRaw)
@@ -92,7 +95,10 @@ class KingkongTv : MainAPI() {
 
         val fakeUrl = "$mainUrl/live_stream/$streamId?title=$encodedTitle&poster=$encodedPoster&ref=$encodedRef"
 
-        return newLiveSearchResponse(title, fakeUrl, TvType.Others) {
+        println("DEBUG [KingkongTv] v7.6: 검색 결과 항목 생성 중 - $title")
+        
+        // [수정 포인트 v7.6] 객체 껍데기는 VOD용(MovieSearch)을 쓰되, 실제 카테고리는 사용자님이 원하시는 TvType.Others로 전달
+        return newMovieSearchResponse(title, fakeUrl, TvType.Others) {
             this.posterUrl = thumbUrl
         }
     }
@@ -107,7 +113,10 @@ class KingkongTv : MainAPI() {
         val rawPoster = uri.getQueryParameter("poster")
         val poster = if (!rawPoster.isNullOrBlank()) URLDecoder.decode(rawPoster, "UTF-8") else null
 
-        return newLiveStreamLoadResponse(title, url, url) {
+        println("DEBUG [KingkongTv] v7.6: 상세 정보 로드 중 - $title")
+
+        // [수정 포인트 v7.6] LiveStream 구조 대신 시청 기록이 남는 단일 영상 구조(MovieLoad)를 차용하며, 타입은 Others로 유지
+        return newMovieLoadResponse(title, url, TvType.Others, url) {
             this.posterUrl = poster
             this.plot = "실시간 중계" 
         }
@@ -124,7 +133,7 @@ class KingkongTv : MainAPI() {
         val rawRef = uri.getQueryParameter("ref")
         val refererUrl = if (!rawRef.isNullOrBlank()) URLDecoder.decode(rawRef, "UTF-8") else "https://kktv.speed10-1.com/kktv/index.php"
         
-        println("DEBUG [KingkongTv] v7.3: ID=$streamId, Referer=$refererUrl")
+        println("DEBUG [KingkongTv] v7.6: 링크 로드 시작 ID=$streamId, Referer=$refererUrl")
 
         val playerPageUrl = "https://kktv.speed10-1.com/kktv/pc_view.php?stream=$streamId"
         
@@ -144,7 +153,7 @@ class KingkongTv : MainAPI() {
             if (m3u8Url == null) {
                 val webrtcMatch = Regex("""['"](webrtc://[^'"]+)['"]""").find(response)?.groupValues?.get(1)
                 if (webrtcMatch != null) {
-                    println("DEBUG [KingkongTv] v7.3: WebRTC 링크 발견 - $webrtcMatch")
+                    println("DEBUG [KingkongTv] v7.6: WebRTC 링크 발견 - $webrtcMatch")
                     m3u8Url = webrtcMatch
                         .replace("webrtc://", "https://")
                         .replace(streamId, "$streamId.m3u8") 
@@ -156,12 +165,12 @@ class KingkongTv : MainAPI() {
                 m3u8Url = "https://play.ogtv3.com/live/$streamId.m3u8?site=kktv"
             }
 
-            println("DEBUG [KingkongTv] v7.3: 원본 M3U8 URL - $m3u8Url")
+            println("DEBUG [KingkongTv] v7.6: 원본 M3U8 URL - $m3u8Url")
 
-            // [추가 로직] v7.2 - SSL 인증서 만료 에러 우회를 위한 다운그레이드 처리
+            // [기존 로직 보존] v7.2 - SSL 인증서 만료 에러 우회를 위한 다운그레이드 처리
             val finalUrl = if (m3u8Url != null && m3u8Url!!.contains("play.ogtv3.com") && m3u8Url!!.startsWith("https://")) {
                 val bypassedUrl = m3u8Url!!.replaceFirst("https://", "http://")
-                println("DEBUG [KingkongTv] v7.3: SSL 우회 적용됨 (HTTPS -> HTTP 변경) - $bypassedUrl")
+                println("DEBUG [KingkongTv] v7.6: SSL 우회 적용됨 (HTTPS -> HTTP 변경) - $bypassedUrl")
                 bypassedUrl
             } else {
                 m3u8Url!!
@@ -185,7 +194,7 @@ class KingkongTv : MainAPI() {
             )
 
         } catch (e: Exception) {
-            println("DEBUG [KingkongTv] v7.3: 에러 - ${e.message}")
+            println("DEBUG [KingkongTv] v7.6: 에러 - ${e.message}")
             e.printStackTrace()
         }
 
