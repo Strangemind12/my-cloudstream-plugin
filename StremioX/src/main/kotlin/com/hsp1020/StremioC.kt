@@ -1,4 +1,4 @@
-// v1.33
+// v1.34
 package com.hsp1020
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -44,12 +44,18 @@ import com.hsp1020.StremioC.Companion.TRACKER_LIST_URLS
 import com.hsp1020.SubsExtractors.invokeOpenSubs
 import com.hsp1020.SubsExtractors.invokeWatchsomuch
 import com.lagradost.nicehttp.Requests
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import okhttp3.ConnectionPool
 import okhttp3.Dispatcher
 import org.json.JSONObject
 import java.net.URLEncoder
 import java.util.Locale
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 
 class StremioC(override var mainUrl: String, override var name: String) : MainAPI() {
     override val supportedTypes = setOf(TvType.Others)
@@ -59,20 +65,20 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     private var lastManifestUrl: String = ""
     private var lastCacheTime: Long = 0
     
-    // [v1.33] 동시성 문제 해결을 위한 Thread-Safe 컬렉션 유지
     private val catalogSentIds = ConcurrentHashMap<String, MutableSet<String>>()
     private val pageContentCache = ConcurrentHashMap<String, List<SearchResponse>>()
     
-    // [v1.33] OkHttp 병목 우회를 위한 커스텀 세션
-    // app.baseClient를 복사하여 동시 요청 제한(maxRequests, maxRequestsPerHost)을 100으로 늘린 새 Dispatcher 적용.
-    // NPE 방지를 위해 이 세션에서는 parsedSafe() 대신 직접 parseJson()을 사용하도록 설계.
+    // [v1.34] Dispatcher + ConnectionPool 동시 적용. 소켓 큐잉 방지
     private val customSession by lazy {
-        println("[StremioC v1.33] 커스텀 OkHttp Dispatcher 초기화 (maxRequests=100)")
+        println("[StremioC v1.34] 커스텀 OkHttp 세션 초기화 (Dispatcher 100, ConnectionPool 100)")
         Requests(
-            app.baseClient.newBuilder().dispatcher(Dispatcher().apply {
-                maxRequests = 100
-                maxRequestsPerHost = 100
-            }).build()
+            app.baseClient.newBuilder()
+                .dispatcher(Dispatcher().apply {
+                    maxRequests = 100
+                    maxRequestsPerHost = 100
+                })
+                .connectionPool(ConnectionPool(100, 5, TimeUnit.MINUTES))
+                .build()
         )
     }
 
@@ -148,7 +154,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-        println("[StremioC v1.33] getMainPage 시작: page=$page")
+        println("[StremioC v1.34] getMainPage 시작: page=$page (Thread: ${Thread.currentThread().name})")
         val startTime = System.currentTimeMillis()
         
         if (mainUrl.isEmpty()) throw IllegalArgumentException("Configure in Extension Settings\n")
@@ -162,56 +168,61 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         
         val manifestStartTime = System.currentTimeMillis()
         val manifest = getManifest()
-        println("[StremioC v1.33] Manifest 가져오기 소요 시간: ${System.currentTimeMillis() - manifestStartTime}ms")
+        println("[StremioC v1.34] Manifest 가져오기 소요 시간: ${System.currentTimeMillis() - manifestStartTime}ms")
         
         val targetCatalogs = manifest?.catalogs?.filter { !it.isSearchRequired() } ?: emptyList()
-        println("[StremioC v1.33] 처리 대상 카탈로그 개수: ${targetCatalogs.size}. 병렬 로드 시작.")
+        println("[StremioC v1.34] 처리 대상 카탈로그 개수: ${targetCatalogs.size}. 순수 비동기(coroutineScope) 병렬 로드 시작.")
         
         val catalogsStartTime = System.currentTimeMillis()
         val lists = mutableListOf<HomePageList>()
         
-        val chunkResults = targetCatalogs.amap { catalog ->
-            try {
-                val catalogStartTime = System.currentTimeMillis()
-                val catalogKey = "${catalog.id}-${catalog.type}"
-                val cacheKey = "${catalogKey}_$skip"
-                
-                println("[StremioC v1.33] 카탈로그 [${catalog.id}] 데이터 로드 요청 시작")
+        // [v1.34] amap 제거 후 coroutineScope + async(Dispatchers.IO) 적용. 
+        val chunkResults = coroutineScope {
+            targetCatalogs.map { catalog ->
+                async(Dispatchers.IO) {
+                    try {
+                        val catalogStartTime = System.currentTimeMillis()
+                        val catalogKey = "${catalog.id}-${catalog.type}"
+                        val cacheKey = "${catalogKey}_$skip"
+                        
+                        println("[StremioC v1.34] 🚀 [시작] 카탈로그 [${catalog.id}] 데이터 처리 코루틴 진입 (Thread: ${Thread.currentThread().name})")
 
-                val cachedItems = pageContentCache[cacheKey]
-                
-                val row = if (cachedItems != null) {
-                    val displayType = catalog.type?.replaceFirstChar { it.uppercase() } ?: ""
-                    val catalogName = "${catalog.name ?: catalog.id} - $displayType"
-                    HomePageList(catalogName, cachedItems)
-                } else {
-                    val freshRow = catalog.toHomePageList(provider = this@StremioC, skip = skip)
-                    if (freshRow.list.isNotEmpty()) {
-                        pageContentCache[cacheKey] = freshRow.list
+                        val cachedItems = pageContentCache[cacheKey]
+                        
+                        val row = if (cachedItems != null) {
+                            val displayType = catalog.type?.replaceFirstChar { it.uppercase() } ?: ""
+                            val catalogName = "${catalog.name ?: catalog.id} - $displayType"
+                            HomePageList(catalogName, cachedItems)
+                        } else {
+                            val freshRow = catalog.toHomePageList(provider = this@StremioC, skip = skip)
+                            if (freshRow.list.isNotEmpty()) {
+                                pageContentCache[cacheKey] = freshRow.list
+                            }
+                            freshRow
+                        }
+                        
+                        val seenForThisCatalog = catalogSentIds.getOrPut(catalogKey) { 
+                            Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>()) 
+                        }
+                        
+                        val filteredItems = row.list.filter { item ->
+                            seenForThisCatalog.add(item.url)
+                        }
+                        
+                        println("[StremioC v1.34] 🏁 [종료] 카탈로그 [${catalog.id}] 전체 완료 소요 시간: ${System.currentTimeMillis() - catalogStartTime}ms")
+                        row.copy(list = filteredItems)
+                    } catch (e: Exception) {
+                        println("[StremioC v1.34] ❌ [에러] 카탈로그 로드 중 에러 발생: ${e.message}")
+                        null
                     }
-                    freshRow
                 }
-                
-                val seenForThisCatalog = catalogSentIds.getOrPut(catalogKey) { 
-                    Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>()) 
-                }
-                
-                val filteredItems = row.list.filter { item ->
-                    seenForThisCatalog.add(item.url)
-                }
-                
-                println("[StremioC v1.33] 카탈로그 [${catalog.id}] 데이터 로드 완료 소요 시간: ${System.currentTimeMillis() - catalogStartTime}ms")
-                row.copy(list = filteredItems)
-            } catch (e: Exception) {
-                println("[StremioC v1.33] 카탈로그 로드 중 에러 발생: ${e.message}")
-                null
-            }
+            }.awaitAll()
         }.filterNotNull().filter { it.list.isNotEmpty() }
         
         lists.addAll(chunkResults)
 
-        println("[StremioC v1.33] 모든 카탈로그 데이터 수집 완료. 총 소요 시간: ${System.currentTimeMillis() - catalogsStartTime}ms")
-        println("[StremioC v1.33] getMainPage 전체 로직 소요 시간: ${System.currentTimeMillis() - startTime}ms")
+        println("[StremioC v1.34] 모든 카탈로그 데이터 수집 완료. 총 소요 시간: ${System.currentTimeMillis() - catalogsStartTime}ms")
+        println("[StremioC v1.34] getMainPage 전체 로직 소요 시간: ${System.currentTimeMillis() - startTime}ms")
 
         return newHomePageResponse(
             lists,
@@ -227,19 +238,24 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val supportedCatalogs = manifest?.catalogs?.filter { it.supportsSearch() } ?: emptyList()
         
         val addonResults = mutableListOf<SearchResponse>()
-        println("[StremioC v1.33] 애드온 검색 시작 (동시 처리 개수: ${supportedCatalogs.size})")
-        val searchResults = supportedCatalogs.amap { catalog -> 
-            try {
-                catalog.search(query, this@StremioC) 
-            } catch (e: Exception) {
-                println("[StremioC v1.33] 검색 중 에러 발생: ${e.message}")
-                emptyList()
-            }
-        }.flatten()
+        println("[StremioC v1.34] 애드온 검색 시작 (동시 처리 개수: ${supportedCatalogs.size})")
+        
+        val searchResults = coroutineScope {
+            supportedCatalogs.map { catalog ->
+                async(Dispatchers.IO) {
+                    try {
+                        catalog.search(query, this@StremioC) 
+                    } catch (e: Exception) {
+                        println("[StremioC v1.34] 검색 중 에러 발생: ${e.message}")
+                        emptyList()
+                    }
+                }
+            }.awaitAll().flatten()
+        }
         addonResults.addAll(searchResults)
         
         val distinctAddonResults = addonResults.distinctBy { it.url }
-        println("[StremioC v1.33] search 애드온 탐색 완료 소요 시간: ${System.currentTimeMillis() - startTime}ms")
+        println("[StremioC v1.34] search 애드온 탐색 완료 소요 시간: ${System.currentTimeMillis() - startTime}ms")
         
         if (distinctAddonResults.isNotEmpty()) {
             return distinctAddonResults
@@ -381,7 +397,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val sites = AcraApplication.getKey<Array<CustomSite>>(USER_PROVIDER_API)?.toMutableList() ?: mutableListOf()
         val filteredSites = sites.filter { it.parentJavaClass == "StremioX" || it.parentJavaClass == "StremioC" }
         
-        // Kitsu/일반 시리즈 규격 대응 ID 생성
         val stremioId = if (type == "series" && season != null && episode != null) {
             when {
                 id?.startsWith("kitsu:") == true -> if (id.endsWith(":$episode")) id else "$id:$episode"
@@ -392,20 +407,24 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             id
         }
 
-        filteredSites.amap { site ->
-            try {
-                val api = site.url.fixSourceUrl().substringBefore("?").replace("/manifest.json", "").trimEnd('/')
-                val url = "$api/stream/$type/$stremioId.json"
-                
-                val req = app.get(url, timeout = 120L)
-                val res = req.parsedSafe<StreamsResponse>()
-                if (res?.streams != null) {
-                    res.streams.forEach { stream ->
-                        stream.runCallback(subtitleCallback, callback)
+        coroutineScope {
+            filteredSites.map { site ->
+                async(Dispatchers.IO) {
+                    try {
+                        val api = site.url.fixSourceUrl().substringBefore("?").replace("/manifest.json", "").trimEnd('/')
+                        val url = "$api/stream/$type/$stremioId.json"
+                        
+                        val req = app.get(url, timeout = 120L)
+                        val res = req.parsedSafe<StreamsResponse>()
+                        if (res?.streams != null) {
+                            res.streams.forEach { stream ->
+                                stream.runCallback(subtitleCallback, callback)
+                            }
+                        }
+                    } catch (e: Exception) {
                     }
                 }
-            } catch (e: Exception) {
-            }
+            }.awaitAll()
         }
     }
 
@@ -432,7 +451,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
         val gson = Gson()
         
-        // Kitsu/일반 시리즈 규격 대응 ID 생성
         val stremioId = if (type == "series" && season != null && episode != null) {
             when {
                 id?.startsWith("kitsu:") == true -> if (id.endsWith(":$episode")) id else "$id:$episode"
@@ -443,27 +461,30 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             id
         }
 
-        addonUrls.toList().amap { api ->
-            try {
-                val url = "$api/subtitles/$type/$stremioId.json"
+        coroutineScope {
+            addonUrls.toList().map { api ->
+                async(Dispatchers.IO) {
+                    try {
+                        val url = "$api/subtitles/$type/$stremioId.json"
+                        val json = app.get(url, timeout = 30L).text
+                        val subtitleResponse = gson.fromJson(json, StremioSubtitleResponse::class.java)
 
-                val json = app.get(url, timeout = 30L).text
-                val subtitleResponse = gson.fromJson(json, StremioSubtitleResponse::class.java)
-
-                subtitleResponse?.subtitles?.forEach { sub ->
-                    val lang = sub.lang ?: sub.lang_code ?: "Unknown"
-                    val fileUrl = sub.url
-                    if (!fileUrl.isNullOrBlank()) {
-                        subtitleCallback.invoke(
-                            newSubtitleFile(
-                                SubtitleHelper.fromTagToEnglishLanguageName(lang) ?: lang,
-                                fileUrl
-                            )
-                        )
+                        subtitleResponse?.subtitles?.forEach { sub ->
+                            val lang = sub.lang ?: sub.lang_code ?: "Unknown"
+                            val fileUrl = sub.url
+                            if (!fileUrl.isNullOrBlank()) {
+                                subtitleCallback.invoke(
+                                    newSubtitleFile(
+                                        SubtitleHelper.fromTagToEnglishLanguageName(lang) ?: lang,
+                                        fileUrl
+                                    )
+                                )
+                            }
+                        }
+                    } catch (e: Exception) {
                     }
                 }
-            } catch (e: Exception) {
-            }
+            }.awaitAll()
         }
     }
 
@@ -521,20 +542,23 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         }
 
         suspend fun search(query: String, provider: StremioC): List<SearchResponse> {
-            val allMetas = types.amap { type ->
-                try {
-                    val searchUrl = provider.buildUrl("/catalog/${type}/${id}/search=${URLEncoder.encode(query, "UTF-8")}.json")
-                    // [v1.33] NPE 우회를 위해 직접 req.text 파싱
-                    val req = provider.customSession.get(searchUrl, timeout = 120L)
-                    val res = if (req.isSuccessful && req.text.isNotBlank()) {
-                        try { parseJson<CatalogResponse>(req.text) } catch (e: Exception) { null }
-                    } else null
-                    res?.metas ?: emptyList()
-                } catch (e: Exception) {
-                    println("[StremioC v1.33] 카탈로그 검색 중 에러: ${e.message}")
-                    emptyList()
-                }
-            }.flatten()
+            val allMetas = coroutineScope {
+                types.map { type ->
+                    async(Dispatchers.IO) {
+                        try {
+                            val searchUrl = provider.buildUrl("/catalog/${type}/${id}/search=${URLEncoder.encode(query, "UTF-8")}.json")
+                            val req = provider.customSession.get(searchUrl, timeout = 120L)
+                            val res = if (req.isSuccessful && req.text.isNotBlank()) {
+                                try { parseJson<CatalogResponse>(req.text) } catch (e: Exception) { null }
+                            } else null
+                            res?.metas ?: emptyList()
+                        } catch (e: Exception) {
+                            println("[StremioC v1.34] 카탈로그 검색 중 에러: ${e.message}")
+                            emptyList()
+                        }
+                    }
+                }.awaitAll().flatten()
+            }
 
             return allMetas.distinctBy { it.id }.map { it.toSearchResponse(provider) }
         }
@@ -543,28 +567,38 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             provider: StremioC,
             skip: Int
         ): HomePageList {
-            val allMetas = types.amap { type ->
-                try {
-                    val path = if (skip > 0) {
-                        "/catalog/$type/$id/skip=$skip.json"
-                    } else {
-                        "/catalog/$type/$id.json"
+            val allMetas = coroutineScope {
+                types.map { type ->
+                    async(Dispatchers.IO) {
+                        try {
+                            val path = if (skip > 0) {
+                                "/catalog/$type/$id/skip=$skip.json"
+                            } else {
+                                "/catalog/$type/$id.json"
+                            }
+                            val url = provider.buildUrl(path)
+                            val currentThread = Thread.currentThread().name
+                            
+                            val reqStartTime = System.currentTimeMillis()
+                            println("[StremioC v1.34] 🌐 [네트워크 요청] URL: $url (Thread: $currentThread)")
+                            
+                            val req = provider.customSession.get(url, timeout = 120L)
+                            
+                            val reqEndTime = System.currentTimeMillis()
+                            println("[StremioC v1.34] 📡 [네트워크 수신] 순수 대기시간: ${reqEndTime - reqStartTime}ms (Thread: $currentThread)")
+
+                            val res = if (req.isSuccessful && req.text.isNotBlank()) {
+                                try { parseJson<CatalogResponse>(req.text) } catch (e: Exception) { null }
+                            } else null
+                            
+                            res?.metas ?: emptyList()
+                        } catch (e: Exception) {
+                            println("[StremioC v1.34] ❌ 카탈로그 메타 로드 중 에러: ${e.message}")
+                            emptyList()
+                        }
                     }
-                    val url = provider.buildUrl(path)
-                    println("[StremioC v1.33] [세부요청] URL 로드: $url")
-                    
-                    // [v1.33] NPE를 원천 차단하기 위해 parsedSafe() 대신 원시 text를 직접 글로벌 파서에 넘김
-                    val req = provider.customSession.get(url, timeout = 120L)
-                    val res = if (req.isSuccessful && req.text.isNotBlank()) {
-                        try { parseJson<CatalogResponse>(req.text) } catch (e: Exception) { null }
-                    } else null
-                    
-                    res?.metas ?: emptyList()
-                } catch (e: Exception) {
-                    println("[StremioC v1.33] 카탈로그 메타 로드 중 에러: ${e.message}")
-                    emptyList()
-                }
-            }.flatten()
+                }.awaitAll().flatten()
+            }
 
             val distinctEntries = allMetas.distinctBy { it.id }.map { it.toSearchResponse(provider) }
 
@@ -792,17 +826,21 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     if (!isMovie && !videos.isNullOrEmpty()) {
                         val requiredSeasons = videos.mapNotNull { it.seasonNumber }.distinct().filter { it > 0 }
                         if (requiredSeasons.isNotEmpty()) {
-                            requiredSeasons.amap { seasonNum ->
-                                try {
-                                    val seasonUrl = "$tmdbAPI/tv/$tmdbIdStr/season/$seasonNum?api_key=$apiKey&language=ko-KR"
-                                    val seasonRes = app.get(seasonUrl).parsedSafe<TmdbSeasonDetail>()
-                                    seasonRes?.episodes?.forEach { ep ->
-                                        if (ep.episodeNumber != null) {
-                                            episodeTmdbMeta["${seasonNum}_${ep.episodeNumber}"] = ep
+                            coroutineScope {
+                                requiredSeasons.map { seasonNum ->
+                                    async(Dispatchers.IO) {
+                                        try {
+                                            val seasonUrl = "$tmdbAPI/tv/$tmdbIdStr/season/$seasonNum?api_key=$apiKey&language=ko-KR"
+                                            val seasonRes = app.get(seasonUrl).parsedSafe<TmdbSeasonDetail>()
+                                            seasonRes?.episodes?.forEach { ep ->
+                                                if (ep.episodeNumber != null) {
+                                                    episodeTmdbMeta["${seasonNum}_${ep.episodeNumber}"] = ep
+                                                }
+                                            }
+                                        } catch (e: Exception) {
                                         }
                                     }
-                                } catch (e: Exception) {
-                                }
+                                }.awaitAll()
                             }
                         }
                     }
