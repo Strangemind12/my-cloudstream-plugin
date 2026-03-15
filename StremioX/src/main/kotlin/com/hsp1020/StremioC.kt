@@ -1,4 +1,4 @@
-// v1.32
+// v1.33
 package com.hsp1020
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -43,6 +43,8 @@ import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.hsp1020.StremioC.Companion.TRACKER_LIST_URLS
 import com.hsp1020.SubsExtractors.invokeOpenSubs
 import com.hsp1020.SubsExtractors.invokeWatchsomuch
+import com.lagradost.nicehttp.Requests
+import okhttp3.Dispatcher
 import org.json.JSONObject
 import java.net.URLEncoder
 import java.util.Locale
@@ -57,10 +59,23 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     private var lastManifestUrl: String = ""
     private var lastCacheTime: Long = 0
     
-    // [v1.32] 동시성 문제 해결을 위해 Thread-Safe 컬렉션으로 변경
+    // [v1.33] 동시성 문제 해결을 위한 Thread-Safe 컬렉션 유지
     private val catalogSentIds = ConcurrentHashMap<String, MutableSet<String>>()
     private val pageContentCache = ConcurrentHashMap<String, List<SearchResponse>>()
     
+    // [v1.33] OkHttp 병목 우회를 위한 커스텀 세션
+    // app.baseClient를 복사하여 동시 요청 제한(maxRequests, maxRequestsPerHost)을 100으로 늘린 새 Dispatcher 적용.
+    // NPE 방지를 위해 이 세션에서는 parsedSafe() 대신 직접 parseJson()을 사용하도록 설계.
+    private val customSession by lazy {
+        println("[StremioC v1.33] 커스텀 OkHttp Dispatcher 초기화 (maxRequests=100)")
+        Requests(
+            app.baseClient.newBuilder().dispatcher(Dispatcher().apply {
+                maxRequests = 100
+                maxRequestsPerHost = 100
+            }).build()
+        )
+    }
+
     companion object {
         private const val cinemeta = "https://aiometadata.elfhosted.com/stremio/b7cb164b-074b-41d5-b458-b3a834e197bb"
         private const val cinemetav3 = "https://v3-cinemeta.strem.io"
@@ -133,14 +148,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-        println("[StremioC v1.32] getMainPage 시작: page=$page")
+        println("[StremioC v1.33] getMainPage 시작: page=$page")
         val startTime = System.currentTimeMillis()
-        
-        // [v1.32] OkHttp Dispatcher 병목 우회: 기존 app.baseClient의 동시 요청 제한을 확장
-        app.baseClient.dispatcher.apply {
-            maxRequests = 100
-            maxRequestsPerHost = 100
-        }
         
         if (mainUrl.isEmpty()) throw IllegalArgumentException("Configure in Extension Settings\n")
         mainUrl = mainUrl.fixSourceUrl()
@@ -153,10 +162,10 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         
         val manifestStartTime = System.currentTimeMillis()
         val manifest = getManifest()
-        println("[StremioC v1.32] Manifest 가져오기 소요 시간: ${System.currentTimeMillis() - manifestStartTime}ms")
+        println("[StremioC v1.33] Manifest 가져오기 소요 시간: ${System.currentTimeMillis() - manifestStartTime}ms")
         
         val targetCatalogs = manifest?.catalogs?.filter { !it.isSearchRequired() } ?: emptyList()
-        println("[StremioC v1.32] 처리 대상 카탈로그 개수: ${targetCatalogs.size}. 병목 우회를 위해 1번에 동시 병렬 로드 시작.")
+        println("[StremioC v1.33] 처리 대상 카탈로그 개수: ${targetCatalogs.size}. 병렬 로드 시작.")
         
         val catalogsStartTime = System.currentTimeMillis()
         val lists = mutableListOf<HomePageList>()
@@ -167,7 +176,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 val catalogKey = "${catalog.id}-${catalog.type}"
                 val cacheKey = "${catalogKey}_$skip"
                 
-                println("[StremioC v1.32] 카탈로그 [${catalog.id}] 데이터 로드 요청 시작")
+                println("[StremioC v1.33] 카탈로그 [${catalog.id}] 데이터 로드 요청 시작")
 
                 val cachedItems = pageContentCache[cacheKey]
                 
@@ -183,7 +192,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     freshRow
                 }
                 
-                // [v1.32] Thread-Safe Set 사용
                 val seenForThisCatalog = catalogSentIds.getOrPut(catalogKey) { 
                     Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>()) 
                 }
@@ -192,18 +200,18 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     seenForThisCatalog.add(item.url)
                 }
                 
-                println("[StremioC v1.32] 카탈로그 [${catalog.id}] 데이터 로드 완료 소요 시간: ${System.currentTimeMillis() - catalogStartTime}ms")
+                println("[StremioC v1.33] 카탈로그 [${catalog.id}] 데이터 로드 완료 소요 시간: ${System.currentTimeMillis() - catalogStartTime}ms")
                 row.copy(list = filteredItems)
             } catch (e: Exception) {
-                println("[StremioC v1.32] 카탈로그 로드 중 에러 발생: ${e.message}")
+                println("[StremioC v1.33] 카탈로그 로드 중 에러 발생: ${e.message}")
                 null
             }
         }.filterNotNull().filter { it.list.isNotEmpty() }
         
         lists.addAll(chunkResults)
 
-        println("[StremioC v1.32] 모든 카탈로그 데이터 수집 완료. 총 소요 시간: ${System.currentTimeMillis() - catalogsStartTime}ms")
-        println("[StremioC v1.32] getMainPage 전체 로직 소요 시간: ${System.currentTimeMillis() - startTime}ms")
+        println("[StremioC v1.33] 모든 카탈로그 데이터 수집 완료. 총 소요 시간: ${System.currentTimeMillis() - catalogsStartTime}ms")
+        println("[StremioC v1.33] getMainPage 전체 로직 소요 시간: ${System.currentTimeMillis() - startTime}ms")
 
         return newHomePageResponse(
             lists,
@@ -219,19 +227,19 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val supportedCatalogs = manifest?.catalogs?.filter { it.supportsSearch() } ?: emptyList()
         
         val addonResults = mutableListOf<SearchResponse>()
-        println("[StremioC v1.32] 애드온 검색 시작 (동시 처리 개수: ${supportedCatalogs.size})")
+        println("[StremioC v1.33] 애드온 검색 시작 (동시 처리 개수: ${supportedCatalogs.size})")
         val searchResults = supportedCatalogs.amap { catalog -> 
             try {
                 catalog.search(query, this@StremioC) 
             } catch (e: Exception) {
-                println("[StremioC v1.32] 검색 중 에러 발생: ${e.message}")
+                println("[StremioC v1.33] 검색 중 에러 발생: ${e.message}")
                 emptyList()
             }
         }.flatten()
         addonResults.addAll(searchResults)
         
         val distinctAddonResults = addonResults.distinctBy { it.url }
-        println("[StremioC v1.32] search 애드온 탐색 완료 소요 시간: ${System.currentTimeMillis() - startTime}ms")
+        println("[StremioC v1.33] search 애드온 탐색 완료 소요 시간: ${System.currentTimeMillis() - startTime}ms")
         
         if (distinctAddonResults.isNotEmpty()) {
             return distinctAddonResults
@@ -516,11 +524,14 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             val allMetas = types.amap { type ->
                 try {
                     val searchUrl = provider.buildUrl("/catalog/${type}/${id}/search=${URLEncoder.encode(query, "UTF-8")}.json")
-                    // [v1.32] app.get 사용
-                    val res = app.get(searchUrl, timeout = 120L).parsedSafe<CatalogResponse>()
+                    // [v1.33] NPE 우회를 위해 직접 req.text 파싱
+                    val req = provider.customSession.get(searchUrl, timeout = 120L)
+                    val res = if (req.isSuccessful && req.text.isNotBlank()) {
+                        try { parseJson<CatalogResponse>(req.text) } catch (e: Exception) { null }
+                    } else null
                     res?.metas ?: emptyList()
                 } catch (e: Exception) {
-                    println("[StremioC v1.32] 카탈로그 검색 중 에러: ${e.message}")
+                    println("[StremioC v1.33] 카탈로그 검색 중 에러: ${e.message}")
                     emptyList()
                 }
             }.flatten()
@@ -540,13 +551,17 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                         "/catalog/$type/$id.json"
                     }
                     val url = provider.buildUrl(path)
-                    println("[StremioC v1.32] [세부요청] URL 로드: $url")
+                    println("[StremioC v1.33] [세부요청] URL 로드: $url")
                     
-                    // [v1.32] customSession 대신 안전한 app.get 사용
-                    val res = app.get(url, timeout = 120L).parsedSafe<CatalogResponse>()
+                    // [v1.33] NPE를 원천 차단하기 위해 parsedSafe() 대신 원시 text를 직접 글로벌 파서에 넘김
+                    val req = provider.customSession.get(url, timeout = 120L)
+                    val res = if (req.isSuccessful && req.text.isNotBlank()) {
+                        try { parseJson<CatalogResponse>(req.text) } catch (e: Exception) { null }
+                    } else null
+                    
                     res?.metas ?: emptyList()
                 } catch (e: Exception) {
-                    println("[StremioC v1.32] 카탈로그 메타 로드 중 에러: ${e.message}")
+                    println("[StremioC v1.33] 카탈로그 메타 로드 중 에러: ${e.message}")
                     emptyList()
                 }
             }.flatten()
