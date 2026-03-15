@@ -69,8 +69,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     private val catalogSentIds = ConcurrentHashMap<String, MutableSet<String>>()
     private val pageContentCache = ConcurrentHashMap<String, List<SearchResponse>>()
     
-    // [v1.36] 서버의 DDoS 오인을 막기 위한 슬라이딩 윈도우 동시성 제어기 (12개로 제한)
-    val catalogSemaphore = Semaphore(12)
+    // [v1.36] 서버의 DDoS 오인을 막기 위한 슬라이딩 윈도우 동시성 제어기 (5개로 제한)
+    val catalogSemaphore = Semaphore(5)
     
     private val customSession by lazy {
         println("[StremioC v1.36] 커스텀 OkHttp 세션 초기화 (Dispatcher 100, ConnectionPool 100)")
