@@ -1,4 +1,4 @@
-// v1.37
+// v1.38
 package com.hsp1020
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -21,6 +21,7 @@ import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.addDate
+import com.lagradost.cloudstream3.amap
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.imdbUrlToIdNullable
 import com.lagradost.cloudstream3.newEpisode
@@ -69,11 +70,10 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     private val catalogSentIds = ConcurrentHashMap<String, MutableSet<String>>()
     private val pageContentCache = ConcurrentHashMap<String, List<SearchResponse>>()
     
-    // [v1.36] 서버의 DDoS 오인을 막기 위한 슬라이딩 윈도우 동시성 제어기 (12개로 제한)
     val catalogSemaphore = Semaphore(12)
     
     private val customSession by lazy {
-        println("[StremioC v1.37] 커스텀 OkHttp 세션 초기화 (Dispatcher 100, ConnectionPool 100)")
+        println("[StremioC v1.38] 커스텀 OkHttp 세션 초기화 (Dispatcher 100, ConnectionPool 100)")
         Requests(
             app.baseClient.newBuilder()
                 .dispatcher(Dispatcher().apply {
@@ -334,11 +334,11 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("[StremioC v1.37] === loadLinks 진입 ===")
-        println("[StremioC v1.37] 원본 LoadData JSON: $data")
+        println("[StremioC v1.38] === loadLinks 진입 ===")
+        println("[StremioC v1.38] 원본 LoadData JSON: $data")
         
         val loadData = try { parseJson<LoadData>(data) } catch (e: Exception) { null } ?: return false
-        println("[StremioC v1.37] 파싱 결과 -> type: ${loadData.type}, id: ${loadData.id}, imdbId: ${loadData.imdbId}, season: ${loadData.season}, episode: ${loadData.episode}")
+        println("[StremioC v1.38] 파싱 결과 -> type: ${loadData.type}, id: ${loadData.id}, imdbId: ${loadData.imdbId}, season: ${loadData.season}, episode: ${loadData.episode}")
         
         val normalizedId = try { normalizeId(loadData.id) } catch (e: Exception) { loadData.id ?: "" }
         val encodedId = try { URLEncoder.encode(normalizedId, "UTF-8") } catch (e: Exception) { normalizedId }
@@ -382,13 +382,17 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        println("[StremioC v1.37] === invokeStremioX 시작 ===")
+        println("[StremioC v1.38] === invokeStremioX 시작 ===")
         val sites = AcraApplication.getKey<Array<CustomSite>>(USER_PROVIDER_API)?.toMutableList() ?: mutableListOf()
         val filteredSites = sites.filter { it.parentJavaClass == "StremioX" || it.parentJavaClass == "StremioC" }
         
         val stremioId = if (type == "series" && season != null && episode != null) {
             when {
-                id?.startsWith("kitsu:") == true -> if (id.endsWith(":$episode")) id else "$id:$episode"
+                id?.startsWith("kitsu:") == true -> {
+                    val parts = id.split(":")
+                    val baseId = if (parts.size >= 2) "kitsu:${parts[1]}" else id
+                    "$baseId:$season:$episode"
+                }
                 id?.endsWith(":$season:$episode") == true -> id
                 else -> "$id:$season:$episode"
             }
@@ -396,7 +400,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             id
         }
         
-        println("[StremioC v1.37] 변환된 스트림 요청용 ID (stremioId): $stremioId")
+        println("[StremioC v1.38] 변환된 스트림 요청용 ID (stremioId): $stremioId")
 
         coroutineScope {
             filteredSites.map { site ->
@@ -404,20 +408,20 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     try {
                         val api = site.url.fixSourceUrl().substringBefore("?").replace("/manifest.json", "").trimEnd('/')
                         val url = "$api/stream/$type/$stremioId.json"
-                        println("[StremioC v1.37] 애드온 스트림 요청 URL: $url")
+                        println("[StremioC v1.38] 애드온 스트림 요청 URL: $url")
                         
                         val req = app.get(url, timeout = 120L)
-                        println("[StremioC v1.37] 애드온 스트림 응답 코드: ${req.code}")
+                        println("[StremioC v1.38] 애드온 스트림 응답 코드: ${req.code}")
                         
                         val res = req.parsedSafe<StreamsResponse>()
                         if (res?.streams != null) {
-                            println("[StremioC v1.37] 파싱 성공, 발견된 스트림 수: ${res.streams.size}")
+                            println("[StremioC v1.38] 파싱 성공, 발견된 스트림 수: ${res.streams.size}")
                             res.streams.forEach { stream ->
                                 stream.runCallback(subtitleCallback, callback)
                             }
                         }
                     } catch (e: Exception) {
-                        println("[StremioC v1.37] 스트림 요청 중 에러: ${e.message}")
+                        println("[StremioC v1.38] 스트림 요청 중 에러: ${e.message}")
                     }
                 }
             }.awaitAll()
@@ -435,7 +439,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         episode: Int?,
         subtitleCallback: (SubtitleFile) -> Unit
     ) {
-        println("[StremioC v1.37] === invokeStremioSubtitles 시작 ===")
+        println("[StremioC v1.38] === invokeStremioSubtitles 시작 ===")
         val sites = AcraApplication.getKey<Array<CustomSite>>(USER_PROVIDER_API)?.toMutableList() ?: mutableListOf()
         val addonUrls = mutableSetOf<String>()
         
@@ -450,7 +454,11 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         
         val stremioId = if (type == "series" && season != null && episode != null) {
             when {
-                id?.startsWith("kitsu:") == true -> if (id.endsWith(":$episode")) id else "$id:$episode"
+                id?.startsWith("kitsu:") == true -> {
+                    val parts = id.split(":")
+                    val baseId = if (parts.size >= 2) "kitsu:${parts[1]}" else id
+                    "$baseId:$season:$episode"
+                }
                 id?.endsWith(":$season:$episode") == true -> id
                 else -> "$id:$season:$episode"
             }
@@ -458,22 +466,22 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             id
         }
         
-        println("[StremioC v1.37] 자막 서버에 요청할 최종 조합 ID (stremioId): $stremioId")
+        println("[StremioC v1.38] 자막 서버에 요청할 최종 조합 ID (stremioId): $stremioId")
 
         coroutineScope {
             addonUrls.toList().map { api ->
                 async(Dispatchers.IO) {
                     try {
                         val url = "$api/subtitles/$type/$stremioId.json"
-                        println("[StremioC v1.37] 애드온 자막 요청 URL: $url")
+                        println("[StremioC v1.38] 애드온 자막 요청 URL: $url")
                         
                         val req = app.get(url, timeout = 30L)
-                        println("[StremioC v1.37] 자막 응답 코드: ${req.code}, 응답 본문 일부: ${req.text.take(300)}")
+                        println("[StremioC v1.38] 자막 응답 코드: ${req.code}, 응답 본문 일부: ${req.text.take(300)}")
                         
                         val subtitleResponse = gson.fromJson(req.text, StremioSubtitleResponse::class.java)
 
                         if (subtitleResponse?.subtitles != null) {
-                            println("[StremioC v1.37] 파싱 성공, 반환된 자막 수: ${subtitleResponse.subtitles.size}")
+                            println("[StremioC v1.38] 파싱 성공, 반환된 자막 수: ${subtitleResponse.subtitles.size}")
                             subtitleResponse.subtitles.forEach { sub ->
                                 val lang = sub.lang ?: sub.lang_code ?: "Unknown"
                                 val fileUrl = sub.url
@@ -487,15 +495,15 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                                 }
                             }
                         } else {
-                            println("[StremioC v1.37] 파싱 실패 또는 반환된 subtitles가 null 입니다.")
+                            println("[StremioC v1.38] 파싱 실패 또는 반환된 subtitles가 null 입니다.")
                         }
                     } catch (e: Exception) {
-                        println("[StremioC v1.37] 자막 요청 중 에러: ${e.message}")
+                        println("[StremioC v1.38] 자막 요청 중 에러: ${e.message}")
                     }
                 }
             }.awaitAll()
         }
-        println("[StremioC v1.37] === invokeStremioSubtitles 완료 ===")
+        println("[StremioC v1.38] === invokeStremioSubtitles 완료 ===")
     }
 
     data class LoadData(
