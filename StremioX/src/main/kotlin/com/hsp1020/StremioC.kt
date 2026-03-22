@@ -1642,7 +1642,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 loadExtractor(externalUrl, subtitleCallback, callback)
             }
             if (infoHash != null) {
-                val resp = provider.customSession.get(TRACKER_LIST_URL).text
+                val resp = app.get(TRACKER_LIST_URL).text
                 val otherTrackers = resp
                     .split("\n")
                     .filterIndexed { i, _ -> i % 2 == 0 }
