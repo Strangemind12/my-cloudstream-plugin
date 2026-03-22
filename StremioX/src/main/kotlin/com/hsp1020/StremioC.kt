@@ -1177,8 +1177,15 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 println("[StremioC v1.90-TRACKING] ⚡ 메타데이터 JSON 내에서 무료 TMDB ID($tmdbIdStr) 발견. Find API 호출을 생략합니다.")
             }
 
-            if (finalImdbId == null && logo != null) {
-                finalImdbId = "tt[0-9]+".toRegex().find(logo)?.value
+            if (finalImdbId == null) {
+                val regex = "tt[0-9]+".toRegex()
+                finalImdbId = logo?.let { regex.find(it)?.value }
+                    ?: poster?.let { regex.find(it)?.value }
+                    ?: background?.let { regex.find(it)?.value }
+                
+                if (finalImdbId != null) {
+                    println("[StremioC v1.91-TRACKING] 💡 포스터/배경/로고 URL에서 숨겨진 IMDb ID($finalImdbId) 사전 추출 성공! 병렬 통신을 정상 시작합니다.")
+                }
             }
 
             if (this@CatalogEntry.id.startsWith("kitsu:") && finalImdbId.isNullOrBlank()) {
