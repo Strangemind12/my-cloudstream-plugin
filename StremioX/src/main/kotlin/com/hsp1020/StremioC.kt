@@ -1050,7 +1050,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     finalDescription = if (finalDescription.isNullOrBlank()) {
                         originalName
                     } else {
-                        "$originalName\n$finalDescription"
+                        "$originalName | $finalDescription"
                     }
                     println("[StremioC v1.64-TRACKING] 📝 타입이 'other'이므로 기존 타이틀을 개요 맨 앞에 병합: $finalDescription")
                 }
