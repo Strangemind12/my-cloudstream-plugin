@@ -1208,7 +1208,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 println("[StremioC v1.90-TRACKING] ⚡ Kitsu 아이템이지만 로컬 JSON에서 유효한 IMDB ID($finalImdbId)를 확보하여 API 통신을 건너뜁니다.")
             }
 
-            val tmdbMediaType = if (isSingleMovieVideo || type == "movie" || videos.isNullOrEmpty()) "movie" else "tv"
+            val tmdbMediaType = if (this@CatalogEntry.type == "movie") "movie" else "tv"
 
             var tmdbData: FetchedTmdbData? = null
             var originalName: String? = null
