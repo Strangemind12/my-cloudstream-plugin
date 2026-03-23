@@ -307,7 +307,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val normalizedId = try { normalizeId(loadData.id) } catch (e: Exception) { loadData.id ?: "" }
         val encodedId = try { URLEncoder.encode(normalizedId, "UTF-8") } catch (e: Exception) { normalizedId }
         
-        val targetId = if (loadData.id != null && !(loadData.id.startsWith("tt") || loadData.id.startsWith("tmdb:") || loadData.id.startsWith("kitsu:"))) {
+        val targetId = if (loadData.id != null && !(loadData.id.startsWith("tt") || loadData.id.startsWith("kitsu:"))) {
             if (!loadData.imdbId.isNullOrBlank()) loadData.imdbId else loadData.id
         } else {
             loadData.id
