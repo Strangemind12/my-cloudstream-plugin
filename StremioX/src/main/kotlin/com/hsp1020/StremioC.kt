@@ -1,4 +1,4 @@
-// v1.105 (Fixed Trakt/Simkl Recs & Master Scoring System)
+// v1.106 (Fixed Trakt/Simkl Silent Parsing Errors & Master Scoring)
 package com.hsp1020
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -40,6 +40,7 @@ import com.lagradost.cloudstream3.utils.SubtitleHelper
 import com.lagradost.cloudstream3.utils.USER_PROVIDER_API
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import com.hsp1020.StremioC.Companion.TRACKER_LIST_URLS
 import com.hsp1020.SubsExtractors.invokeOpenSubs
 import com.hsp1020.SubsExtractors.invokeWatchsomuch
 import com.lagradost.nicehttp.Requests
@@ -54,11 +55,14 @@ import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.ConnectionPool
 import okhttp3.Dispatcher
 import okhttp3.Protocol
+import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLEncoder
+import java.util.Locale
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import kotlin.math.min
 
 private fun String.cleanBaseUrl(): String {
     return this.substringBefore("?").replace("/manifest.json", "").trimEnd('/')
@@ -80,6 +84,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     private val activePageRequests = mutableMapOf<Int, Deferred<HomePageResponse>>()
     
     val customSession by lazy {
+        println("[StremioC v1.106-TRACKING] 커스텀 OkHttp 세션 초기화")
         val newClient = app.baseClient.newBuilder()
             .protocols(listOf(Protocol.HTTP_1_1))
             .dispatcher(Dispatcher().apply {
@@ -116,9 +121,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 .filter { it.isNotEmpty() }
                 .joinToString("") { "&tr=$it" }
             cachedTrackers!!
-        } catch (e: Exception) {
-            ""
-        }
+        } catch (e: Exception) { "" }
     }
 
     private fun buildStremioId(type: String?, id: String?, season: Int?, episode: Int?): String? {
@@ -398,7 +401,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     }
 
     data class LoadData(val type: String? = null, val id: String? = null, val season: Int? = null, val episode: Int? = null, val imdbId: String? = null, val year: Int? = null)
-
     data class CustomSite(@JsonProperty("parentJavaClass") val parentJavaClass: String, @JsonProperty("name") val name: String, @JsonProperty("url") val url: String, @JsonProperty("lang") val lang: String)
 
     private fun isImdborTmdb(url: String?): Boolean {
@@ -464,13 +466,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val fetchedYear: Int?, val fetchedStatus: ShowStatus?, val episodeTmdbMeta: Map<String, TmdbEpisode>
     )
 
-    private data class TraktMedia(@JsonProperty("title") val title: String? = null, @JsonProperty("ids") val ids: TraktIds? = null)
-    private data class TraktIds(@JsonProperty("tmdb") val tmdb: Int? = null)
-    private data class SimklResponse(@JsonProperty("users_recommendations") val users_recommendations: List<SimklMedia>? = null)
-    private data class SimklMedia(@JsonProperty("title") val title: String? = null, @JsonProperty("ids") val ids: SimklIds? = null)
-    private data class SimklDetailResponse(@JsonProperty("ids") val ids: SimklIds? = null)
-    private data class SimklIds(@JsonProperty("simkl") val simkl: Int? = null, @JsonProperty("tmdb") val tmdb: Int? = null)
-
     private data class CatalogEntry(
         @JsonProperty("name") val name: String, @JsonProperty("id") val id: String, @JsonProperty("moviedb_id") val moviedb_id: Int? = null,
         @JsonProperty("poster") val poster: String?, @JsonProperty("background") val background: String?, @JsonProperty("logo") val logo: String? = null,
@@ -505,44 +500,61 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             }
 
             coroutineScope {
-                // [해결 1] 미디어 타입 오판 방지: 정제된 tmdbMediaType을 인자로 받아 내부에서 Trakt/Simkl 호출!
+                // [해결 1] 원시 JSON 수동 파싱으로 ClassCastException 완벽 차단! (Trakt)
                 val traktDeferred = async(Dispatchers.IO) {
                     if (finalImdbId == null || TRAKT_CLIENT_ID.isEmpty()) return@async emptyList<Int>()
                     val traktMediaType = if (tmdbMediaType == "movie") "movies" else "shows"
                     try {
                         val req = provider.customSession.get("https://api.trakt.tv/$traktMediaType/$finalImdbId/related?limit=30", headers = mapOf("Content-Type" to "application/json", "trakt-api-version" to "2", "trakt-api-key" to TRAKT_CLIENT_ID), timeout = 15)
-                        if (req.isSuccessful) parseJson<List<TraktMedia>>(req.text).mapNotNull { it.ids?.tmdb } else emptyList()
+                        if (req.isSuccessful && req.text.isNotBlank()) {
+                            val jsonArray = JSONArray(req.text)
+                            val ids = mutableListOf<Int>()
+                            for (i in 0 until jsonArray.length()) {
+                                val tmdbId = jsonArray.optJSONObject(i)?.optJSONObject("ids")?.optInt("tmdb", 0) ?: 0
+                                if (tmdbId > 0) ids.add(tmdbId)
+                            }
+                            ids
+                        } else emptyList()
                     } catch(e: Exception) { emptyList() }
                 }
 
+                // [해결 1] 원시 JSON 수동 파싱 적용 (Simkl)
                 val simklDeferred = async(Dispatchers.IO) {
                     if (finalImdbId == null || SIMKL_CLIENT_ID.isEmpty()) return@async emptyList<Int>()
                     val simklMediaType = if (tmdbMediaType == "movie") "movies" else "tv"
                     try {
                         val req = provider.customSession.get("https://api.simkl.com/$simklMediaType/$finalImdbId?extended=full&client_id=$SIMKL_CLIENT_ID", timeout = 15)
-                        val res = if (req.isSuccessful) parseJson<SimklResponse>(req.text) else null
-                        val rawSimklRecs = res?.users_recommendations?.take(30) ?: emptyList()
-                        coroutineScope {
-                            rawSimklRecs.map { rec ->
-                                async(Dispatchers.IO) {
-                                    val existingTmdbId = rec.ids?.tmdb
-                                    if (existingTmdbId != null) existingTmdbId
-                                    else {
-                                        val simklId = rec.ids?.simkl
-                                        if (simklId != null) {
+                        if (req.isSuccessful && req.text.isNotBlank()) {
+                            val rootObj = JSONObject(req.text)
+                            val recsArray = rootObj.optJSONArray("users_recommendations") ?: JSONArray()
+                            val rawSimklRecs = mutableListOf<Pair<Int, Int>>()
+                            
+                            for (i in 0 until min(recsArray.length(), 30)) {
+                                val idsObj = recsArray.optJSONObject(i)?.optJSONObject("ids")
+                                val tmdb = idsObj?.optInt("tmdb", 0) ?: 0
+                                val simkl = idsObj?.optInt("simkl", 0) ?: 0
+                                if (tmdb > 0 || simkl > 0) rawSimklRecs.add(Pair(tmdb, simkl))
+                            }
+                            
+                            coroutineScope {
+                                rawSimklRecs.map { (tmdbId, simklId) ->
+                                    async(Dispatchers.IO) {
+                                        if (tmdbId > 0) tmdbId
+                                        else if (simklId > 0) {
                                             try {
                                                 val dReq = provider.customSession.get("https://api.simkl.com/$simklMediaType/$simklId?client_id=$SIMKL_CLIENT_ID", timeout = 15)
-                                                if (dReq.isSuccessful) parseJson<SimklDetailResponse>(dReq.text).ids?.tmdb else null
+                                                if (dReq.isSuccessful && dReq.text.isNotBlank()) {
+                                                    JSONObject(dReq.text).optJSONObject("ids")?.optInt("tmdb", 0)?.takeIf { it > 0 }
+                                                } else null
                                             } catch(e: Exception) { null }
                                         } else null
                                     }
-                                }
-                            }.awaitAll().filterNotNull()
-                        }
+                                }.awaitAll().filterNotNull()
+                            }
+                        } else emptyList()
                     } catch(e: Exception) { emptyList() }
                 }
 
-                // [해결 3] TMDB 40개 보장: append_to_response(20개 한도)를 쓰지 않고 병렬 코루틴 2페이지(40개) 호출 부활
                 val tmdbRecsDeferred = (1..2).map { page ->
                     async(Dispatchers.IO) {
                         try {
@@ -566,7 +578,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
                 val existingTmdbIds = collectionParts.mapNotNull { it.id }.toSet() + tmdbRecsIds
                 
-                // [해결 2] 강제 증발 방지: .take(20) 삭제. 60개의 Trakt/Simkl 미싱 ID를 병목 없이 전량 수집
+                // [해결 2] 강제 증발 유발 요소 .take(20) 완전 삭제 (모든 미싱 데이터 병목 없이 풀 로드)
                 val missingIds = (traktIds + simklIds).distinct()
                     .filter { !existingTmdbIds.contains(it) && it != tmdbIdStr.toIntOrNull() }
 
@@ -589,16 +601,20 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 val allCandidates = (collectionParts + tmdbRecs + fetchedMissingMedia).distinctBy { it.id }
                     .filter { it.id != null && it.id != tmdbIdStr.toIntOrNull() }
                 
-                // 천재적인 마스터 스코어링 시스템 (오차 없는 수학적 10티어 + 컬렉션 강제 고정)
+                println("[StremioC v1.106-TRACKING] ⚙️ [정렬 시작] 각 추천작별 마스터 스코어링 배정 심사를 시작합니다...")
+                
+                // [해결 3] 오차 0% 수학적 마스터 스코어링 시스템
                 val finalCombinedMedia = allCandidates.map { media ->
                     var score = 0.0 
                     if (collectionParts.any { it.id == media.id }) score += 1000.0 // [0순위] 컬렉션 (무조건 1빠따)
                     if (isSameOrigin(media)) score += 10.0 // [동일 국가 보너스]
-                    if (media.id in traktIds) score += 4.0 // [Trakt]
-                    if (media.id in simklIds) score += 2.0 // [Simkl]
-                    if (media.id in tmdbRecsIds) score += 1.0 // [TMDB 추천]
+                    if (media.id in traktIds) score += 4.0 // [Trakt 권위 가중치]
+                    if (media.id in simklIds) score += 2.0 // [Simkl 권위 가중치]
+                    if (media.id in tmdbRecsIds) score += 1.0 // [TMDB 권위 가중치]
                     Pair(media, score)
-                }.sortedByDescending { it.second }.map { it.first }.take(50) // 100 Pool 중 최상위 50개 쾌속 컷오프
+                }.sortedByDescending { it.second }.map { it.first }.take(50)
+
+                println("[StremioC v1.106-TRACKING] 🏆 최종 출력 확정: ${finalCombinedMedia.size}개의 최고 득점 추천작이 UI로 전송됩니다.")
 
                 fetchedRecommendations = finalCombinedMedia.mapNotNull { media ->
                     val recTitle = media.title ?: media.name ?: media.originalTitle ?: return@mapNotNull null
