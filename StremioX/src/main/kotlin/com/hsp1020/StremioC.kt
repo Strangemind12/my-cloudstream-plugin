@@ -1,4 +1,3 @@
-// v1.108 (Restored Language & Country Dual-Check for +10 Bonus Score)
 package com.hsp1020
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -91,7 +90,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     private val activePageRequests = mutableMapOf<Int, Deferred<HomePageResponse>>()
     
     val customSession by lazy {
-        println("[StremioC v1.108-TRACKING] 커스텀 OkHttp 세션 초기화")
         val newClient = app.baseClient.newBuilder()
             .protocols(listOf(Protocol.HTTP_1_1))
             .dispatcher(Dispatcher().apply {
