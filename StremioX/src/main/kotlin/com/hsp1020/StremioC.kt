@@ -382,7 +382,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             if (!fileUrl.isNullOrBlank()) {
                                 val baseLangName = SubtitleHelper.fromTagToEnglishLanguageName(lang) ?: lang
                                 val customLabel = "$baseLangName (Stremio)"
-                                subtitleCallback.invoke(newSubtitleFile(SubtitleHelper.fromTagToEnglishLanguageName(lang) ?: lang, fileUrl))
+                                subtitleCallback.invoke(newSubtitleFile(customLabel, fileUrl))                            
                             }
                         }
                     } catch (e: Exception) {}
