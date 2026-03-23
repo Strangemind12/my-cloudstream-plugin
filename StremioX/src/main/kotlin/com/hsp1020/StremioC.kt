@@ -1,4 +1,4 @@
-// v1.106 (Fixed Trakt/Simkl Silent Parsing Errors & Master Scoring)
+// v1.107 (Implemented LRU Cache & Removed Bloated Torrent Trackers)
 package com.hsp1020
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -67,6 +67,15 @@ private fun String.cleanBaseUrl(): String {
     return this.substringBefore("?").replace("/manifest.json", "").trimEnd('/')
 }
 
+// [해결 2] OOM 방지를 위한 LRU(최근 최소 사용) Set 구현체 추가
+private inline fun <T> lruSet(maxSize: Int): MutableSet<T> {
+    return Collections.newSetFromMap(object : java.util.LinkedHashMap<T, Boolean>(maxSize, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<T, Boolean>): Boolean {
+            return size > maxSize
+        }
+    })
+}
+
 class StremioC(override var mainUrl: String, override var name: String) : MainAPI() {
     override val supportedTypes = setOf(TvType.Others)
     override val hasMainPage = true
@@ -75,6 +84,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     private var lastManifestUrl: String = ""
     private var lastCacheTime: Long = 0
     
+    // [해결 2] 무한 스크롤 메모리 방어: 내부 Set을 LRU 기반으로 래핑하여 생성
     private val catalogSentIds = ConcurrentHashMap<String, MutableSet<String>>()
     private val pageContentCache = ConcurrentHashMap<String, List<SearchResponse>>()
     private val catalogSkipState = ConcurrentHashMap<String, Int>()
@@ -83,7 +93,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     private val activePageRequests = mutableMapOf<Int, Deferred<HomePageResponse>>()
     
     val customSession by lazy {
-        println("[StremioC v1.106-TRACKING] 커스텀 OkHttp 세션 초기화")
+        println("[StremioC v1.107-TRACKING] 커스텀 OkHttp 세션 초기화")
         val newClient = app.baseClient.newBuilder()
             .protocols(listOf(Protocol.HTTP_1_1))
             .dispatcher(Dispatcher().apply {
@@ -106,21 +116,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         private const val TRAKT_CLIENT_ID = "6d8668915ed1953f5023ea090e206facc6261813243f567dea15a9a678783b6d" 
         private const val SIMKL_CLIENT_ID = "f392628a1235f474859905f5453239c57715d9a197a89bd71cac975ddd9c4d39" 
         
-        private const val TRACKER_LIST_URL = "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt"
-        
-        private var cachedTrackers: String? = null
-    }
-
-    private suspend fun getFormattedTrackers(): String {
-        if (cachedTrackers != null) return cachedTrackers!!
-        return try {
-            val resp = app.get(TRACKER_LIST_URL).text
-            cachedTrackers = resp.split("\n")
-                .filterIndexed { i, _ -> i % 2 == 0 }
-                .filter { it.isNotEmpty() }
-                .joinToString("") { "&tr=$it" }
-            cachedTrackers!!
-        } catch (e: Exception) { "" }
+        // [해결 3] trackers_best.txt 다운로드 및 캐시 변수 완전 삭제 (파싱 에러 방지)
     }
 
     private fun buildStremioId(type: String?, id: String?, season: Int?, episode: Int?): String? {
@@ -245,8 +241,9 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             freshRow
                         }
                         
+                        // [해결 2] LRU Set 적용: 한 카탈로그당 최대 500개 아이템만 기록하여 무한 스크롤 OOM 완벽 방지
                         val seenForThisCatalog = catalogSentIds.getOrPut(catalogKey) { 
-                            Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>()) 
+                            Collections.synchronizedSet(lruSet<String>(500))
                         }
                         
                         val filteredItems = row.list.filter { item -> seenForThisCatalog.add(item.url) }
@@ -499,7 +496,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             }
 
             coroutineScope {
-                // [해결 1] 원시 JSON 수동 파싱으로 ClassCastException 완벽 차단! (Trakt)
                 val traktDeferred = async(Dispatchers.IO) {
                     if (finalImdbId == null || TRAKT_CLIENT_ID.isEmpty()) return@async emptyList<Int>()
                     val traktMediaType = if (tmdbMediaType == "movie") "movies" else "shows"
@@ -517,7 +513,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     } catch(e: Exception) { emptyList() }
                 }
 
-                // [해결 1] 원시 JSON 수동 파싱 적용 (Simkl)
                 val simklDeferred = async(Dispatchers.IO) {
                     if (finalImdbId == null || SIMKL_CLIENT_ID.isEmpty()) return@async emptyList<Int>()
                     val simklMediaType = if (tmdbMediaType == "movie") "movies" else "tv"
@@ -577,7 +572,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
                 val existingTmdbIds = collectionParts.mapNotNull { it.id }.toSet() + tmdbRecsIds
                 
-                // [해결 2] 강제 증발 유발 요소 .take(20) 완전 삭제 (모든 미싱 데이터 병목 없이 풀 로드)
                 val missingIds = (traktIds + simklIds).distinct()
                     .filter { !existingTmdbIds.contains(it) && it != tmdbIdStr.toIntOrNull() }
 
@@ -600,20 +594,15 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 val allCandidates = (collectionParts + tmdbRecs + fetchedMissingMedia).distinctBy { it.id }
                     .filter { it.id != null && it.id != tmdbIdStr.toIntOrNull() }
                 
-                println("[StremioC v1.106-TRACKING] ⚙️ [정렬 시작] 각 추천작별 마스터 스코어링 배정 심사를 시작합니다...")
-                
-                // [해결 3] 오차 0% 수학적 마스터 스코어링 시스템
                 val finalCombinedMedia = allCandidates.map { media ->
                     var score = 0.0 
-                    if (collectionParts.any { it.id == media.id }) score += 1000.0 // [0순위] 컬렉션 (무조건 1빠따)
-                    if (isSameOrigin(media)) score += 10.0 // [동일 국가 보너스]
-                    if (media.id in traktIds) score += 4.0 // [Trakt 권위 가중치]
-                    if (media.id in simklIds) score += 2.0 // [Simkl 권위 가중치]
-                    if (media.id in tmdbRecsIds) score += 1.0 // [TMDB 권위 가중치]
+                    if (collectionParts.any { it.id == media.id }) score += 1000.0 
+                    if (isSameOrigin(media)) score += 10.0 
+                    if (media.id in traktIds) score += 4.0 
+                    if (media.id in simklIds) score += 2.0 
+                    if (media.id in tmdbRecsIds) score += 1.0 
                     Pair(media, score)
-                }.sortedByDescending { it.second }.map { it.first }.take(50)
-
-                println("[StremioC v1.106-TRACKING] 🏆 최종 출력 확정: ${finalCombinedMedia.size}개의 최고 득점 추천작이 UI로 전송됩니다.")
+                }.sortedByDescending { it.second }.map { it.first }.take(50) 
 
                 fetchedRecommendations = finalCombinedMedia.mapNotNull { media ->
                     val recTitle = media.title ?: media.name ?: media.originalTitle ?: return@mapNotNull null
@@ -662,6 +651,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
             val episodeTmdbMeta = mutableMapOf<String, TmdbEpisode>()
             
+            // [검증 1] "other" 타입 예외 처리가 작동하는 부분 (정상 코드)
             if (stremioType == "other" && !isMovie && !targetVideos.isNullOrEmpty()) {
                 var requiredSeasons = targetVideos.mapNotNull { it.seasonNumber }.filter { it > 0 }.distinct()
                 if (requiredSeasons.isEmpty()) requiredSeasons = listOf(1)
@@ -981,11 +971,11 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 loadExtractor(externalUrl, subtitleCallback, callback)
             }
             if (infoHash != null) {
-                val otherTrackers = provider.getFormattedTrackers()
+                // [해결 3] 마그넷 주소 폭파(에러)를 막기 위해 거추장스러운 외부 트래커 캐싱/결합 로직 삭제
                 val sourceTrackers = sources.filter { it.startsWith("tracker:") }
                     .joinToString("") { "&tr=${it.removePrefix("tracker:")}" }
 
-                val magnet = "magnet:?xt=urn:btih:${infoHash}${sourceTrackers}${otherTrackers}"
+                val magnet = "magnet:?xt=urn:btih:${infoHash}${sourceTrackers}"
                 callback.invoke(newExtractorLink(name ?: "", title ?: name ?: "", magnet) {
                     this.quality = Qualities.Unknown.value
                 })
