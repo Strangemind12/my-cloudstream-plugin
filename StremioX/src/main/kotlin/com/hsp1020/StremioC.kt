@@ -1,4 +1,4 @@
-// v1.107 (Implemented LRU Cache & Removed Bloated Torrent Trackers)
+// v1.108 (Restored Language & Country Dual-Check for +10 Bonus Score)
 package com.hsp1020
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -67,7 +67,6 @@ private fun String.cleanBaseUrl(): String {
     return this.substringBefore("?").replace("/manifest.json", "").trimEnd('/')
 }
 
-// [해결 2] OOM 방지를 위한 LRU(최근 최소 사용) Set 구현체 추가
 private inline fun <T> lruSet(maxSize: Int): MutableSet<T> {
     return Collections.newSetFromMap(object : java.util.LinkedHashMap<T, Boolean>(maxSize, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<T, Boolean>): Boolean {
@@ -84,7 +83,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     private var lastManifestUrl: String = ""
     private var lastCacheTime: Long = 0
     
-    // [해결 2] 무한 스크롤 메모리 방어: 내부 Set을 LRU 기반으로 래핑하여 생성
     private val catalogSentIds = ConcurrentHashMap<String, MutableSet<String>>()
     private val pageContentCache = ConcurrentHashMap<String, List<SearchResponse>>()
     private val catalogSkipState = ConcurrentHashMap<String, Int>()
@@ -93,7 +91,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     private val activePageRequests = mutableMapOf<Int, Deferred<HomePageResponse>>()
     
     val customSession by lazy {
-        println("[StremioC v1.107-TRACKING] 커스텀 OkHttp 세션 초기화")
+        println("[StremioC v1.108-TRACKING] 커스텀 OkHttp 세션 초기화")
         val newClient = app.baseClient.newBuilder()
             .protocols(listOf(Protocol.HTTP_1_1))
             .dispatcher(Dispatcher().apply {
@@ -115,8 +113,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         private const val TRANSPARENT_PIXEL = "https://upload.wikimedia.org/wikipedia/commons/c/ca/1x1.png"
         private const val TRAKT_CLIENT_ID = "6d8668915ed1953f5023ea090e206facc6261813243f567dea15a9a678783b6d" 
         private const val SIMKL_CLIENT_ID = "f392628a1235f474859905f5453239c57715d9a197a89bd71cac975ddd9c4d39" 
-        
-        // [해결 3] trackers_best.txt 다운로드 및 캐시 변수 완전 삭제 (파싱 에러 방지)
     }
 
     private fun buildStremioId(type: String?, id: String?, season: Int?, episode: Int?): String? {
@@ -241,7 +237,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             freshRow
                         }
                         
-                        // [해결 2] LRU Set 적용: 한 카탈로그당 최대 500개 아이템만 기록하여 무한 스크롤 OOM 완벽 방지
                         val seenForThisCatalog = catalogSentIds.getOrPut(catalogKey) { 
                             Collections.synchronizedSet(lruSet<String>(500))
                         }
@@ -490,9 +485,14 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 return FetchedTmdbData(null, null, null, emptyList(), null, null, null, null, null, null, emptyMap())
             }
 
+            // [해결] 언어 및 국가 이중 검증 로직 복구 완료 (original_language 추가 검사)
             val targetCountry = detailRes.origin_country?.firstOrNull()
+            val targetLanguage = detailRes.original_language
             val isSameOrigin: (TmdbMedia?) -> Boolean = { media -> 
-                media != null && (targetCountry != null && media.origin_country?.contains(targetCountry) == true) 
+                media != null && (
+                    (targetCountry != null && media.origin_country?.contains(targetCountry) == true) ||
+                    (targetLanguage != null && media.original_language == targetLanguage)
+                ) 
             }
 
             coroutineScope {
@@ -651,7 +651,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
             val episodeTmdbMeta = mutableMapOf<String, TmdbEpisode>()
             
-            // [검증 1] "other" 타입 예외 처리가 작동하는 부분 (정상 코드)
             if (stremioType == "other" && !isMovie && !targetVideos.isNullOrEmpty()) {
                 var requiredSeasons = targetVideos.mapNotNull { it.seasonNumber }.filter { it > 0 }.distinct()
                 if (requiredSeasons.isEmpty()) requiredSeasons = listOf(1)
@@ -971,12 +970,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 loadExtractor(externalUrl, subtitleCallback, callback)
             }
             if (infoHash != null) {
-                // [해결 3] 마그넷 주소 폭파(에러)를 막기 위해 거추장스러운 외부 트래커 캐싱/결합 로직 삭제
-                val sourceTrackers = sources.filter { it.startsWith("tracker:") }
-                    .joinToString("") { "&tr=${it.removePrefix("tracker:")}" }
-
-                val magnet = "magnet:?xt=urn:btih:${infoHash}${sourceTrackers}"
-                callback.invoke(newExtractorLink(name ?: "", title ?: name ?: "", magnet) {
+                callback.invoke(newExtractorLink(name ?: "", title ?: name ?: "", "magnet:?xt=urn:btih:${infoHash}") {
                     this.quality = Qualities.Unknown.value
                 })
             }
@@ -1038,7 +1032,8 @@ private data class TmdbDetailResponse(
             mediaType = mediaType,
             posterPath = this.posterPath,
             overview = this.overview,
-            origin_country = this.origin_country
+            origin_country = this.origin_country,
+            original_language = this.original_language
         )
     }
 }
@@ -1055,7 +1050,8 @@ private data class TmdbMedia(
     @JsonProperty("media_type") val mediaType: String? = null,
     @JsonProperty("poster_path") val posterPath: String? = null,
     @JsonProperty("overview") val overview: String? = null,
-    @JsonProperty("origin_country") val origin_country: List<String>? = null
+    @JsonProperty("origin_country") val origin_country: List<String>? = null,
+    @JsonProperty("original_language") val original_language: String? = null
 )
 
 private data class TmdbReleaseDates(@JsonProperty("results") val results: List<TmdbReleaseDateResult>?)
