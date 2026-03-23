@@ -110,7 +110,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
         private const val TRAKT_CLIENT_ID = "6d8668915ed1953f5023ea090e206facc6261813243f567dea15a9a678783b6d" 
         private const val SIMKL_CLIENT_ID = "f392628a1235f474859905f5453239c57715d9a197a89bd71cac975ddd9c4d39" 
-        private const val WATCHMODE_API_KEY = "EVsjusIqcAaRFUFiE0rofBcAgCBTFru2Jo9UNDC9"
     }
 
     private fun baseUrl(): String {
@@ -741,12 +740,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         @JsonProperty("tmdb") val tmdb: Int? = null
     )
 
-    private data class WatchmodeDetailResponse(
-        @JsonProperty("similar_titles") val similar_titles: List<Int>? = null,
-        @JsonProperty("tmdb_id") val tmdb_id: Int? = null,
-        @JsonProperty("imdb_id") val imdb_id: String? = null
-    )
-
     private data class CatalogEntry(
         @JsonProperty("name") val name: String,
         @JsonProperty("id") val id: String,
@@ -784,7 +777,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             finalImdbId: String?,
             traktDeferred: Deferred<List<Int>>,
             simklDeferred: Deferred<List<Int>>,
-            watchmodeDeferred: Deferred<List<Int>>,
             videos: List<Video>?
         ): FetchedTmdbData {
             var fetchedTitle: String? = null
@@ -863,34 +855,54 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                         }
                     }
 
+                    // v1.99: Watchmode 자리를 대체할 TMDB Similar(유사작) 병렬 호출 (최대 40개)
+                    val tmdbSimilarDeferred = (1..2).map { page ->
+                        async(Dispatchers.IO) {
+                            try {
+                                val simUrl = "$tmdbAPI/$tmdbMediaType/$tmdbIdStr/similar?api_key=$apiKey&language=ko-KR&page=$page"
+                                provider.customSession.get(simUrl, timeout = 15).parsedSafe<TmdbRecommendations>()?.results ?: emptyList()
+                            } catch (e: Exception) { emptyList<TmdbMedia>() }
+                        }
+                    }
+
                     val traktIds = traktDeferred.await()
                     val simklIds = simklDeferred.await()
-                    val watchmodeIds = watchmodeDeferred.await()
                     val collectionParts = collectionDeferred.await()
                     val allTmdbRecs = tmdbRecsDeferred.awaitAll().flatten().distinctBy { it.id }
+                    val allTmdbSimilar = tmdbSimilarDeferred.awaitAll().flatten().distinctBy { it.id }
 
-                    val existingTmdbIds = allTmdbRecs.mapNotNull { it.id }.toSet() + collectionParts.mapNotNull { it.id }.toSet()
-                    val missingIds = (traktIds + simklIds + watchmodeIds).distinct().filter { !existingTmdbIds.contains(it) }
+                    val existingTmdbIds = allTmdbRecs.mapNotNull { it.id }.toSet() + allTmdbSimilar.mapNotNull { it.id }.toSet() + collectionParts.mapNotNull { it.id }.toSet()
+                    val missingIds = (traktIds + simklIds).distinct().filter { !existingTmdbIds.contains(it) }
                     
                     val missingMediaDeferred = missingIds.map { missingId ->
                         async(Dispatchers.IO) {
                             try {
-                                val missingDetailUrl = "$tmdbAPI/$tmdbMediaType/$missingId?api_key=$apiKey&language=ko-KR"
-                                val res = withTimeoutOrNull(4000) { provider.customSession.get(missingDetailUrl, timeout = 15).parsedSafe<TmdbDetailResponse>() }
-                                res?.toTmdbMedia(tmdbMediaType)
+                                var currentType = tmdbMediaType
+                                var missingDetailUrl = "$tmdbAPI/$currentType/$missingId?api_key=$apiKey&language=ko-KR"
+                                var res = withTimeoutOrNull(4000) { provider.customSession.get(missingDetailUrl, timeout = 15).parsedSafe<TmdbDetailResponse>() }
+                                
+                                if (res == null || res.id == null) {
+                                    currentType = if (tmdbMediaType == "movie") "tv" else "movie"
+                                    val fallbackUrl = "$tmdbAPI/$currentType/$missingId?api_key=$apiKey&language=ko-KR"
+                                    res = withTimeoutOrNull(4000) { provider.customSession.get(fallbackUrl, timeout = 15).parsedSafe<TmdbDetailResponse>() }
+                                    if (res != null && res.id != null) {
+                                        println("[StremioC v1.99-TRACKING] 🔄 교차 추천 감지됨: ID $missingId ($tmdbMediaType -> $currentType) 재조회 성공")
+                                    }
+                                }
+                                res?.toTmdbMedia(currentType)
                             } catch(e:Exception) { null }
                         }
                     }
                     val fetchedMissingMedia = missingMediaDeferred.awaitAll().filterNotNull()
 
-                    val masterMediaMap = (collectionParts + allTmdbRecs + fetchedMissingMedia)
+                    val masterMediaMap = (collectionParts + allTmdbRecs + allTmdbSimilar + fetchedMissingMedia)
                         .filter { it.id != null && it.id != tmdbIdStr.toIntOrNull() }
                         .associateBy { it.id!! }
 
                     val setTrakt = traktIds.toSet()
                     val setSimkl = simklIds.toSet()
-                    val setWatchmode = watchmodeIds.toSet()
                     val setTmdbRecs = allTmdbRecs.mapNotNull { it.id }.toSet()
+                    val setTmdbSimilar = allTmdbSimilar.mapNotNull { it.id }.toSet()
 
                     val orderedIds = mutableListOf<Int>()
                     
@@ -905,7 +917,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                         }
                     }
 
-                    val allCandidateIds = (setTrakt + setSimkl + setWatchmode + setTmdbRecs)
+                    // 플랫폼 우선순위: Trakt > Simkl > TMDB 추천 > TMDB 유사 (140개 Pool 유지)
+                    val allCandidateIds = (setTrakt + setSimkl + setTmdbRecs + setTmdbSimilar)
                         .filter { it != tmdbIdStr.toIntOrNull() && !orderedIds.contains(it) }.toSet()
 
                     val tier1 = mutableListOf<Int>() 
@@ -934,30 +947,30 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                         
                         val inTrakt = id in setTrakt
                         val inSimkl = id in setSimkl
-                        val inWatchmode = id in setWatchmode
-                        val inTmdb = id in setTmdbRecs
+                        val inTmdbRecs = id in setTmdbRecs
+                        val inTmdbSimilar = id in setTmdbSimilar
                         val inSameCountry = isSameOrigin(media)
 
                         when {
-                            inTrakt && inSimkl && inWatchmode && inTmdb -> { tier1.add(id); println("[StremioC v1.99-TRACKING] 🥇 [1순위: 4관왕] '$mTitle' (ID: $id) -> 사유: Trakt & Simkl & Watchmode & TMDB") }
-                            inTrakt && inSimkl && inWatchmode -> { tier2.add(id); println("[StremioC v1.99-TRACKING] 🥈 [2순위: 3관왕A] '$mTitle' (ID: $id) -> 사유: Trakt & Simkl & Watchmode") }
-                            inTrakt && inSimkl && inTmdb -> { tier3.add(id); println("[StremioC v1.99-TRACKING] 🥈 [3순위: 3관왕B] '$mTitle' (ID: $id) -> 사유: Trakt & Simkl & TMDB") }
-                            inTrakt && inWatchmode && inTmdb -> { tier4.add(id); println("[StremioC v1.99-TRACKING] 🥈 [4순위: 3관왕C] '$mTitle' (ID: $id) -> 사유: Trakt & Watchmode & TMDB") }
-                            inSimkl && inWatchmode && inTmdb -> { tier5.add(id); println("[StremioC v1.99-TRACKING] 🥈 [5순위: 3관왕D] '$mTitle' (ID: $id) -> 사유: Simkl & Watchmode & TMDB") }
+                            inTrakt && inSimkl && inTmdbRecs && inTmdbSimilar -> { tier1.add(id); println("[StremioC v1.99-TRACKING] 🥇 [1순위: 4관왕] '$mTitle' (ID: $id) -> 사유: Trakt & Simkl & TMDB추천 & TMDB유사") }
+                            inTrakt && inSimkl && inTmdbRecs -> { tier2.add(id); println("[StremioC v1.99-TRACKING] 🥈 [2순위: 3관왕A] '$mTitle' (ID: $id) -> 사유: Trakt & Simkl & TMDB추천") }
+                            inTrakt && inSimkl && inTmdbSimilar -> { tier3.add(id); println("[StremioC v1.99-TRACKING] 🥈 [3순위: 3관왕B] '$mTitle' (ID: $id) -> 사유: Trakt & Simkl & TMDB유사") }
+                            inTrakt && inTmdbRecs && inTmdbSimilar -> { tier4.add(id); println("[StremioC v1.99-TRACKING] 🥈 [4순위: 3관왕C] '$mTitle' (ID: $id) -> 사유: Trakt & TMDB추천 & TMDB유사") }
+                            inSimkl && inTmdbRecs && inTmdbSimilar -> { tier5.add(id); println("[StremioC v1.99-TRACKING] 🥈 [5순위: 3관왕D] '$mTitle' (ID: $id) -> 사유: Simkl & TMDB추천 & TMDB유사") }
                             inTrakt && inSimkl -> { tier6.add(id); println("[StremioC v1.99-TRACKING] 🥉 [6순위: 2관왕A] '$mTitle' (ID: $id) -> 사유: Trakt & Simkl") }
-                            inTrakt && inWatchmode -> { tier7.add(id); println("[StremioC v1.99-TRACKING] 🥉 [7순위: 2관왕B] '$mTitle' (ID: $id) -> 사유: Trakt & Watchmode") }
-                            inSimkl && inWatchmode -> { tier8.add(id); println("[StremioC v1.99-TRACKING] 🥉 [8순위: 2관왕C] '$mTitle' (ID: $id) -> 사유: Simkl & Watchmode") }
-                            inTrakt && inTmdb -> { tier9.add(id); println("[StremioC v1.99-TRACKING] 🥉 [9순위: 2관왕D] '$mTitle' (ID: $id) -> 사유: Trakt & TMDB") }
-                            inSimkl && inTmdb -> { tier10.add(id); println("[StremioC v1.99-TRACKING] 🥉 [10순위: 2관왕E] '$mTitle' (ID: $id) -> 사유: Simkl & TMDB") }
-                            inWatchmode && inTmdb -> { tier11.add(id); println("[StremioC v1.99-TRACKING] 🥉 [11순위: 2관왕F] '$mTitle' (ID: $id) -> 사유: Watchmode & TMDB") }
+                            inTrakt && inTmdbRecs -> { tier7.add(id); println("[StremioC v1.99-TRACKING] 🥉 [7순위: 2관왕B] '$mTitle' (ID: $id) -> 사유: Trakt & TMDB추천") }
+                            inSimkl && inTmdbRecs -> { tier8.add(id); println("[StremioC v1.99-TRACKING] 🥉 [8순위: 2관왕C] '$mTitle' (ID: $id) -> 사유: Simkl & TMDB추천") }
+                            inTrakt && inTmdbSimilar -> { tier9.add(id); println("[StremioC v1.99-TRACKING] 🥉 [9순위: 2관왕D] '$mTitle' (ID: $id) -> 사유: Trakt & TMDB유사") }
+                            inSimkl && inTmdbSimilar -> { tier10.add(id); println("[StremioC v1.99-TRACKING] 🥉 [10순위: 2관왕E] '$mTitle' (ID: $id) -> 사유: Simkl & TMDB유사") }
+                            inTmdbRecs && inTmdbSimilar -> { tier11.add(id); println("[StremioC v1.99-TRACKING] 🥉 [11순위: 2관왕F] '$mTitle' (ID: $id) -> 사유: TMDB추천 & TMDB유사") }
                             inTrakt && inSameCountry -> { tier12.add(id); println("[StremioC v1.99-TRACKING] 🏅 [12순위: Trakt/동일국가] '$mTitle' (ID: $id) -> 사유: Trakt 단독 + 국가 일치") }
                             inSimkl && inSameCountry -> { tier13.add(id); println("[StremioC v1.99-TRACKING] 🏅 [13순위: Simkl/동일국가] '$mTitle' (ID: $id) -> 사유: Simkl 단독 + 국가 일치") }
-                            inWatchmode && inSameCountry -> { tier14.add(id); println("[StremioC v1.99-TRACKING] 🏅 [14순위: Watchmode/동일국가] '$mTitle' (ID: $id) -> 사유: Watchmode 단독 + 국가 일치") }
-                            inTmdb && inSameCountry -> { tier15.add(id); println("[StremioC v1.99-TRACKING] 🏅 [15순위: TMDB/동일국가] '$mTitle' (ID: $id) -> 사유: TMDB 단독 + 국가 일치") }
+                            inTmdbRecs && inSameCountry -> { tier14.add(id); println("[StremioC v1.99-TRACKING] 🏅 [14순위: TMDB추천/동일국가] '$mTitle' (ID: $id) -> 사유: TMDB추천 단독 + 국가 일치") }
+                            inTmdbSimilar && inSameCountry -> { tier15.add(id); println("[StremioC v1.99-TRACKING] 🏅 [15순위: TMDB유사/동일국가] '$mTitle' (ID: $id) -> 사유: TMDB유사 단독 + 국가 일치") }
                             inTrakt && !inSameCountry -> { tier16.add(id); println("[StremioC v1.99-TRACKING] 🎖️ [16순위: Trakt/타국가] '$mTitle' (ID: $id) -> 사유: Trakt 단독 + 국가 불일치") }
                             inSimkl && !inSameCountry -> { tier17.add(id); println("[StremioC v1.99-TRACKING] 🎖️ [17순위: Simkl/타국가] '$mTitle' (ID: $id) -> 사유: Simkl 단독 + 국가 불일치") }
-                            inWatchmode && !inSameCountry -> { tier18.add(id); println("[StremioC v1.99-TRACKING] 🎖️ [18순위: Watchmode/타국가] '$mTitle' (ID: $id) -> 사유: Watchmode 단독 + 국가 불일치") }
-                            inTmdb && !inSameCountry -> { tier19.add(id); println("[StremioC v1.99-TRACKING] 🎖️ [19순위: TMDB/타국가] '$mTitle' (ID: $id) -> 사유: TMDB 단독 + 국가 불일치") }
+                            inTmdbRecs && !inSameCountry -> { tier18.add(id); println("[StremioC v1.99-TRACKING] 🎖️ [18순위: TMDB추천/타국가] '$mTitle' (ID: $id) -> 사유: TMDB추천 단독 + 국가 불일치") }
+                            inTmdbSimilar && !inSameCountry -> { tier19.add(id); println("[StremioC v1.99-TRACKING] 🎖️ [19순위: TMDB유사/타국가] '$mTitle' (ID: $id) -> 사유: TMDB유사 단독 + 국가 불일치") }
                         }
                     }
 
@@ -1273,43 +1286,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 } catch(e: Exception) { emptyList<Int>() }
             }
 
-            val watchmodeDeferred = async(Dispatchers.IO) {
-                if (finalImdbId == null || WATCHMODE_API_KEY.isEmpty()) return@async emptyList<Int>()
-                val detailUrl = "https://api.watchmode.com/v1/title/$finalImdbId/details/?apiKey=$WATCHMODE_API_KEY"
-                try {
-                    val resText = withTimeoutOrNull(4000) {
-                        val req = provider.customSession.get(detailUrl, timeout = 15)
-                        if (req.isSuccessful) req.text else null
-                    }
-                    if (resText != null) {
-                        val res = try { parseJson<WatchmodeDetailResponse>(resText) } catch (e: Exception) { null }
-                        val similarIds = res?.similar_titles ?: emptyList()
-                        if (similarIds.isNotEmpty()) {
-                            println("[StremioC v1.99-TRACKING] 🔎 Watchmode 유사작 ${similarIds.size}개 ID 확보. 상위 10개만 추출하여 1번의 병렬 통신으로 TMDB ID 조회를 시작합니다.")
-                            val tmdbIds = coroutineScope {
-                                similarIds.take(10).map { wmId ->
-                                    async(Dispatchers.IO) {
-                                        try {
-                                            val wmDetailUrl = "https://api.watchmode.com/v1/title/$wmId/details/?apiKey=$WATCHMODE_API_KEY"
-                                            val wmResText = withTimeoutOrNull(2500) {
-                                                val req = provider.customSession.get(wmDetailUrl, timeout = 10)
-                                                if (req.isSuccessful) req.text else null
-                                            }
-                                            if (wmResText != null) {
-                                                try { parseJson<WatchmodeDetailResponse>(wmResText).tmdb_id } catch (e: Exception) { null }
-                                            } else null
-                                        } catch (e: Exception) { null }
-                                    }
-                                }.awaitAll().filterNotNull().distinct()
-                            }
-                            tmdbIds
-                        } else emptyList()
-                    } else emptyList()
-                } catch(e: Exception) { emptyList() }
-            }
-
             val findApiDeferred = if (tmdbIdStr == null && finalImdbId?.startsWith("tt") == true) {
-                println("[StremioC v1.99-TRACKING] ⚠️ TMDB ID 누락. Find API 비동기 조회를 시작합니다 (Trakt/Simkl/Watchmode와 동시 실행).")
+                println("[StremioC v1.99-TRACKING] ⚠️ TMDB ID 누락. Find API 비동기 조회를 시작합니다 (Trakt/Simkl과 동시 실행).")
                 async(Dispatchers.IO) {
                     try {
                         val findUrl = "$tmdbAPI/find/$finalImdbId?api_key=$apiKey&external_source=imdb_id&language=ko-KR"
@@ -1356,7 +1334,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     
                     val refinedMediaType = if (isSingleMovieVideo || finalType == "movie" || finalVideos.isNullOrEmpty()) "movie" else "tv"
 
-                    tmdbData = fetchTmdbDetails(provider, refinedMediaType, tmdbIdStr!!, refinedMediaType == "movie", finalImdbId, traktDeferred, simklDeferred, watchmodeDeferred, finalVideos)
+                    tmdbData = fetchTmdbDetails(provider, refinedMediaType, tmdbIdStr!!, refinedMediaType == "movie", finalImdbId, traktDeferred, simklDeferred, finalVideos)
                 } catch (e: Exception) {
                     println("[StremioC v1.99-TRACKING] ❌ [toLoadResponse] TMDB 세부 메타데이터 추출/통신 중 에러 발생: ${e.message}")
                 }
