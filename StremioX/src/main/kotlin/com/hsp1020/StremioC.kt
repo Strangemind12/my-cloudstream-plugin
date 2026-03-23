@@ -1,4 +1,4 @@
-// v1.104 (Fixed Trakt/Simkl Recs & Other Episode Fetching)
+// v1.105 (Fixed Trakt/Simkl Recs & Master Scoring System)
 package com.hsp1020
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -50,6 +50,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.ConnectionPool
 import okhttp3.Dispatcher
 import okhttp3.Protocol
@@ -485,17 +486,15 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         }
 
         private suspend fun fetchTmdbDetails(
-            provider: StremioC, tmdbMediaType: String, tmdbIdStr: String, isMovie: Boolean,
-            traktDeferred: Deferred<List<Int>>, simklDeferred: Deferred<List<Int>>, 
+            provider: StremioC, tmdbMediaType: String, tmdbIdStr: String, isMovie: Boolean, finalImdbId: String?,
             stremioType: String?, targetVideos: List<Video>?
         ): FetchedTmdbData {
             var fetchedRecommendations: List<SearchResponse>? = null
             
-            val detailAppend = if (isMovie) "release_dates,credits,images,videos,recommendations" else "content_ratings,credits,images,videos,recommendations"
+            val detailAppend = if (isMovie) "release_dates,credits,images,videos" else "content_ratings,credits,images,videos"
             val detailUrl = "$tmdbAPI/$tmdbMediaType/$tmdbIdStr?api_key=$apiKey&language=ko-KR&append_to_response=$detailAppend&include_image_language=ko"
             
             val detailRes = provider.customSession.get(detailUrl).parsedSafe<TmdbDetailResponse>()
-            
             if (detailRes == null) {
                 return FetchedTmdbData(null, null, null, emptyList(), null, null, null, null, null, null, emptyMap())
             }
@@ -506,6 +505,53 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             }
 
             coroutineScope {
+                // [해결 1] 미디어 타입 오판 방지: 정제된 tmdbMediaType을 인자로 받아 내부에서 Trakt/Simkl 호출!
+                val traktDeferred = async(Dispatchers.IO) {
+                    if (finalImdbId == null || TRAKT_CLIENT_ID.isEmpty()) return@async emptyList<Int>()
+                    val traktMediaType = if (tmdbMediaType == "movie") "movies" else "shows"
+                    try {
+                        val req = provider.customSession.get("https://api.trakt.tv/$traktMediaType/$finalImdbId/related?limit=30", headers = mapOf("Content-Type" to "application/json", "trakt-api-version" to "2", "trakt-api-key" to TRAKT_CLIENT_ID), timeout = 15)
+                        if (req.isSuccessful) parseJson<List<TraktMedia>>(req.text).mapNotNull { it.ids?.tmdb } else emptyList()
+                    } catch(e: Exception) { emptyList() }
+                }
+
+                val simklDeferred = async(Dispatchers.IO) {
+                    if (finalImdbId == null || SIMKL_CLIENT_ID.isEmpty()) return@async emptyList<Int>()
+                    val simklMediaType = if (tmdbMediaType == "movie") "movies" else "tv"
+                    try {
+                        val req = provider.customSession.get("https://api.simkl.com/$simklMediaType/$finalImdbId?extended=full&client_id=$SIMKL_CLIENT_ID", timeout = 15)
+                        val res = if (req.isSuccessful) parseJson<SimklResponse>(req.text) else null
+                        val rawSimklRecs = res?.users_recommendations?.take(30) ?: emptyList()
+                        coroutineScope {
+                            rawSimklRecs.map { rec ->
+                                async(Dispatchers.IO) {
+                                    val existingTmdbId = rec.ids?.tmdb
+                                    if (existingTmdbId != null) existingTmdbId
+                                    else {
+                                        val simklId = rec.ids?.simkl
+                                        if (simklId != null) {
+                                            try {
+                                                val dReq = provider.customSession.get("https://api.simkl.com/$simklMediaType/$simklId?client_id=$SIMKL_CLIENT_ID", timeout = 15)
+                                                if (dReq.isSuccessful) parseJson<SimklDetailResponse>(dReq.text).ids?.tmdb else null
+                                            } catch(e: Exception) { null }
+                                        } else null
+                                    }
+                                }
+                            }.awaitAll().filterNotNull()
+                        }
+                    } catch(e: Exception) { emptyList() }
+                }
+
+                // [해결 3] TMDB 40개 보장: append_to_response(20개 한도)를 쓰지 않고 병렬 코루틴 2페이지(40개) 호출 부활
+                val tmdbRecsDeferred = (1..2).map { page ->
+                    async(Dispatchers.IO) {
+                        try {
+                            val recUrl = "$tmdbAPI/$tmdbMediaType/$tmdbIdStr/recommendations?api_key=$apiKey&language=ko-KR&page=$page"
+                            provider.customSession.get(recUrl, timeout = 15).parsedSafe<TmdbRecommendations>()?.results ?: emptyList()
+                        } catch (e: Exception) { emptyList<TmdbMedia>() }
+                    }
+                }
+
                 val collectionParts = if (isMovie && detailRes.belongs_to_collection?.id != null) {
                     try {
                         val colUrl = "$tmdbAPI/collection/${detailRes.belongs_to_collection.id}?api_key=$apiKey&language=ko-KR"
@@ -515,13 +561,14 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
                 val traktIds = traktDeferred.await().toSet()
                 val simklIds = simklDeferred.await().toSet()
-                val tmdbRecs = detailRes.recommendations?.results ?: emptyList()
+                val tmdbRecs = tmdbRecsDeferred.awaitAll().flatten().distinctBy { it.id }
+                val tmdbRecsIds = tmdbRecs.mapNotNull { it.id }.toSet()
 
-                val existingTmdbIds = collectionParts.mapNotNull { it.id }.toSet() + tmdbRecs.mapNotNull { it.id }.toSet()
+                val existingTmdbIds = collectionParts.mapNotNull { it.id }.toSet() + tmdbRecsIds
                 
-                //[해결 1] Trakt/Simkl 추천 목록에서 TMDB에 없는 데이터 병렬 조회 보강 (Timeout 래퍼 제거로 유실 완벽 차단)
+                // [해결 2] 강제 증발 방지: .take(20) 삭제. 60개의 Trakt/Simkl 미싱 ID를 병목 없이 전량 수집
                 val missingIds = (traktIds + simklIds).distinct()
-                    .filter { !existingTmdbIds.contains(it) && it != tmdbIdStr.toIntOrNull() }.take(20)
+                    .filter { !existingTmdbIds.contains(it) && it != tmdbIdStr.toIntOrNull() }
 
                 val missingMediaDeferred = missingIds.map { missingId ->
                     async(Dispatchers.IO) {
@@ -542,14 +589,16 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 val allCandidates = (collectionParts + tmdbRecs + fetchedMissingMedia).distinctBy { it.id }
                     .filter { it.id != null && it.id != tmdbIdStr.toIntOrNull() }
                 
+                // 천재적인 마스터 스코어링 시스템 (오차 없는 수학적 10티어 + 컬렉션 강제 고정)
                 val finalCombinedMedia = allCandidates.map { media ->
-                    var score = 1.0 
-                    if (media.id in traktIds) score += 4.0 
-                    if (media.id in simklIds) score += 2.0 
-                    if (isSameOrigin(media)) score += 5.0 
-                    if (collectionParts.any { it.id == media.id }) score += 10.0 
+                    var score = 0.0 
+                    if (collectionParts.any { it.id == media.id }) score += 1000.0 // [0순위] 컬렉션 (무조건 1빠따)
+                    if (isSameOrigin(media)) score += 10.0 // [동일 국가 보너스]
+                    if (media.id in traktIds) score += 4.0 // [Trakt]
+                    if (media.id in simklIds) score += 2.0 // [Simkl]
+                    if (media.id in tmdbRecsIds) score += 1.0 // [TMDB 추천]
                     Pair(media, score)
-                }.sortedByDescending { it.second }.map { it.first }.take(40)
+                }.sortedByDescending { it.second }.map { it.first }.take(50) // 100 Pool 중 최상위 50개 쾌속 컷오프
 
                 fetchedRecommendations = finalCombinedMedia.mapNotNull { media ->
                     val recTitle = media.title ?: media.name ?: media.originalTitle ?: return@mapNotNull null
@@ -598,10 +647,9 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
             val episodeTmdbMeta = mutableMapOf<String, TmdbEpisode>()
             
-            // [해결 2] other 타입일 때만 예외적으로 TMDB 시즌 정보 통신 복구
             if (stremioType == "other" && !isMovie && !targetVideos.isNullOrEmpty()) {
                 var requiredSeasons = targetVideos.mapNotNull { it.seasonNumber }.filter { it > 0 }.distinct()
-                if (requiredSeasons.isEmpty()) requiredSeasons = listOf(1) // 시즌이 없는 경우 Fallback
+                if (requiredSeasons.isEmpty()) requiredSeasons = listOf(1)
                 
                 if (requiredSeasons.isNotEmpty()) {
                     coroutineScope {
@@ -702,45 +750,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 } catch (e: Exception) {}
             }
 
-            val tmdbMediaType = if (this@CatalogEntry.type == "movie") "movie" else "tv"
-
-            val traktDeferred = async(Dispatchers.IO) {
-                if (finalImdbId == null || TRAKT_CLIENT_ID.isEmpty()) return@async emptyList<Int>()
-                val traktMediaType = if (tmdbMediaType == "movie") "movies" else "shows"
-                try {
-                    val req = provider.customSession.get("https://api.trakt.tv/$traktMediaType/$finalImdbId/related?limit=30", headers = mapOf("Content-Type" to "application/json", "trakt-api-version" to "2", "trakt-api-key" to TRAKT_CLIENT_ID), timeout = 15)
-                    if (req.isSuccessful) parseJson<List<TraktMedia>>(req.text).mapNotNull { it.ids?.tmdb } else emptyList()
-                } catch(e: Exception) { emptyList() }
-            }
-
-            val simklDeferred = async(Dispatchers.IO) {
-                if (finalImdbId == null || SIMKL_CLIENT_ID.isEmpty()) return@async emptyList<Int>()
-                val simklMediaType = if (tmdbMediaType == "movie") "movies" else "tv"
-                try {
-                    val req = provider.customSession.get("https://api.simkl.com/$simklMediaType/$finalImdbId?extended=full&client_id=$SIMKL_CLIENT_ID", timeout = 15)
-                    val res = if (req.isSuccessful) parseJson<SimklResponse>(req.text) else null
-                    
-                    val rawSimklRecs = res?.users_recommendations?.take(30) ?: emptyList()
-                    coroutineScope {
-                        rawSimklRecs.map { rec ->
-                            async(Dispatchers.IO) {
-                                val existingTmdbId = rec.ids?.tmdb
-                                if (existingTmdbId != null) existingTmdbId
-                                else {
-                                    val simklId = rec.ids?.simkl
-                                    if (simklId != null) {
-                                        try {
-                                            val dReq = provider.customSession.get("https://api.simkl.com/$simklMediaType/$simklId?client_id=$SIMKL_CLIENT_ID", timeout = 15)
-                                            if (dReq.isSuccessful) parseJson<SimklDetailResponse>(dReq.text).ids?.tmdb else null
-                                        } catch(e: Exception) { null }
-                                    } else null
-                                }
-                            }
-                        }.awaitAll().filterNotNull()
-                    }
-                } catch(e: Exception) { emptyList() }
-            }
-
             var tmdbIdStr: String? = if (this@CatalogEntry.id.startsWith("tmdb:")) this@CatalogEntry.id.removePrefix("tmdb:") else this@CatalogEntry.moviedb_id?.toString()
             val findApiDeferred = if (tmdbIdStr == null && finalImdbId?.startsWith("tt") == true) {
                 async(Dispatchers.IO) {
@@ -781,7 +790,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             (finalVideos?.size == 1 && (finalVideos[0].seasonNumber ?: 0) == 0 && (finalVideos[0].episode ?: finalVideos[0].number ?: 0) == 0)
                     
                     val refinedMediaType = if (isSingleMovieVideo || finalType == "movie" || finalVideos.isNullOrEmpty()) "movie" else "tv"
-                    tmdbData = fetchTmdbDetails(provider, refinedMediaType, tmdbIdStr, refinedMediaType == "movie", traktDeferred, simklDeferred, finalType, finalVideos)
+                    tmdbData = fetchTmdbDetails(provider, refinedMediaType, tmdbIdStr, refinedMediaType == "movie", finalImdbId, finalType, finalVideos)
                 } catch (e: Exception) {}
             }
 
@@ -896,19 +905,14 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     rawTitle.replace("\n", "").trim()
                 }
                 
-                // [해결 2] displaySeason/Episode 값을 바탕으로 가장 정확하게 에피소드 데이터 매핑 (시즌이 0이거나 없는 fallback 대응)
                 val tmdbEp = tmdbMetaMap["${displaySeason}_${displayEpisode}"] 
                              ?: tmdbMetaMap["${seasonNumber ?: 0}_${episode ?: number ?: 0}"]
                 
-                // 에피소드 제목 로직: TMDB 제목이 있으면 우선 적용, 없으면 원본 파일 제목
                 this.name = if (tmdbEp?.name != null) tmdbEp.name else cleanOriginalTitle
-                
                 this.posterUrl = thumbnail ?: TRANSPARENT_PIXEL
                 
-                // 에피소드 설명 로직
                 var finalEpDesc = provider.mergeOverview(this@Video.overview ?: this@Video.description, tmdbEp?.overview)
                 
-                //[해결 2] other 타입이면 무조건 설명 끝에 파일제목 병합
                 if (type == "other") {
                     finalEpDesc = if (finalEpDesc.isNullOrBlank()) {
                         cleanOriginalTitle
@@ -1034,17 +1038,9 @@ private data class TmdbDetailResponse(
     }
 }
 
-private data class TmdbImages(
-    @JsonProperty("logos") val logos: List<TmdbLogo>? = null
-)
-
-private data class TmdbLogo(
-    @JsonProperty("file_path") val file_path: String? = null
-)
-
-private data class TmdbRecommendations(
-    @JsonProperty("results") val results: List<TmdbMedia>? = null
-)
+private data class TmdbImages(@JsonProperty("logos") val logos: List<TmdbLogo>? = null)
+private data class TmdbLogo(@JsonProperty("file_path") val file_path: String? = null)
+private data class TmdbRecommendations(@JsonProperty("results") val results: List<TmdbMedia>? = null)
 
 private data class TmdbMedia(
     @JsonProperty("id") val id: Int? = null,
@@ -1054,8 +1050,7 @@ private data class TmdbMedia(
     @JsonProperty("media_type") val mediaType: String? = null,
     @JsonProperty("poster_path") val posterPath: String? = null,
     @JsonProperty("overview") val overview: String? = null,
-    @JsonProperty("origin_country") val origin_country: List<String>? = null,
-    @JsonProperty("original_language") val original_language: String? = null
+    @JsonProperty("origin_country") val origin_country: List<String>? = null
 )
 
 private data class TmdbReleaseDates(@JsonProperty("results") val results: List<TmdbReleaseDateResult>?)
@@ -1064,45 +1059,13 @@ private data class TmdbReleaseDate(@JsonProperty("certification") val certificat
 private data class TmdbContentRatings(@JsonProperty("results") val results: List<TmdbContentRatingResult>?)
 private data class TmdbContentRatingResult(@JsonProperty("iso_3166_1") val iso_3166_1: String?, @JsonProperty("rating") val rating: String?)
 
-private data class TmdbCredits(
-    @JsonProperty("cast") val cast: List<TmdbCast>? = null,
-    @JsonProperty("crew") val crew: List<TmdbCrew>? = null
-)
-private data class TmdbCast(
-    @JsonProperty("name") val name: String?,
-    @JsonProperty("original_name") val originalName: String?,
-    @JsonProperty("character") val character: String?,
-    @JsonProperty("profile_path") val profilePath: String?
-)
-private data class TmdbCrew(
-    @JsonProperty("name") val name: String?,
-    @JsonProperty("original_name") val originalName: String?,
-    @JsonProperty("job") val job: String?,
-    @JsonProperty("profile_path") val profilePath: String?
-)
+private data class TmdbCredits(@JsonProperty("cast") val cast: List<TmdbCast>? = null, @JsonProperty("crew") val crew: List<TmdbCrew>? = null)
+private data class TmdbCast(@JsonProperty("name") val name: String?, @JsonProperty("original_name") val originalName: String?, @JsonProperty("character") val character: String?, @JsonProperty("profile_path") val profilePath: String?)
+private data class TmdbCrew(@JsonProperty("name") val name: String?, @JsonProperty("original_name") val originalName: String?, @JsonProperty("job") val job: String?, @JsonProperty("profile_path") val profilePath: String?)
 
 private data class TmdbSeasonDetail(@JsonProperty("episodes") val episodes: List<TmdbEpisode>? = null)
+private data class TmdbEpisode(@JsonProperty("name") val name: String?, @JsonProperty("overview") val overview: String?, @JsonProperty("episode_number") val episodeNumber: Int?, @JsonProperty("air_date") val airDate: String?, @JsonProperty("vote_average") val voteAverage: Double?, @JsonProperty("runtime") val runtime: Int?)
 
-private data class TmdbEpisode(
-    @JsonProperty("name") val name: String?,
-    @JsonProperty("overview") val overview: String?,
-    @JsonProperty("episode_number") val episodeNumber: Int?,
-    @JsonProperty("air_date") val airDate: String?,
-    @JsonProperty("vote_average") val voteAverage: Double?,
-    @JsonProperty("runtime") val runtime: Int?
-)
-
-data class Trailers(
-    @JsonProperty("key") val key: String? = null,
-    @JsonProperty("type") val type: String? = null, 
-    @JsonProperty("published_at") val publishedAt: String? = null
-)
-
-data class ResultsTrailer(
-    @JsonProperty("results") val results: ArrayList<Trailers>? = arrayListOf(),
-)
-
-data class ExternalIds(
-    @JsonProperty("imdb_id") val imdb_id: String? = null,
-    @JsonProperty("tvdb_id") val tvdb_id: String? = null,
-)
+data class Trailers(@JsonProperty("key") val key: String? = null, @JsonProperty("type") val type: String? = null, @JsonProperty("published_at") val publishedAt: String? = null)
+data class ResultsTrailer(@JsonProperty("results") val results: ArrayList<Trailers>? = arrayListOf())
+data class ExternalIds(@JsonProperty("imdb_id") val imdb_id: String? = null, @JsonProperty("tvdb_id") val tvdb_id: String? = null)
