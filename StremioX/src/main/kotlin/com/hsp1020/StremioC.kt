@@ -1,4 +1,4 @@
-// v1.103 (Fixed Trakt/Simkl Recommendations & 'other' type Episode fetching)
+// v1.104 (Fixed Trakt/Simkl Recs & Other Episode Fetching)
 package com.hsp1020
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -50,7 +50,6 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.ConnectionPool
 import okhttp3.Dispatcher
 import okhttp3.Protocol
@@ -518,23 +517,21 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 val simklIds = simklDeferred.await().toSet()
                 val tmdbRecs = detailRes.recommendations?.results ?: emptyList()
 
-                //[해결 1] 기존 TMDB 추천 및 컬렉션에 등록된 ID들 수집
                 val existingTmdbIds = collectionParts.mapNotNull { it.id }.toSet() + tmdbRecs.mapNotNull { it.id }.toSet()
                 
-                // [해결 1] Trakt/Simkl에서 추천받았지만 TMDB 추천 리스트에는 없는 누락된 ID 추출 (상위 20개 제한)
+                //[해결 1] Trakt/Simkl 추천 목록에서 TMDB에 없는 데이터 병렬 조회 보강 (Timeout 래퍼 제거로 유실 완벽 차단)
                 val missingIds = (traktIds + simklIds).distinct()
                     .filter { !existingTmdbIds.contains(it) && it != tmdbIdStr.toIntOrNull() }.take(20)
 
-                // [해결 1] 누락된 ID들에 대해 TMDB 기본 상세정보를 병렬(비동기)로 호출하여 보충
                 val missingMediaDeferred = missingIds.map { missingId ->
                     async(Dispatchers.IO) {
                         try {
                             var currentType = tmdbMediaType
-                            var res = withTimeoutOrNull(3000) { provider.customSession.get("$tmdbAPI/$currentType/$missingId?api_key=$apiKey&language=ko-KR", timeout = 10).parsedSafe<TmdbDetailResponse>() }
+                            var res = provider.customSession.get("$tmdbAPI/$currentType/$missingId?api_key=$apiKey&language=ko-KR", timeout = 10).parsedSafe<TmdbDetailResponse>()
                             
                             if (res?.id == null) {
                                 currentType = if (tmdbMediaType == "movie") "tv" else "movie"
-                                res = withTimeoutOrNull(3000) { provider.customSession.get("$tmdbAPI/$currentType/$missingId?api_key=$apiKey&language=ko-KR", timeout = 10).parsedSafe<TmdbDetailResponse>() }
+                                res = provider.customSession.get("$tmdbAPI/$currentType/$missingId?api_key=$apiKey&language=ko-KR", timeout = 10).parsedSafe<TmdbDetailResponse>()
                             }
                             res?.toTmdbMedia(currentType)
                         } catch(e:Exception) { null }
@@ -542,7 +539,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 }
                 val fetchedMissingMedia = missingMediaDeferred.awaitAll().filterNotNull()
 
-                // 모든 후보군 병합 (컬렉션 + TMDB 기본 추천 + Trakt/Simkl을 통해 보충된 추천)
                 val allCandidates = (collectionParts + tmdbRecs + fetchedMissingMedia).distinctBy { it.id }
                     .filter { it.id != null && it.id != tmdbIdStr.toIntOrNull() }
                 
@@ -600,10 +596,13 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 .sortedWith(compareBy({ if (it.type == "Trailer") 0 else 1 }, { it.publishedAt ?: "9999-12-31" }))
                 .mapNotNull { it.key }.map { "https://m.youtube.com/watch?v=$it" }
 
-            // [해결 2] stremio 메타 타입이 'other' 인 경우에만 예외적으로 TMDB 시즌 에피소드를 병렬 호출하여 보강
             val episodeTmdbMeta = mutableMapOf<String, TmdbEpisode>()
+            
+            // [해결 2] other 타입일 때만 예외적으로 TMDB 시즌 정보 통신 복구
             if (stremioType == "other" && !isMovie && !targetVideos.isNullOrEmpty()) {
-                val requiredSeasons = targetVideos.mapNotNull { it.seasonNumber }.distinct().filter { it > 0 }
+                var requiredSeasons = targetVideos.mapNotNull { it.seasonNumber }.filter { it > 0 }.distinct()
+                if (requiredSeasons.isEmpty()) requiredSeasons = listOf(1) // 시즌이 없는 경우 Fallback
+                
                 if (requiredSeasons.isNotEmpty()) {
                     coroutineScope {
                         requiredSeasons.map { seasonNum ->
@@ -709,11 +708,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 if (finalImdbId == null || TRAKT_CLIENT_ID.isEmpty()) return@async emptyList<Int>()
                 val traktMediaType = if (tmdbMediaType == "movie") "movies" else "shows"
                 try {
-                    val res = withTimeoutOrNull(4000) {
-                        val req = provider.customSession.get("https://api.trakt.tv/$traktMediaType/$finalImdbId/related?limit=30", headers = mapOf("Content-Type" to "application/json", "trakt-api-version" to "2", "trakt-api-key" to TRAKT_CLIENT_ID), timeout = 15)
-                        if (req.isSuccessful) parseJson<List<TraktMedia>>(req.text) else null
-                    }
-                    res?.mapNotNull { it.ids?.tmdb } ?: emptyList()
+                    val req = provider.customSession.get("https://api.trakt.tv/$traktMediaType/$finalImdbId/related?limit=30", headers = mapOf("Content-Type" to "application/json", "trakt-api-version" to "2", "trakt-api-key" to TRAKT_CLIENT_ID), timeout = 15)
+                    if (req.isSuccessful) parseJson<List<TraktMedia>>(req.text).mapNotNull { it.ids?.tmdb } else emptyList()
                 } catch(e: Exception) { emptyList() }
             }
 
@@ -721,10 +717,9 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 if (finalImdbId == null || SIMKL_CLIENT_ID.isEmpty()) return@async emptyList<Int>()
                 val simklMediaType = if (tmdbMediaType == "movie") "movies" else "tv"
                 try {
-                    val res = withTimeoutOrNull(4000) {
-                        val req = provider.customSession.get("https://api.simkl.com/$simklMediaType/$finalImdbId?extended=full&client_id=$SIMKL_CLIENT_ID", timeout = 15)
-                        if (req.isSuccessful) parseJson<SimklResponse>(req.text) else null
-                    }
+                    val req = provider.customSession.get("https://api.simkl.com/$simklMediaType/$finalImdbId?extended=full&client_id=$SIMKL_CLIENT_ID", timeout = 15)
+                    val res = if (req.isSuccessful) parseJson<SimklResponse>(req.text) else null
+                    
                     val rawSimklRecs = res?.users_recommendations?.take(30) ?: emptyList()
                     coroutineScope {
                         rawSimklRecs.map { rec ->
@@ -893,6 +888,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     ) {
         fun toEpisode(provider: StremioC, type: String?, imdbId: String?, tmdbMetaMap: Map<String, TmdbEpisode>, displaySeason: Int, displayEpisode: Int): Episode {
             return provider.newEpisode(LoadData(type, id, seasonNumber, episode ?: number, imdbId)) {
+                
                 val rawTitle = this@Video.name ?: this@Video.title ?: "Episode $displayEpisode"
                 val cleanOriginalTitle = if (rawTitle.contains("📄")) {
                     rawTitle.substringAfter("📄").replace("\n", "").trim()
@@ -900,21 +896,19 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     rawTitle.replace("\n", "").trim()
                 }
                 
-                val tmdbEp = tmdbMetaMap["${seasonNumber ?: 0}_${episode ?: number ?: 0}"]
+                // [해결 2] displaySeason/Episode 값을 바탕으로 가장 정확하게 에피소드 데이터 매핑 (시즌이 0이거나 없는 fallback 대응)
+                val tmdbEp = tmdbMetaMap["${displaySeason}_${displayEpisode}"] 
+                             ?: tmdbMetaMap["${seasonNumber ?: 0}_${episode ?: number ?: 0}"]
                 
-                this.name = if (tmdbEp?.name != null && type == "other") {
-                    if (tmdbEp.name != cleanOriginalTitle) "${tmdbEp.name} - $cleanOriginalTitle" else tmdbEp.name
-                } else if (tmdbEp?.name != null) {
-                    tmdbEp.name
-                } else {
-                    cleanOriginalTitle
-                }
+                // 에피소드 제목 로직: TMDB 제목이 있으면 우선 적용, 없으면 원본 파일 제목
+                this.name = if (tmdbEp?.name != null) tmdbEp.name else cleanOriginalTitle
                 
                 this.posterUrl = thumbnail ?: TRANSPARENT_PIXEL
                 
+                // 에피소드 설명 로직
                 var finalEpDesc = provider.mergeOverview(this@Video.overview ?: this@Video.description, tmdbEp?.overview)
                 
-                //[해결 2] type이 "other"인 경우, 에피소드 설명 끝에 " | 파일제목(cleanOriginalTitle)" 추가
+                //[해결 2] other 타입이면 무조건 설명 끝에 파일제목 병합
                 if (type == "other") {
                     finalEpDesc = if (finalEpDesc.isNullOrBlank()) {
                         cleanOriginalTitle
