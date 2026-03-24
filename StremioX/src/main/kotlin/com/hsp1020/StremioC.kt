@@ -759,7 +759,15 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 async(Dispatchers.IO) {
                     try {
                         val findRes = provider.customSession.get("$tmdbAPI/find/$finalImdbId?api_key=$apiKey&external_source=imdb_id&language=ko-KR").parsedSafe<TmdbFindResponse>()
-                        findRes?.movie_results?.firstOrNull()?.id?.toString() ?: findRes?.tv_results?.firstOrNull()?.id?.toString()
+                        val movieMatch = findRes?.movie_results?.firstOrNull()
+                        if (movieMatch?.id != null) {
+                            Pair(movieMatch.id.toString(), "movie")
+                        } else {
+                            val tvMatch = findRes?.tv_results?.firstOrNull()
+                            if (tvMatch?.id != null) {
+                                Pair(tvMatch.id.toString(), "tv")
+                            } else null
+                        }
                     } catch (e: Exception) { null }
                 }
             } else null
@@ -783,6 +791,15 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 finalImdbId = finalLinks.firstOrNull { it.category == "imdb" }?.url?.substringAfterLast("/")?.takeIf { it.startsWith("tt") }
             }
 
+            var foundMediaType: String? = null
+            if (findApiDeferred != null) {
+                val findResult = findApiDeferred.await()
+                if (findResult != null) {
+                    tmdbIdStr = findResult.first
+                    foundMediaType = findResult.second // Find API가 찾아낸 진짜 미디어 타입
+                }
+            }
+           
             if (findApiDeferred != null) {
                 tmdbIdStr = findApiDeferred.await()
             }
