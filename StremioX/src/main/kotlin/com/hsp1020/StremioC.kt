@@ -596,11 +596,11 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 
                 val finalCombinedMedia = allCandidates.map { media ->
                     var score = 0.0 
-                    if (collectionParts.any { it.id == media.id }) score += 1000.0 
-                    if (isSameOrigin(media)) score += 10.0 
-                    if (media.id in traktIds) score += 4.0 
-                    if (media.id in simklIds) score += 2.0 
-                    if (media.id in tmdbRecsIds) score += 1.0 
+                    if (collectionParts.any { it.id == media.id }) score += 10.0
+                    if (isSameOrigin(media)) score += 1.0
+                    if (media.id in traktIds) score += 2.5
+                    if (media.id in simklIds) score += 2.0
+                    if (media.id in tmdbRecsIds) score += 1.7
                     Pair(media, score)
                 }.sortedByDescending { it.second }.map { it.first }.take(50) 
 
