@@ -9,7 +9,7 @@ import java.net.URLDecoder
 import java.net.URLEncoder
 
 class KingkongTv : MainAPI() {
-    override var mainUrl = "https://holyindia.org"
+    override var mainUrl = "https://wcauditor.org"
     override var name = "KKTV"
     override val hasMainPage = true
     override var lang = "ko"
