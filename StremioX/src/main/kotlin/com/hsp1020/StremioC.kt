@@ -1,3 +1,4 @@
+// v1.110 (Ultimate: Pair Type Fallback, Stream ID Compat, Subtitle Label & Master Scoring)
 package com.hsp1020
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -90,6 +91,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     private val activePageRequests = mutableMapOf<Int, Deferred<HomePageResponse>>()
     
     val customSession by lazy {
+        println("[StremioC v1.110-TRACKING] 커스텀 OkHttp 세션 초기화")
         val newClient = app.baseClient.newBuilder()
             .protocols(listOf(Protocol.HTTP_1_1))
             .dispatcher(Dispatcher().apply {
@@ -305,8 +307,14 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val normalizedId = try { normalizeId(loadData.id) } catch (e: Exception) { loadData.id ?: "" }
         val encodedId = try { URLEncoder.encode(normalizedId, "UTF-8") } catch (e: Exception) { normalizedId }
         
+        // [수정] tmdb: 방어막 해제. tmdb: ID도 내부 imdbId가 있다면 무조건 변환되도록 강제
         val targetId = if (loadData.id != null && !(loadData.id.startsWith("tt") || loadData.id.startsWith("kitsu:"))) {
-            if (!loadData.imdbId.isNullOrBlank()) loadData.imdbId else loadData.id
+            if (!loadData.imdbId.isNullOrBlank()) {
+                println("[StremioC v1.110-TRACKING] 사설 ID 감지됨(${loadData.id}). 대체 탐색용 ID를 imdbId(${loadData.imdbId})로 보정합니다.")
+                loadData.imdbId
+            } else {
+                loadData.id
+            }
         } else {
             loadData.id
         }
@@ -329,7 +337,11 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             },
             { invokeWatchsomuch(loadData.imdbId, loadData.season, loadData.episode, subtitleCallback) },
             { invokeOpenSubs(loadData.imdbId, loadData.season, loadData.episode, subtitleCallback) },
-            { invokeStremioSubtitles(targetType, if (!loadData.imdbId.isNullOrBlank()) loadData.imdbId else targetId, loadData.season, loadData.episode, subtitleCallback) }
+            { 
+                val subtitleId = if (!loadData.imdbId.isNullOrBlank()) loadData.imdbId else targetId
+                println("[StremioC v1.110-TRACKING] 💬 자막 애드온 호출용 ID 설정: imdbId 우선 적용 -> $subtitleId")
+                invokeStremioSubtitles(targetType, subtitleId, loadData.season, loadData.episode, subtitleCallback) 
+            }
         )
         return true
     }
@@ -380,9 +392,10 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             val lang = sub.lang ?: sub.lang_code ?: "Unknown"
                             val fileUrl = sub.url
                             if (!fileUrl.isNullOrBlank()) {
+                                // [수정] Stremio 자막 전용 커스텀 라벨 강제 지정
                                 val baseLangName = SubtitleHelper.fromTagToEnglishLanguageName(lang) ?: lang
                                 val customLabel = "$baseLangName (Stremio)"
-                                subtitleCallback.invoke(newSubtitleFile(customLabel, fileUrl))                            
+                                subtitleCallback.invoke(newSubtitleFile(customLabel, fileUrl))
                             }
                         }
                     } catch (e: Exception) {}
@@ -485,7 +498,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 return FetchedTmdbData(null, null, null, emptyList(), null, null, null, null, null, null, emptyMap())
             }
 
-            // [해결] 언어 및 국가 이중 검증 로직 복구 완료 (original_language 추가 검사)
             val targetCountry = detailRes.origin_country?.firstOrNull()
             val targetLanguage = detailRes.original_language
             val isSameOrigin: (TmdbMedia?) -> Boolean = { media -> 
@@ -596,11 +608,11 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 
                 val finalCombinedMedia = allCandidates.map { media ->
                     var score = 0.0 
-                    if (collectionParts.any { it.id == media.id }) score += 10.0
-                    if (isSameOrigin(media)) score += 1.0
-                    if (media.id in traktIds) score += 2.5
-                    if (media.id in simklIds) score += 2.0
-                    if (media.id in tmdbRecsIds) score += 1.7
+                    if (collectionParts.any { it.id == media.id }) score += 1000.0 
+                    if (isSameOrigin(media)) score += 10.0 
+                    if (media.id in traktIds) score += 4.0 
+                    if (media.id in simklIds) score += 2.0 
+                    if (media.id in tmdbRecsIds) score += 1.0 
                     Pair(media, score)
                 }.sortedByDescending { it.second }.map { it.first }.take(50) 
 
@@ -755,6 +767,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             }
 
             var tmdbIdStr: String? = if (this@CatalogEntry.id.startsWith("tmdb:")) this@CatalogEntry.id.removePrefix("tmdb:") else this@CatalogEntry.moviedb_id?.toString()
+            
+            // [수정] Find API가 Pair(ID, MediaType)을 반환하도록 구조 개선
             val findApiDeferred = if (tmdbIdStr == null && finalImdbId?.startsWith("tt") == true) {
                 async(Dispatchers.IO) {
                     try {
@@ -796,12 +810,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 val findResult = findApiDeferred.await()
                 if (findResult != null) {
                     tmdbIdStr = findResult.first
-                    foundMediaType = findResult.second // Find API가 찾아낸 진짜 미디어 타입
+                    foundMediaType = findResult.second
                 }
-            }
-           
-            if (findApiDeferred != null) {
-                tmdbIdStr = findApiDeferred.await()
             }
 
             var tmdbData: FetchedTmdbData? = null
@@ -810,7 +820,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     val isSingleMovieVideo = (finalType == "movie" && finalVideos?.size == 1 && finalVideos[0].seasonNumber == 1 && (finalVideos[0].episode == 1 || finalVideos[0].number == 1)) ||
                             (finalVideos?.size == 1 && (finalVideos[0].seasonNumber ?: 0) == 0 && (finalVideos[0].episode ?: finalVideos[0].number ?: 0) == 0)
                     
-                    val refinedMediaType = if (isSingleMovieVideo || finalType == "movie" || finalVideos.isNullOrEmpty()) "movie" else "tv"
+                    // [수정] foundMediaType이 존재하면 추측 로직을 덮어씌움
+                    val refinedMediaType = foundMediaType ?: if (isSingleMovieVideo || finalType == "movie" || finalVideos.isNullOrEmpty()) "movie" else "tv"
                     tmdbData = fetchTmdbDetails(provider, refinedMediaType, tmdbIdStr, refinedMediaType == "movie", finalImdbId, finalType, finalVideos)
                 } catch (e: Exception) {}
             }
