@@ -1,4 +1,4 @@
-// v1.111 (Ultimate Optimization: 1-Call TMDB, Pair Type Fallback & Precise Master Scoring)
+// v1.113 (Ultimate Parallel Optimization: 1-Call TMDB, Parallel Kitsu ID Mapping, Pair Type Fallback & Precise Master Scoring)
 package com.hsp1020
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -91,7 +91,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     private val activePageRequests = mutableMapOf<Int, Deferred<HomePageResponse>>()
     
     val customSession by lazy {
-        println("[StremioC v1.111-TRACKING] 커스텀 OkHttp 세션 초기화")
+        println("[StremioC v1.113-TRACKING] 커스텀 OkHttp 세션 초기화")
         val newClient = app.baseClient.newBuilder()
             .protocols(listOf(Protocol.HTTP_1_1))
             .dispatcher(Dispatcher().apply {
@@ -275,22 +275,22 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             parseJson<CatalogResponse>(responseText).meta ?: parseJson(JSONObject(responseText).getJSONObject("meta").toString())
         }
         
-        // 1. Stremio 애드온 메타데이터 호출 (TMDB 번역을 기다리지 않고 원본 ID로 즉시 출발!)
+        // 1. Stremio Addon 메타데이터 병렬 호출 (화면 꾸미기용 거대 JSON)
         val encodedId = try { URLEncoder.encode(try { normalizeId(res.id) } catch (e: Exception) { res.id }, "UTF-8") } catch (e: Exception) { res.id }
         val addonDeferred = async(Dispatchers.IO) {
             try {
-                println("[StremioC v1.112-TRACKING] ⚡ Stremio Addon 메타데이터 병렬 호출 시작 (원본 ID: ${res.id})")
+                println("[StremioC v1.113-TRACKING] ⚡ Stremio Addon 메타데이터 병렬 호출 시작 (원본 ID: ${res.id})")
                 val response = customSession.get(buildUrl("/meta/${res.type}/$encodedId.json")).parsedSafe<CatalogResponse>()
                 response?.meta ?: response?.metas?.firstOrNull { it.id == res.id } ?: response?.metas?.firstOrNull()
             } catch (e: Exception) { null }
         }
 
-        // 2. TMDB 디테일 통합 호출 및 ID 번역 (동시 출발!)
+        // 2. TMDB 디테일 병렬 호출 (TMDB ID일 경우)
         val tmdbDeferred = if (res.id.startsWith("tmdb:")) {
             async(Dispatchers.IO) {
                 val tmdbIdOnly = res.id.removePrefix("tmdb:")
                 try {
-                    println("[StremioC v1.112-TRACKING] ⚡ TMDB 디테일/번역 병렬 호출 시작 (TMDB ID: $tmdbIdOnly)")
+                    println("[StremioC v1.113-TRACKING] ⚡ TMDB 디테일/번역 병렬 호출 시작 (TMDB ID: $tmdbIdOnly)")
                     val mediaType = if (res.type == "movie") "movie" else "tv"
                     val detailAppend = if (mediaType == "movie") "release_dates,credits,images,videos,external_ids" else "content_ratings,credits,images,videos,external_ids"
                     val detailUrl = "$tmdbAPI/$mediaType/$tmdbIdOnly?api_key=$apiKey&language=ko-KR&append_to_response=$detailAppend&include_image_language=ko"
@@ -300,19 +300,34 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             }
         } else null
 
-        // 두 비동기 작업의 결과를 수합 (가장 늦게 끝나는 것만 기다림)
+        // 3. Kitsu 전용 API 병렬 호출 (Kitsu ID일 경우 초고속 ID 매핑 전담)
+        val kitsuDeferred = if (res.id.startsWith("kitsu:")) {
+            async(Dispatchers.IO) {
+                try {
+                    println("[StremioC v1.113-TRACKING] ⚡ Kitsu 전용 API 병렬 호출 시작 (Kitsu ID: ${res.id})")
+                    val kitsuJson = customSession.get("https://anime-kitsu.strem.fun/meta/${res.type}/${res.id}.json", timeout = 15L).text
+                    val metaObj = JSONObject(kitsuJson).optJSONObject("meta")
+                    val fetchedImdb = metaObj?.optString("imdb_id", "")
+                    if (fetchedImdb?.startsWith("tt") == true) fetchedImdb else null
+                } catch (e: Exception) { null }
+            }
+        } else null
+
+        // 작업 완료 대기 및 수합
         val preFetchedTmdbDetail = tmdbDeferred?.await()
+        val kitsuImdbId = kitsuDeferred?.await()
+        
         var finalProcessedId = res.id
         
-        val imdbId = preFetchedTmdbDetail?.external_ids?.imdb_id
+        val imdbId = preFetchedTmdbDetail?.external_ids?.imdb_id ?: kitsuImdbId
         if (!imdbId.isNullOrBlank() && imdbId.startsWith("tt")) {
             finalProcessedId = imdbId
-            println("[StremioC v1.112-TRACKING] ✅ TMDB -> IMDb ID($imdbId) 번역 완료 (이후 자막/스트림 탐색용으로 인계)")
+            println("[StremioC v1.113-TRACKING] ✅ TMDB/Kitsu -> IMDb ID($imdbId) 번역 완료")
         }
 
         return@coroutineScope res.toLoadResponse(this@StremioC, finalProcessedId, addonDeferred, preFetchedTmdbDetail)
     }
-    
+
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         val loadData = try { parseJson<LoadData>(data) } catch (e: Exception) { null } ?: return false
         val normalizedId = try { normalizeId(loadData.id) } catch (e: Exception) { loadData.id ?: "" }
@@ -320,7 +335,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         
         val targetId = if (loadData.id != null && !(loadData.id.startsWith("tt") || loadData.id.startsWith("kitsu:"))) {
             if (!loadData.imdbId.isNullOrBlank()) {
-                println("[StremioC v1.111-TRACKING] 사설 ID 감지됨(${loadData.id}). 대체 탐색용 ID를 imdbId(${loadData.imdbId})로 보정합니다.")
+                println("[StremioC v1.113-TRACKING] 사설 ID 감지됨(${loadData.id}). 대체 탐색용 ID를 imdbId(${loadData.imdbId})로 보정합니다.")
                 loadData.imdbId
             } else {
                 loadData.id
@@ -349,7 +364,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             { invokeOpenSubs(loadData.imdbId, loadData.season, loadData.episode, subtitleCallback) },
             { 
                 val subtitleId = if (!loadData.imdbId.isNullOrBlank()) loadData.imdbId else targetId
-                println("[StremioC v1.111-TRACKING] 💬 자막 애드온 호출용 ID 설정: imdbId 우선 적용 -> $subtitleId")
+                println("[StremioC v1.113-TRACKING] 💬 자막 애드온 호출용 ID 설정: imdbId 우선 적용 -> $subtitleId")
                 invokeStremioSubtitles(targetType, subtitleId, loadData.season, loadData.episode, subtitleCallback) 
             }
         )
@@ -622,8 +637,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 
                 val finalCombinedMedia = allCandidates.map { media ->
                     var score = 0.0 
-                    if (collectionParts.any { it.id == media.id }) score += 1000.0 
-                    if (isSameOrigin(media)) score += 10.0 
+                    if (collectionParts.any { it.id == media.id }) score += 10.0 
+                    if (isSameOrigin(media)) score += 1.0 
                     if (media.id in traktIds) score += 2.5 
                     if (media.id in simklIds) score += 2.0 
                     if (media.id in tmdbRecsIds) score += 1.7 
@@ -767,17 +782,9 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             if (finalImdbId == null) {
                 val regex = "tt[0-9]+".toRegex()
                 finalImdbId = logo?.let { regex.find(it)?.value } ?: poster?.let { regex.find(it)?.value } ?: background?.let { regex.find(it)?.value }
-            }
-
-            if (this@CatalogEntry.id.startsWith("kitsu:") && finalImdbId.isNullOrBlank()) {
-                try {
-                    val kitsuJson = provider.customSession.get("https://anime-kitsu.strem.fun/meta/${this@CatalogEntry.type}/${this@CatalogEntry.id}.json", timeout = 30L).text
-                    val metaObj = JSONObject(kitsuJson).optJSONObject("meta")
-                    if (metaObj != null) {
-                        val fetchedKitsuImdbId = metaObj.optString("imdb_id", "")
-                        if (fetchedKitsuImdbId.isNotBlank() && fetchedKitsuImdbId.startsWith("tt")) finalImdbId = fetchedKitsuImdbId
-                    }
-                } catch (e: Exception) {}
+                if (finalImdbId != null) {
+                    println("[StremioC v1.113-TRACKING] 🔍 로컬 이미지 URL 정규식 검사로 숨겨진 IMDb ID($finalImdbId) 0.001초 발굴 성공")
+                }
             }
 
             var tmdbIdStr: String? = if (this@CatalogEntry.id.startsWith("tmdb:")) this@CatalogEntry.id.removePrefix("tmdb:") else this@CatalogEntry.moviedb_id?.toString()
