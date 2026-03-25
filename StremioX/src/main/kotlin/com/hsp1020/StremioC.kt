@@ -1,4 +1,4 @@
-// v1.110 (Ultimate: Pair Type Fallback, Stream ID Compat, Subtitle Label & Master Scoring)
+// v1.111 (Ultimate Optimization: 1-Call TMDB, Pair Type Fallback & Precise Master Scoring)
 package com.hsp1020
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -91,7 +91,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     private val activePageRequests = mutableMapOf<Int, Deferred<HomePageResponse>>()
     
     val customSession by lazy {
-        println("[StremioC v1.110-TRACKING] 커스텀 OkHttp 세션 초기화")
+        println("[StremioC v1.111-TRACKING] 커스텀 OkHttp 세션 초기화")
         val newClient = app.baseClient.newBuilder()
             .protocols(listOf(Protocol.HTTP_1_1))
             .dispatcher(Dispatcher().apply {
@@ -276,15 +276,21 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         }
         
         var finalProcessedId = res.id
+        var preFetchedTmdbDetail: TmdbDetailResponse? = null
+
         if (res.id.startsWith("tmdb:")) {
             val tmdbIdOnly = res.id.removePrefix("tmdb:")
             try {
                 val mediaType = if (res.type == "movie") "movie" else "tv"
-                val externalUrl = "$tmdbAPI/$mediaType/$tmdbIdOnly/external_ids?api_key=$apiKey"
-                val externalRes = customSession.get(externalUrl).parsedSafe<ExternalIds>()
-                val imdbId = externalRes?.imdb_id
+                val detailAppend = if (mediaType == "movie") "release_dates,credits,images,videos,external_ids" else "content_ratings,credits,images,videos,external_ids"
+                val detailUrl = "$tmdbAPI/$mediaType/$tmdbIdOnly?api_key=$apiKey&language=ko-KR&append_to_response=$detailAppend&include_image_language=ko"
+                
+                preFetchedTmdbDetail = customSession.get(detailUrl).parsedSafe<TmdbDetailResponse>()
+                val imdbId = preFetchedTmdbDetail?.external_ids?.imdb_id
+                
                 if (!imdbId.isNullOrBlank() && imdbId.startsWith("tt")) {
                     finalProcessedId = imdbId
+                    println("[StremioC v1.111-TRACKING] ⚡ load() 단계에서 TMDB 디테일 통합 1회 호출 및 IMDb ID($imdbId) 사전 추출 성공")
                 }
             } catch (e: Exception) {}
         }
@@ -299,7 +305,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             } catch (e: Exception) { null }
         }
 
-        return@coroutineScope res.toLoadResponse(this@StremioC, finalProcessedId, addonDeferred)
+        return@coroutineScope res.toLoadResponse(this@StremioC, finalProcessedId, addonDeferred, preFetchedTmdbDetail)
     }
 
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
@@ -307,10 +313,9 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val normalizedId = try { normalizeId(loadData.id) } catch (e: Exception) { loadData.id ?: "" }
         val encodedId = try { URLEncoder.encode(normalizedId, "UTF-8") } catch (e: Exception) { normalizedId }
         
-        // [수정] tmdb: 방어막 해제. tmdb: ID도 내부 imdbId가 있다면 무조건 변환되도록 강제
         val targetId = if (loadData.id != null && !(loadData.id.startsWith("tt") || loadData.id.startsWith("kitsu:"))) {
             if (!loadData.imdbId.isNullOrBlank()) {
-                println("[StremioC v1.110-TRACKING] 사설 ID 감지됨(${loadData.id}). 대체 탐색용 ID를 imdbId(${loadData.imdbId})로 보정합니다.")
+                println("[StremioC v1.111-TRACKING] 사설 ID 감지됨(${loadData.id}). 대체 탐색용 ID를 imdbId(${loadData.imdbId})로 보정합니다.")
                 loadData.imdbId
             } else {
                 loadData.id
@@ -339,7 +344,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             { invokeOpenSubs(loadData.imdbId, loadData.season, loadData.episode, subtitleCallback) },
             { 
                 val subtitleId = if (!loadData.imdbId.isNullOrBlank()) loadData.imdbId else targetId
-                println("[StremioC v1.110-TRACKING] 💬 자막 애드온 호출용 ID 설정: imdbId 우선 적용 -> $subtitleId")
+                println("[StremioC v1.111-TRACKING] 💬 자막 애드온 호출용 ID 설정: imdbId 우선 적용 -> $subtitleId")
                 invokeStremioSubtitles(targetType, subtitleId, loadData.season, loadData.episode, subtitleCallback) 
             }
         )
@@ -392,7 +397,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             val lang = sub.lang ?: sub.lang_code ?: "Unknown"
                             val fileUrl = sub.url
                             if (!fileUrl.isNullOrBlank()) {
-                                // [수정] Stremio 자막 전용 커스텀 라벨 강제 지정
                                 val baseLangName = SubtitleHelper.fromTagToEnglishLanguageName(lang) ?: lang
                                 val customLabel = "$baseLangName (Stremio)"
                                 subtitleCallback.invoke(newSubtitleFile(customLabel, fileUrl))
@@ -486,14 +490,16 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
         private suspend fun fetchTmdbDetails(
             provider: StremioC, tmdbMediaType: String, tmdbIdStr: String, isMovie: Boolean, finalImdbId: String?,
-            stremioType: String?, targetVideos: List<Video>?
+            stremioType: String?, targetVideos: List<Video>?, preFetchedDetail: TmdbDetailResponse? = null
         ): FetchedTmdbData {
             var fetchedRecommendations: List<SearchResponse>? = null
             
-            val detailAppend = if (isMovie) "release_dates,credits,images,videos" else "content_ratings,credits,images,videos"
-            val detailUrl = "$tmdbAPI/$tmdbMediaType/$tmdbIdStr?api_key=$apiKey&language=ko-KR&append_to_response=$detailAppend&include_image_language=ko"
+            val detailRes = preFetchedDetail ?: run {
+                val detailAppend = if (isMovie) "release_dates,credits,images,videos,external_ids" else "content_ratings,credits,images,videos,external_ids"
+                val detailUrl = "$tmdbAPI/$tmdbMediaType/$tmdbIdStr?api_key=$apiKey&language=ko-KR&append_to_response=$detailAppend&include_image_language=ko"
+                provider.customSession.get(detailUrl).parsedSafe<TmdbDetailResponse>()
+            }
             
-            val detailRes = provider.customSession.get(detailUrl).parsedSafe<TmdbDetailResponse>()
             if (detailRes == null) {
                 return FetchedTmdbData(null, null, null, emptyList(), null, null, null, null, null, null, emptyMap())
             }
@@ -509,16 +515,17 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
             coroutineScope {
                 val traktDeferred = async(Dispatchers.IO) {
-                    if (finalImdbId == null || TRAKT_CLIENT_ID.isEmpty()) return@async emptyList<Int>()
+                    if (finalImdbId == null || TRAKT_CLIENT_ID.isEmpty()) return@async emptyList<Pair<Int, String>>()
                     val traktMediaType = if (tmdbMediaType == "movie") "movies" else "shows"
+                    val expectedType = if (tmdbMediaType == "movie") "movie" else "tv"
                     try {
                         val req = provider.customSession.get("https://api.trakt.tv/$traktMediaType/$finalImdbId/related?limit=30", headers = mapOf("Content-Type" to "application/json", "trakt-api-version" to "2", "trakt-api-key" to TRAKT_CLIENT_ID), timeout = 15)
                         if (req.isSuccessful && req.text.isNotBlank()) {
                             val jsonArray = JSONArray(req.text)
-                            val ids = mutableListOf<Int>()
+                            val ids = mutableListOf<Pair<Int, String>>()
                             for (i in 0 until jsonArray.length()) {
                                 val tmdbId = jsonArray.optJSONObject(i)?.optJSONObject("ids")?.optInt("tmdb", 0) ?: 0
-                                if (tmdbId > 0) ids.add(tmdbId)
+                                if (tmdbId > 0) ids.add(Pair(tmdbId, expectedType))
                             }
                             ids
                         } else emptyList()
@@ -526,8 +533,9 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 }
 
                 val simklDeferred = async(Dispatchers.IO) {
-                    if (finalImdbId == null || SIMKL_CLIENT_ID.isEmpty()) return@async emptyList<Int>()
+                    if (finalImdbId == null || SIMKL_CLIENT_ID.isEmpty()) return@async emptyList<Pair<Int, String>>()
                     val simklMediaType = if (tmdbMediaType == "movie") "movies" else "tv"
+                    val expectedType = if (tmdbMediaType == "movie") "movie" else "tv"
                     try {
                         val req = provider.customSession.get("https://api.simkl.com/$simklMediaType/$finalImdbId?extended=full&client_id=$SIMKL_CLIENT_ID", timeout = 15)
                         if (req.isSuccessful && req.text.isNotBlank()) {
@@ -545,12 +553,13 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             coroutineScope {
                                 rawSimklRecs.map { (tmdbId, simklId) ->
                                     async(Dispatchers.IO) {
-                                        if (tmdbId > 0) tmdbId
+                                        if (tmdbId > 0) Pair(tmdbId, expectedType)
                                         else if (simklId > 0) {
                                             try {
                                                 val dReq = provider.customSession.get("https://api.simkl.com/$simklMediaType/$simklId?client_id=$SIMKL_CLIENT_ID", timeout = 15)
                                                 if (dReq.isSuccessful && dReq.text.isNotBlank()) {
-                                                    JSONObject(dReq.text).optJSONObject("ids")?.optInt("tmdb", 0)?.takeIf { it > 0 }
+                                                    val fetchedTmdbId = JSONObject(dReq.text).optJSONObject("ids")?.optInt("tmdb", 0) ?: 0
+                                                    if (fetchedTmdbId > 0) Pair(fetchedTmdbId, expectedType) else null
                                                 } else null
                                             } catch(e: Exception) { null }
                                         } else null
@@ -577,26 +586,26 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     } catch (e: Exception) { emptyList() }
                 } else emptyList()
 
-                val traktIds = traktDeferred.await().toSet()
-                val simklIds = simklDeferred.await().toSet()
+                val traktResults = traktDeferred.await()
+                val simklResults = simklDeferred.await()
+                
+                val traktIds = traktResults.map { it.first }.toSet()
+                val simklIds = simklResults.map { it.first }.toSet()
+                
                 val tmdbRecs = tmdbRecsDeferred.awaitAll().flatten().distinctBy { it.id }
                 val tmdbRecsIds = tmdbRecs.mapNotNull { it.id }.toSet()
 
                 val existingTmdbIds = collectionParts.mapNotNull { it.id }.toSet() + tmdbRecsIds
                 
-                val missingIds = (traktIds + simklIds).distinct()
-                    .filter { !existingTmdbIds.contains(it) && it != tmdbIdStr.toIntOrNull() }
+                val missingPairs = (traktResults + simklResults).distinctBy { it.first }
+                    .filter { !existingTmdbIds.contains(it.first) && it.first != tmdbIdStr.toIntOrNull() }
 
-                val missingMediaDeferred = missingIds.map { missingId ->
+                val missingMediaDeferred = missingPairs.map { pair ->
                     async(Dispatchers.IO) {
                         try {
-                            var currentType = tmdbMediaType
-                            var res = provider.customSession.get("$tmdbAPI/$currentType/$missingId?api_key=$apiKey&language=ko-KR", timeout = 10).parsedSafe<TmdbDetailResponse>()
-                            
-                            if (res?.id == null) {
-                                currentType = if (tmdbMediaType == "movie") "tv" else "movie"
-                                res = provider.customSession.get("$tmdbAPI/$currentType/$missingId?api_key=$apiKey&language=ko-KR", timeout = 10).parsedSafe<TmdbDetailResponse>()
-                            }
+                            val currentType = pair.second
+                            val missingId = pair.first
+                            val res = provider.customSession.get("$tmdbAPI/$currentType/$missingId?api_key=$apiKey&language=ko-KR", timeout = 10).parsedSafe<TmdbDetailResponse>()
                             res?.toTmdbMedia(currentType)
                         } catch(e:Exception) { null }
                     }
@@ -608,8 +617,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 
                 val finalCombinedMedia = allCandidates.map { media ->
                     var score = 0.0 
-                    if (collectionParts.any { it.id == media.id }) score += 10.0 
-                    if (isSameOrigin(media)) score += 1.0 
+                    if (collectionParts.any { it.id == media.id }) score += 1000.0 
+                    if (isSameOrigin(media)) score += 10.0 
                     if (media.id in traktIds) score += 2.5 
                     if (media.id in simklIds) score += 2.0 
                     if (media.id in tmdbRecsIds) score += 1.7 
@@ -747,7 +756,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             }
         }
 
-        suspend fun toLoadResponse(provider: StremioC, imdbId: String?, addonDeferred: Deferred<CatalogEntry?>? = null): LoadResponse = coroutineScope {
+        suspend fun toLoadResponse(provider: StremioC, imdbId: String?, addonDeferred: Deferred<CatalogEntry?>?, preFetchedDetail: TmdbDetailResponse? = null): LoadResponse = coroutineScope {
             var finalImdbId = if (this@CatalogEntry.id.startsWith("tt")) this@CatalogEntry.id else imdbId?.takeIf { it.startsWith("tt") }
             
             if (finalImdbId == null) {
@@ -768,7 +777,6 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
             var tmdbIdStr: String? = if (this@CatalogEntry.id.startsWith("tmdb:")) this@CatalogEntry.id.removePrefix("tmdb:") else this@CatalogEntry.moviedb_id?.toString()
             
-            // [수정] Find API가 Pair(ID, MediaType)을 반환하도록 구조 개선
             val findApiDeferred = if (tmdbIdStr == null && finalImdbId?.startsWith("tt") == true) {
                 async(Dispatchers.IO) {
                     try {
@@ -820,9 +828,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     val isSingleMovieVideo = (finalType == "movie" && finalVideos?.size == 1 && finalVideos[0].seasonNumber == 1 && (finalVideos[0].episode == 1 || finalVideos[0].number == 1)) ||
                             (finalVideos?.size == 1 && (finalVideos[0].seasonNumber ?: 0) == 0 && (finalVideos[0].episode ?: finalVideos[0].number ?: 0) == 0)
                     
-                    // [수정] foundMediaType이 존재하면 추측 로직을 덮어씌움
                     val refinedMediaType = foundMediaType ?: if (isSingleMovieVideo || finalType == "movie" || finalVideos.isNullOrEmpty()) "movie" else "tv"
-                    tmdbData = fetchTmdbDetails(provider, refinedMediaType, tmdbIdStr, refinedMediaType == "movie", finalImdbId, finalType, finalVideos)
+                    tmdbData = fetchTmdbDetails(provider, refinedMediaType, tmdbIdStr, refinedMediaType == "movie", finalImdbId, finalType, finalVideos, preFetchedDetail)
                 } catch (e: Exception) {}
             }
 
@@ -1049,7 +1056,8 @@ private data class TmdbDetailResponse(
     @JsonProperty("content_ratings") val content_ratings: TmdbContentRatings? = null,
     @JsonProperty("credits") val credits: TmdbCredits? = null,
     @JsonProperty("images") val images: TmdbImages? = null,
-    @JsonProperty("videos") val videos: ResultsTrailer? = null
+    @JsonProperty("videos") val videos: ResultsTrailer? = null,
+    @JsonProperty("external_ids") val external_ids: ExternalIds? = null
 ) {
     fun toTmdbMedia(mediaType: String): TmdbMedia {
         return TmdbMedia(
