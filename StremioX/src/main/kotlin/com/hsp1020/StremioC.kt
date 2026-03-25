@@ -275,39 +275,44 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             parseJson<CatalogResponse>(responseText).meta ?: parseJson(JSONObject(responseText).getJSONObject("meta").toString())
         }
         
-        var finalProcessedId = res.id
-        var preFetchedTmdbDetail: TmdbDetailResponse? = null
-
-        if (res.id.startsWith("tmdb:")) {
-            val tmdbIdOnly = res.id.removePrefix("tmdb:")
-            try {
-                val mediaType = if (res.type == "movie") "movie" else "tv"
-                val detailAppend = if (mediaType == "movie") "release_dates,credits,images,videos,external_ids" else "content_ratings,credits,images,videos,external_ids"
-                val detailUrl = "$tmdbAPI/$mediaType/$tmdbIdOnly?api_key=$apiKey&language=ko-KR&append_to_response=$detailAppend&include_image_language=ko"
-                
-                preFetchedTmdbDetail = customSession.get(detailUrl).parsedSafe<TmdbDetailResponse>()
-                val imdbId = preFetchedTmdbDetail?.external_ids?.imdb_id
-                
-                if (!imdbId.isNullOrBlank() && imdbId.startsWith("tt")) {
-                    finalProcessedId = imdbId
-                    println("[StremioC v1.111-TRACKING] ⚡ load() 단계에서 TMDB 디테일 통합 1회 호출 및 IMDb ID($imdbId) 사전 추출 성공")
-                }
-            } catch (e: Exception) {}
-        }
-
-        val normalizedId = try { normalizeId(finalProcessedId) } catch (e: Exception) { finalProcessedId }
-        val encodedId = try { URLEncoder.encode(normalizedId, "UTF-8") } catch (e: Exception) { normalizedId }
-        
+        // 1. Stremio 애드온 메타데이터 호출 (TMDB 번역을 기다리지 않고 원본 ID로 즉시 출발!)
+        val encodedId = try { URLEncoder.encode(try { normalizeId(res.id) } catch (e: Exception) { res.id }, "UTF-8") } catch (e: Exception) { res.id }
         val addonDeferred = async(Dispatchers.IO) {
             try {
+                println("[StremioC v1.112-TRACKING] ⚡ Stremio Addon 메타데이터 병렬 호출 시작 (원본 ID: ${res.id})")
                 val response = customSession.get(buildUrl("/meta/${res.type}/$encodedId.json")).parsedSafe<CatalogResponse>()
-                response?.meta ?: response?.metas?.firstOrNull { it.id == finalProcessedId || it.id == res.id } ?: response?.metas?.firstOrNull()
+                response?.meta ?: response?.metas?.firstOrNull { it.id == res.id } ?: response?.metas?.firstOrNull()
             } catch (e: Exception) { null }
+        }
+
+        // 2. TMDB 디테일 통합 호출 및 ID 번역 (동시 출발!)
+        val tmdbDeferred = if (res.id.startsWith("tmdb:")) {
+            async(Dispatchers.IO) {
+                val tmdbIdOnly = res.id.removePrefix("tmdb:")
+                try {
+                    println("[StremioC v1.112-TRACKING] ⚡ TMDB 디테일/번역 병렬 호출 시작 (TMDB ID: $tmdbIdOnly)")
+                    val mediaType = if (res.type == "movie") "movie" else "tv"
+                    val detailAppend = if (mediaType == "movie") "release_dates,credits,images,videos,external_ids" else "content_ratings,credits,images,videos,external_ids"
+                    val detailUrl = "$tmdbAPI/$mediaType/$tmdbIdOnly?api_key=$apiKey&language=ko-KR&append_to_response=$detailAppend&include_image_language=ko"
+                    
+                    customSession.get(detailUrl).parsedSafe<TmdbDetailResponse>()
+                } catch (e: Exception) { null }
+            }
+        } else null
+
+        // 두 비동기 작업의 결과를 수합 (가장 늦게 끝나는 것만 기다림)
+        val preFetchedTmdbDetail = tmdbDeferred?.await()
+        var finalProcessedId = res.id
+        
+        val imdbId = preFetchedTmdbDetail?.external_ids?.imdb_id
+        if (!imdbId.isNullOrBlank() && imdbId.startsWith("tt")) {
+            finalProcessedId = imdbId
+            println("[StremioC v1.112-TRACKING] ✅ TMDB -> IMDb ID($imdbId) 번역 완료 (이후 자막/스트림 탐색용으로 인계)")
         }
 
         return@coroutineScope res.toLoadResponse(this@StremioC, finalProcessedId, addonDeferred, preFetchedTmdbDetail)
     }
-
+    
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         val loadData = try { parseJson<LoadData>(data) } catch (e: Exception) { null } ?: return false
         val normalizedId = try { normalizeId(loadData.id) } catch (e: Exception) { loadData.id ?: "" }
