@@ -1,3 +1,4 @@
+// v1.1 (기본 제공되는 StremioX, StremioC 카탈로그 생성 방지 및 로깅 추가)
 package com.hsp1020
 
 import android.content.Context
@@ -16,24 +17,37 @@ class StremioXPlugin : Plugin() {
     private val PREF_KEY_LINKS = "stremio_saved_links"
 
     override fun load(context: Context) {
+        println("[StremioXPlugin v1.1-TRACKING] load() 함수 호출됨")
+        
+        // 기본 카탈로그 생성 방지를 위해 초기 registerMainAPI 호출 주석 처리
+        /*
         try {
             registerMainAPI(StremioX("", "StremioX"))
         } catch (_: Throwable) {}
         try {
             registerMainAPI(StremioC("", "StremioC"))
         } catch (_: Throwable) {}
+        */
+        println("[StremioXPlugin v1.1-TRACKING] 기본 StremioX, StremioC 카탈로그 등록 건너뜀")
+
+        println("[StremioXPlugin v1.1-TRACKING] reload(context) 실행 시도")
         reload(context)
+        
         val activity = context as? AppCompatActivity
         openSettings = {
+            println("[StremioXPlugin v1.1-TRACKING] openSettings 클릭됨, SettingsBottomFragment 표시 시도")
             val frag = SettingsBottomFragment(this, context.getSharedPreferences(PREF_FILE, Context.MODE_PRIVATE))
             activity?.supportFragmentManager?.let { fm -> frag.show(fm, "Frag") }
         }
     }
 
     fun reload(context: Context) {
+        println("[StremioXPlugin v1.1-TRACKING] reload() 함수 호출됨")
         try {
             val prefs = context.getSharedPreferences(PREF_FILE, Context.MODE_PRIVATE)
             val json = prefs.getString(PREF_KEY_LINKS, null) ?: "[]"
+            println("[StremioXPlugin v1.1-TRACKING] 저장된 링크 JSON 로드 완료: $json")
+            
             val arr = JSONArray(json)
             val links = mutableListOf<LinkEntry>()
             for (i in 0 until arr.length()) {
@@ -47,7 +61,10 @@ class StremioXPlugin : Plugin() {
                     )
                 )
             }
+            println("[StremioXPlugin v1.1-TRACKING] 파싱된 커스텀 링크 개수: ${links.size}")
+            
             for (item in links) {
+                println("[StremioXPlugin v1.1-TRACKING] 링크 처리 중: ${item.name} (${item.type})")
                 val pluginsOnline: Array<PluginData> = PluginManager.getPluginsOnline()
                 var found: PluginData? = null
                 for (p in pluginsOnline) {
@@ -58,12 +75,15 @@ class StremioXPlugin : Plugin() {
                 }
                 if (found != null) {
                     try {
+                        println("[StremioXPlugin v1.1-TRACKING] 기존 플러그인 발견, 언로드 시도: ${found.internalName}")
                         PluginManager.unloadPlugin(found.filePath)
                     } catch (e: Throwable) {
                         Log.e("StremioXPlugin", "unload failed ${e.message}")
+                        println("[StremioXPlugin v1.1-TRACKING] 플러그인 언로드 실패: ${e.message}")
                     }
                 } else {
                     try {
+                        println("[StremioXPlugin v1.1-TRACKING] 새로운 확장 등록 시도: ${item.name} 타입: ${item.type}")
                         when (item.type) {
                             "StremioX" -> {
                                 try {
@@ -83,18 +103,23 @@ class StremioXPlugin : Plugin() {
                                 try { registerMainAPI(StremioX(item.link, item.name)) } catch (_: Throwable) {}
                             }
                         }
+                        println("[StremioXPlugin v1.1-TRACKING] 확장 등록 완료: ${item.name}")
                     } catch (e: Throwable) {
                         Log.e("StremioXPlugin", "register failed ${e.message}")
+                        println("[StremioXPlugin v1.1-TRACKING] 확장 등록 실패: ${e.message}")
                     }
                 }
             }
             try {
+                println("[StremioXPlugin v1.1-TRACKING] afterPluginsLoadedEvent 호출 시도")
                 MainActivity.afterPluginsLoadedEvent.invoke(true)
             } catch (e: Throwable) {
                 Log.w("StremioXPlugin", "afterPluginsLoaded invoke failed ${e.message}")
+                println("[StremioXPlugin v1.1-TRACKING] afterPluginsLoadedEvent 호출 실패: ${e.message}")
             }
         } catch (e: Throwable) {
             Log.e("StremioXPlugin", "reload error ${e.message}")
+            println("[StremioXPlugin v1.1-TRACKING] reload 함수 에러: ${e.message}")
         }
     }
 
