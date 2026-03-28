@@ -1,4 +1,4 @@
-// v1.117 (TargetType Override Bug Fix for 'other' and Custom Streams)
+// v1.119 (Smart ID Routing: Selective TMDB Translation & Custom ID Preservation)
 package com.hsp1020
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -88,7 +88,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     private val activePageRequests = mutableMapOf<Int, Deferred<HomePageResponse>>()
     
     val customSession by lazy {
-        println("[StremioC v1.117-TRACKING] 커스텀 OkHttp 세션 초기화")
+        println("[StremioC v1.119-TRACKING] 커스텀 OkHttp 세션 초기화")
         val newClient = app.baseClient.newBuilder()
             .protocols(listOf(Protocol.HTTP_1_1))
             .dispatcher(Dispatcher().apply {
@@ -212,7 +212,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 val now = System.currentTimeMillis()
                 val removedCount = globalPageCache.entries.removeIf { now - it.value.third > CACHE_TTL_MS }
                 if (removedCount) {
-                    println("[StremioC v1.117-TRACKING] 🧹 1시간 이상 경과된 홈 카탈로그 캐시 정리 완료")
+                    println("[StremioC v1.119-TRACKING] 🧹 1시간 이상 경과된 홈 카탈로그 캐시 정리 완료")
                 }
                 
                 catalogSkipState.clear()
@@ -241,7 +241,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                         val cachedEntry = getCachedPage(cacheKey)
                         
                         val row = if (cachedEntry != null) {
-                            println("[StremioC v1.117-TRACKING] ⚡ 홈 카탈로그 메모리 캐시 적중 (통신 스킵): $cacheKey")
+                            println("[StremioC v1.119-TRACKING] ⚡ 홈 카탈로그 메모리 캐시 적중 (통신 스킵): $cacheKey")
                             val displayType = catalog.type?.replaceFirstChar { it.uppercase() } ?: ""
                             catalogSkipState[catalogKey] = currentSkip + cachedEntry.second
                             HomePageList("${catalog.name ?: catalog.id} - $displayType", cachedEntry.first)
@@ -250,7 +250,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             val freshRow = resultPair.first
                             
                             if (freshRow.list.isNotEmpty()) {
-                                println("[StremioC v1.117-TRACKING] 🌐 홈 카탈로그 네트워크 통신 완료 (캐시 저장): $cacheKey")
+                                println("[StremioC v1.119-TRACKING] 🌐 홈 카탈로그 네트워크 통신 완료 (캐시 저장): $cacheKey")
                                 setCachedPage(cacheKey, freshRow.list, resultPair.second)
                                 catalogSkipState[catalogKey] = currentSkip + resultPair.second
                             }
@@ -298,7 +298,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val encodedId = try { URLEncoder.encode(try { normalizeId(res.id) } catch (e: Exception) { res.id }, "UTF-8") } catch (e: Exception) { res.id }
         val addonDeferred = async(Dispatchers.IO) {
             try {
-                println("[StremioC v1.117-TRACKING] ⚡ Stremio Addon 메타데이터 병렬 호출 시작 (원본 ID: ${res.id})")
+                println("[StremioC v1.119-TRACKING] ⚡ Stremio Addon 메타데이터 병렬 호출 시작 (원본 ID: ${res.id})")
                 val response = customSession.get(buildUrl("/meta/${res.type}/$encodedId.json")).parsedSafe<CatalogResponse>()
                 response?.meta ?: response?.metas?.firstOrNull { it.id == res.id } ?: response?.metas?.firstOrNull()
             } catch (e: Exception) { null }
@@ -308,7 +308,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             async(Dispatchers.IO) {
                 val tmdbIdOnly = res.id.removePrefix("tmdb:")
                 try {
-                    println("[StremioC v1.117-TRACKING] ⚡ TMDB 디테일/번역 병렬 호출 시작 (TMDB ID: $tmdbIdOnly)")
+                    println("[StremioC v1.119-TRACKING] ⚡ TMDB 디테일/번역 병렬 호출 시작 (TMDB ID: $tmdbIdOnly)")
                     val mediaType = if (res.type == "movie") "movie" else "tv"
                     val detailAppend = if (mediaType == "movie") "release_dates,credits,images,videos,external_ids" else "content_ratings,credits,images,videos,external_ids"
                     val detailUrl = "$tmdbAPI/$mediaType/$tmdbIdOnly?api_key=$apiKey&language=ko-KR&append_to_response=$detailAppend&include_image_language=ko"
@@ -321,7 +321,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val kitsuDeferred = if (res.id.startsWith("kitsu:")) {
             async(Dispatchers.IO) {
                 try {
-                    println("[StremioC v1.117-TRACKING] ⚡ Kitsu 전용 API 병렬 호출 시작 (Kitsu ID: ${res.id})")
+                    println("[StremioC v1.119-TRACKING] ⚡ Kitsu 전용 API 병렬 호출 시작 (Kitsu ID: ${res.id})")
                     val kitsuJson = customSession.get("https://anime-kitsu.strem.fun/meta/${res.type}/${res.id}.json", timeout = 15L).text
                     val metaObj = JSONObject(kitsuJson).optJSONObject("meta")
                     val fetchedImdb = metaObj?.optString("imdb_id", "")
@@ -338,7 +338,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val imdbId = preFetchedTmdbDetail?.external_ids?.imdb_id ?: kitsuImdbId
         if (!imdbId.isNullOrBlank() && imdbId.startsWith("tt")) {
             finalProcessedId = imdbId
-            println("[StremioC v1.117-TRACKING] ✅ TMDB/Kitsu -> IMDb ID($imdbId) 번역 완료")
+            println("[StremioC v1.119-TRACKING] ✅ TMDB/Kitsu -> IMDb ID($imdbId) 번역 완료")
         }
 
         return@coroutineScope res.toLoadResponse(this@StremioC, finalProcessedId, addonDeferred, preFetchedTmdbDetail)
@@ -347,41 +347,51 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         val loadData = try { parseJson<LoadData>(data) } catch (e: Exception) { null } ?: return false
         
-        val targetId = if (loadData.id != null && !(loadData.id.startsWith("tt") || loadData.id.startsWith("kitsu:"))) {
-            if (!loadData.imdbId.isNullOrBlank()) {
-                println("[StremioC v1.117-TRACKING] 🔄 스트림 탐색 ID 치환: ${loadData.id} -> ${loadData.imdbId}")
-                loadData.imdbId
-            } else {
-                loadData.id
-            }
+        // 🚀 [v1.119 핵심 픽스] tmdb: 일 때만 강제 변환, 그 외의 특수 ID(st:store 등)는 원본 보존
+        val primaryId = if (loadData.id?.startsWith("tmdb:") == true && !loadData.imdbId.isNullOrBlank()) {
+            println("[StremioC v1.119-TRACKING] 🔄 메인 애드온 요청용 ID 치환 (tmdb -> imdb): ${loadData.id} -> ${loadData.imdbId}")
+            loadData.imdbId
         } else {
-            loadData.id
+            loadData.id ?: ""
         }
 
-        // 🚀 [v1.117 픽스] 오리지널 타입을 1순위로 존중하여 강제 조작(무지성 movie 변환)을 방지합니다.
+        // 🚀 외부 애드온/자막 탐색용 글로벌 ID는 여전히 IMDb를 최우선으로 사용
+        val globalId = if (!loadData.imdbId.isNullOrBlank()) {
+            loadData.imdbId
+        } else {
+            primaryId
+        }
+
         val targetType = loadData.type ?: if ((loadData.season ?: 0) > 0 || (loadData.episode ?: 0) > 0) "series" else "movie"
         
-        val primaryStremioId = buildStremioId(targetType, targetId, loadData.season, loadData.episode) ?: targetId
+        // 1. 메인 애드온용 스트림 ID 조립 (선택적 치환된 ID 사용)
+        val primaryStremioId = buildStremioId(targetType, primaryId, loadData.season, loadData.episode) ?: primaryId
         val encodedPrimaryId = try { URLEncoder.encode(primaryStremioId, "UTF-8") } catch (e: Exception) { primaryStremioId }
+
+        // 2. 외부 애드온용 스트림 ID 조립 (글로벌 ID 사용)
+        val globalStremioId = buildStremioId(targetType, globalId, loadData.season, loadData.episode) ?: globalId
 
         runAllAsync(
             {
                 try {
+                    // 메인 애드온 호출 (PikPak은 원본 st:store... 전송, TMDB카탈로그는 tt... 전송)
                     val url = buildUrl("/stream/$targetType/$encodedPrimaryId.json")
                     val res = customSession.get(url, timeout = 120L).parsedSafe<StreamsResponse>()
                     if (!res?.streams.isNullOrEmpty()) {
+                        println("[StremioC v1.119-TRACKING] ✅ 메인 애드온 스트림 탐색 성공 (ID: $primaryId)")
                         res?.streams?.forEach { stream -> stream.runCallback(this@StremioC, subtitleCallback, callback) }
                     } else {
-                        invokeStremioX(targetType, targetId, loadData.season, loadData.episode, subtitleCallback, callback)
+                        // 메인 애드온 실패 시 글로벌 ID(tt...)로 외부 애드온 교차 탐색
+                        println("[StremioC v1.119-TRACKING] ⚠️ 메인 애드온 실패, 외부 애드온(글로벌 ID) 교차 탐색 시작")
+                        invokeStremioX(targetType, globalId, loadData.season, loadData.episode, subtitleCallback, callback)
                     }
                 } catch (e: Exception) {}
             },
             { invokeWatchsomuch(loadData.imdbId, loadData.season, loadData.episode, subtitleCallback) },
             { invokeOpenSubs(loadData.imdbId, loadData.season, loadData.episode, subtitleCallback) },
             { 
-                val subtitleId = if (!loadData.imdbId.isNullOrBlank()) loadData.imdbId else targetId
-                println("[StremioC v1.117-TRACKING] 💬 자막 애드온 호출용 ID 설정: imdbId 우선 적용 -> $subtitleId")
-                invokeStremioSubtitles(targetType, subtitleId, loadData.season, loadData.episode, subtitleCallback) 
+                println("[StremioC v1.119-TRACKING] 💬 자막 애드온 호출 (글로벌 ID): $globalId")
+                invokeStremioSubtitles(targetType, globalId, loadData.season, loadData.episode, subtitleCallback) 
             }
         )
         return true
@@ -805,7 +815,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 val regex = "tt[0-9]+".toRegex()
                 finalImdbId = logo?.let { regex.find(it)?.value } ?: poster?.let { regex.find(it)?.value } ?: background?.let { regex.find(it)?.value }
                 if (finalImdbId != null) {
-                    println("[StremioC v1.117-TRACKING] 🔍 로컬 이미지 URL 정규식 검사로 숨겨진 IMDb ID($finalImdbId) 0.001초 발굴 성공")
+                    println("[StremioC v1.119-TRACKING] 🔍 로컬 이미지 URL 정규식 검사로 숨겨진 IMDb ID($finalImdbId) 0.001초 발굴 성공")
                 }
             }
 
