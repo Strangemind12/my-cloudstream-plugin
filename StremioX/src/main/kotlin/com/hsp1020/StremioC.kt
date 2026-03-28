@@ -555,31 +555,41 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 val simklDeferred = async(Dispatchers.IO) {
                     if (finalImdbId == null || SIMKL_CLIENT_ID.isEmpty()) return@async emptyList<Pair<Int, String>>()
                     val simklMediaType = if (tmdbMediaType == "movie") "movies" else "tv"
-                    val expectedType = if (tmdbMediaType == "movie") "movie" else "tv"
+                    val parentExpectedType = if (tmdbMediaType == "movie") "movie" else "tv" // 부모 타입 (기본값용)
+                    
                     try {
                         val req = provider.customSession.get("https://api.simkl.com/$simklMediaType/$finalImdbId?extended=full&client_id=$SIMKL_CLIENT_ID", timeout = 15)
                         if (req.isSuccessful && req.text.isNotBlank()) {
                             val rootObj = JSONObject(req.text)
                             val recsArray = rootObj.optJSONArray("users_recommendations") ?: JSONArray()
-                            val rawSimklRecs = mutableListOf<Pair<Int, Int>>()
+                            // 🚀 [수정됨] Pair 대신 Triple을 사용하여 (TMDB ID, Simkl ID, 정확한 미디어 타입) 3가지를 저장합니다.
+                            val rawSimklRecs = mutableListOf<Triple<Int, Int, String>>()
                             
                             for (i in 0 until min(recsArray.length(), 30)) {
-                                val idsObj = recsArray.optJSONObject(i)?.optJSONObject("ids")
+                                val recObj = recsArray.optJSONObject(i)
+                                // 🚀 [핵심] JSON에서 직접 "type" 필드를 읽어옵니다. 없으면 부모 타입을 따라갑니다.
+                                val itemTypeRaw = recObj?.optString("type", parentExpectedType) ?: parentExpectedType
+                                // simkl의 "tv" 또는 "movie" 값을 TMDB 규격에 맞게 정제
+                                val itemTmdbType = if (itemTypeRaw.contains("movie")) "movie" else "tv"
+                                
+                                val idsObj = recObj?.optJSONObject("ids")
                                 val tmdb = idsObj?.optInt("tmdb", 0) ?: 0
                                 val simkl = idsObj?.optInt("simkl", 0) ?: 0
-                                if (tmdb > 0 || simkl > 0) rawSimklRecs.add(Pair(tmdb, simkl))
+                                if (tmdb > 0 || simkl > 0) rawSimklRecs.add(Triple(tmdb, simkl, itemTmdbType))
                             }
                             
                             coroutineScope {
-                                rawSimklRecs.map { (tmdbId, simklId) ->
+                                rawSimklRecs.map { (tmdbId, simklId, itemTmdbType) ->
                                     async(Dispatchers.IO) {
-                                        if (tmdbId > 0) Pair(tmdbId, expectedType)
+                                        if (tmdbId > 0) Pair(tmdbId, itemTmdbType) // 🚀 정확한 개별 타입 꼬리표 부착!
                                         else if (simklId > 0) {
                                             try {
-                                                val dReq = provider.customSession.get("https://api.simkl.com/$simklMediaType/$simklId?client_id=$SIMKL_CLIENT_ID", timeout = 15)
+                                                // Simkl 상세 조회용 URL (movie는 movies로 찔러야 함)
+                                                val simklReqType = if (itemTmdbType == "movie") "movies" else "tv"
+                                                val dReq = provider.customSession.get("https://api.simkl.com/$simklReqType/$simklId?client_id=$SIMKL_CLIENT_ID", timeout = 15)
                                                 if (dReq.isSuccessful && dReq.text.isNotBlank()) {
                                                     val fetchedTmdbId = JSONObject(dReq.text).optJSONObject("ids")?.optInt("tmdb", 0) ?: 0
-                                                    if (fetchedTmdbId > 0) Pair(fetchedTmdbId, expectedType) else null
+                                                    if (fetchedTmdbId > 0) Pair(fetchedTmdbId, itemTmdbType) else null
                                                 } else null
                                             } catch(e: Exception) { null }
                                         } else null
