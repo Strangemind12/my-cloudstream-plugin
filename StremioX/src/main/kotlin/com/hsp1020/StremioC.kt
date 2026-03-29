@@ -127,14 +127,14 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         }
     }
 
-    private fun buildStremioId(type: String?, id: String?, season: Int?, episode: Int?): String? {
+    private fun buildStremioId(type: String?, id: String?, season: Int?, episode: Int?, isSubtitle: Boolean = false): String? {
         if (type == "series" && season != null && episode != null) {
             return when {
                 id?.startsWith("kitsu:") == true -> {
                     val parts = id.split(":")
                     val baseId = if (parts.size >= 2) "kitsu:${parts[1]}" else id
-                    // 🚀 [v1.121 픽스] Kitsu 규격에 맞춰 시즌 번호 생략, 절대 에피소드 번호만 적용
-                    "$baseId:$episode" // ✨ 정상 동작: 시즌 번호가 제거됨 (예: kitsu:48363:2)
+                    // 🚀 자막일 때는 시즌 포함, 스트림일 때는 에피소드만 조립
+                    if (isSubtitle) "$baseId:$season:$episode" else "$baseId:$episode"
                 }
                 id?.endsWith(":$season:$episode") == true -> id
                 else -> "$id:$season:$episode"
@@ -142,7 +142,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         }
         return id
     }
-
+    
     private fun mergeOverview(original: String?, newOverview: String?): String? {
         if (newOverview.isNullOrBlank()) return original
         if (original != null && original.contains("✨")) {
@@ -429,7 +429,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             addonUrls.add(site.url.cleanBaseUrl())
         }
 
-        val stremioId = buildStremioId(type, id, season, episode) ?: return
+        // 🚀 자막 전용 플래그(isSubtitle = true)를 넘겨서 Kitsu 자막은 시즌 번호가 포함되도록 요청
+        val stremioId = buildStremioId(type, id, season, episode, isSubtitle = true) ?: return
         val gson = Gson()
 
         coroutineScope {
