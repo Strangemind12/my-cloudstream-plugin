@@ -133,7 +133,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 id?.startsWith("kitsu:") == true -> {
                     val parts = id.split(":")
                     val baseId = if (parts.size >= 2) "kitsu:${parts[1]}" else id
-                    "$baseId:$season:$episode"
+                    // 🚀 [v1.121 픽스] Kitsu 규격에 맞춰 시즌 번호 생략, 절대 에피소드 번호만 적용
+                    "$baseId:$episode" // ✨ 정상 동작: 시즌 번호가 제거됨 (예: kitsu:48363:2)
                 }
                 id?.endsWith(":$season:$episode") == true -> id
                 else -> "$id:$season:$episode"
