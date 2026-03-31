@@ -1,4 +1,4 @@
-// v1.127 (Perfect Pagination: Row Isolation, Exact Skip Accumulation, Fast & Safe Debouncing)
+// v1.123 (Ultimate Optimization: JSON Unification, Debouncing Pagination, Regex Caching, Safe Idiomatic Kotlin)
 package com.hsp1020
 
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -79,17 +79,13 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     private var lastCacheTime: Long = 0
     
     private val catalogSentIds = ConcurrentHashMap<String, MutableSet<String>>()
-    
-    // 🚀 v1.127: 정확한 아이템 갯수를 누적하여 단 1개의 누락도 없애는 순정 카운터 원복
     private val catalogSkipState = ConcurrentHashMap<String, Int>()
     
     private val pageMutex = Mutex()
-    
-    // 🚀 v1.127: String 키(이름+페이지)를 사용하여 행별로 완벽하게 격리된 요청 추적
-    private val activePageRequests = mutableMapOf<String, Deferred<HomePageResponse>>()
+    private val activePageRequests = mutableMapOf<Int, Deferred<HomePageResponse>>()
     
     val customSession by lazy {
-        println("[StremioC v1.127-TRACKING] 커스텀 OkHttp 세션 초기화")
+        println("[StremioC v1.123-TRACKING] 커스텀 OkHttp 세션 초기화")
         val newClient = app.baseClient.newBuilder()
             .protocols(listOf(Protocol.HTTP_1_1))
             .dispatcher(Dispatcher().apply {
@@ -112,6 +108,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         private const val TRAKT_CLIENT_ID = "6d8668915ed1953f5023ea090e206facc6261813243f567dea15a9a678783b6d" 
         private const val SIMKL_CLIENT_ID = "f392628a1235f474859905f5453239c57715d9a197a89bd71cac975ddd9c4d39" 
         
+        // 🚀 v1.123 성능 개선: 메모리에 단 1회만 할당되는 초고속 캐싱 정규식
         private val IMDB_ID_REGEX = "tt[0-9]+".toRegex()
         private val JSON_ID_EXTRACT_REGEX = "\"id\":\"([^\"]+)\"".toRegex()
         
@@ -219,41 +216,41 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse = coroutineScope {
-        // 🚀 v1.127: Cloudstream의 가로 행(Row) 이름을 포함하여 키를 생성 (행 단위 완벽 격리)
-        val requestKey = "${request.name}_$page"
         var isNewRequest = false
         
         val deferred = pageMutex.withLock {
             if (page <= 1) {
                 catalogSentIds.clear()
                 activePageRequests.clear()
-                catalogSkipState.clear()
                 
                 val now = System.currentTimeMillis()
                 val removedCount = globalPageCache.entries.removeIf { now - it.value.third > CACHE_TTL_MS }
                 if (removedCount) {
-                    println("[StremioC v1.127-TRACKING] 🧹 1시간 이상 경과된 홈 카탈로그 캐시 정리 완료")
+                    println("[StremioC v1.123-TRACKING] 🧹 1시간 이상 경과된 홈 카탈로그 캐시 정리 완료")
                 }
+                
+                catalogSkipState.clear()
             }
             
-            if (!activePageRequests.containsKey(requestKey)) {
+            if (!activePageRequests.containsKey(page)) {
                 isNewRequest = true
-                activePageRequests[requestKey] = async { fetchMainPageData(page, request) }
+                activePageRequests[page] = async { fetchMainPageData(page, request) }
             }
-            activePageRequests[requestKey]!!
+            activePageRequests[page]!!
         }
         
         val response = deferred.await()
         
         pageMutex.withLock {
-            activePageRequests.remove(requestKey)
+            activePageRequests.remove(page)
             if (isNewRequest) {
-                println("[StremioC v1.127-TRACKING] 🧹 메모리 관리: 요청 객체 Map 할당 해제 완료 ($requestKey)")
+                println("[StremioC v1.123-TRACKING] 🧹 메모리 관리: 페이지 $page 요청 객체 Map 할당 해제 완료")
             }
         }
         
+        // 🚀 v1.123 완벽한 픽스 (Debouncing): 다발성 호출(무임승차) 방어
         if (!isNewRequest && page > 1) {
-            println("[StremioC v1.127-TRACKING] 🚫 다발성 중복 페이지 요청 감지 ($requestKey) - 무임승차 차단 (빈 배열 반환)")
+            println("[StremioC v1.123-TRACKING] 🚫 다발성 중복 페이지 요청 감지 (page=$page) - 무임승차 차단 (빈 배열 반환)")
             return@coroutineScope newHomePageResponse(emptyList(), hasNext = true)
         }
         
@@ -263,19 +260,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
     private suspend fun fetchMainPageData(page: Int, request: MainPageRequest): HomePageResponse {
         mainUrl = mainUrl.fixSourceUrl()
         val manifest = getManifest()
-        val allCatalogs = manifest?.catalogs?.filter { !it.isSearchRequired() } ?: emptyList()
-        
-        // 🚀 v1.127 핵심 픽스: 가로 스크롤 시, 무식하게 전체를 다 가져오지 않고 "요청한 딱 그 줄"만 가져와서 통신 속도 극대화 및 카운터 오염 차단
-        val targetCatalogs = if (page <= 1 || request.name.isBlank()) {
-            allCatalogs
-        } else {
-            allCatalogs.filter { catalog ->
-                val displayType = catalog.type?.replaceFirstChar { it.uppercase() } ?: ""
-                val listName = "${catalog.name ?: catalog.id} - $displayType"
-                listName == request.name
-            }
-        }
-        
+        val targetCatalogs = manifest?.catalogs?.filter { !it.isSearchRequired() } ?: emptyList()
         val lists = mutableListOf<HomePageList>()
         
         val chunkResults = coroutineScope {
@@ -283,15 +268,13 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                 async(Dispatchers.IO) {
                     try {
                         val catalogKey = "${catalog.id}-${catalog.type}"
-                        
-                        // 🚀 v1.127: 행(Row)별로 격리되었으므로 가장 안전하고 정확한 '가져온 갯수 누적 방식' 재활성화
                         val currentSkip = catalogSkipState[catalogKey] ?: 0
-                        
                         val cacheKey = "${this@StremioC.name}_${catalogKey}_$currentSkip"
+                        
                         val cachedEntry = getCachedPage(cacheKey)
                         
                         val row = if (cachedEntry != null) {
-                            println("[StremioC v1.127-TRACKING] ⚡ 홈 카탈로그 메모리 캐시 적중 (통신 스킵): $cacheKey")
+                            println("[StremioC v1.123-TRACKING] ⚡ 홈 카탈로그 메모리 캐시 적중 (통신 스킵): $cacheKey")
                             val displayType = catalog.type?.replaceFirstChar { it.uppercase() } ?: ""
                             catalogSkipState[catalogKey] = currentSkip + cachedEntry.second
                             HomePageList("${catalog.name ?: catalog.id} - $displayType", cachedEntry.first)
@@ -300,9 +283,8 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             val freshRow = resultPair.first
                             
                             if (freshRow.list.isNotEmpty()) {
-                                println("[StremioC v1.127-TRACKING] 🌐 홈 카탈로그 네트워크 통신 완료 (캐시 저장): $cacheKey")
+                                println("[StremioC v1.123-TRACKING] 🌐 홈 카탈로그 네트워크 통신 완료 (캐시 저장): $cacheKey")
                                 setCachedPage(cacheKey, freshRow.list, resultPair.second)
-                                // 오차가 1도 발생하지 않는 완벽한 누적 페이징
                                 catalogSkipState[catalogKey] = currentSkip + resultPair.second
                             }
                             freshRow
@@ -312,6 +294,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             Collections.synchronizedSet(lruSet<String>(500))
                         }
                         
+                        // 🚀 v1.123 완벽한 픽스 (절대 ID 추출 필터링): JSON 내부 미세 변동으로 인한 중복 뚫림 방어
                         val filteredItems = row.list.filter { item -> 
                             val extractedId = try {
                                 JSON_ID_EXTRACT_REGEX.find(item.url)?.groupValues?.get(1) ?: item.url
@@ -322,7 +305,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                         }
                         row.copy(list = filteredItems)
                     } catch (e: Exception) { 
-                        println("[StremioC v1.127-TRACKING] ERROR: 메인 카탈로그 로드 중 예외 발생 - ${e.message}")
+                        println("[StremioC v1.123-TRACKING] ERROR: 메인 카탈로그 로드 중 예외 발생 - ${e.message}")
                         null 
                     }
                 }
@@ -344,7 +327,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     try { 
                         catalog.search(query, this@StremioC) 
                     } catch (e: Exception) { 
-                        println("[StremioC v1.127-TRACKING] ERROR: 검색 중 예외 발생 - ${e.message}")
+                        println("[StremioC v1.123-TRACKING] ERROR: 검색 중 예외 발생 - ${e.message}")
                         emptyList() 
                     }
                 }
@@ -372,11 +355,11 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
 
         val addonDeferred = async(Dispatchers.IO) {
             try {
-                println("[StremioC v1.127-TRACKING] ⚡ Stremio Addon 메타데이터 병렬 호출 시작 (원본 ID: ${res.id})")
+                println("[StremioC v1.123-TRACKING] ⚡ Stremio Addon 메타데이터 병렬 호출 시작 (원본 ID: ${res.id})")
                 val response = customSession.get(buildUrl("/meta/${res.type}/$encodedId.json")).parsedSafe<CatalogResponse>()
                 response?.meta ?: response?.metas?.firstOrNull { it.id == res.id } ?: response?.metas?.firstOrNull()
             } catch (e: Exception) { 
-                println("[StremioC v1.127-TRACKING] ERROR: 메타데이터 병렬 호출 실패 - ${e.message}")
+                println("[StremioC v1.123-TRACKING] ERROR: 메타데이터 병렬 호출 실패 - ${e.message}")
                 null 
             }
         }
@@ -385,14 +368,14 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             async(Dispatchers.IO) {
                 val tmdbIdOnly = res.id.removePrefix("tmdb:")
                 try {
-                    println("[StremioC v1.127-TRACKING] ⚡ TMDB 디테일/번역 병렬 호출 시작 (TMDB ID: $tmdbIdOnly)")
+                    println("[StremioC v1.123-TRACKING] ⚡ TMDB 디테일/번역 병렬 호출 시작 (TMDB ID: $tmdbIdOnly)")
                     val mediaType = if (res.type == "movie") "movie" else "tv"
                     val detailAppend = if (mediaType == "movie") "release_dates,credits,images,videos,external_ids" else "content_ratings,credits,images,videos,external_ids"
                     val detailUrl = buildTmdbUrl("/$mediaType/$tmdbIdOnly", "append_to_response" to detailAppend, "include_image_language" to "ko")
                     
                     customSession.get(detailUrl).parsedSafe<TmdbDetailResponse>()
                 } catch (e: Exception) { 
-                    println("[StremioC v1.127-TRACKING] ERROR: TMDB 디테일 호출 실패 - ${e.message}")
+                    println("[StremioC v1.123-TRACKING] ERROR: TMDB 디테일 호출 실패 - ${e.message}")
                     null 
                 }
             }
@@ -401,12 +384,12 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val kitsuDeferred = if (res.id.startsWith("kitsu:")) {
             async(Dispatchers.IO) {
                 try {
-                    println("[StremioC v1.127-TRACKING] ⚡ Kitsu 전용 API 병렬 호출 시작 (Kitsu ID: ${res.id})")
+                    println("[StremioC v1.123-TRACKING] ⚡ Kitsu 전용 API 병렬 호출 시작 (Kitsu ID: ${res.id})")
                     val kitsuRes = customSession.get("https://anime-kitsu.strem.fun/meta/${res.type}/${res.id}.json", timeout = 15L).parsedSafe<KitsuMetaResponse>()
                     val fetchedImdb = kitsuRes?.meta?.imdb_id
                     if (fetchedImdb?.startsWith("tt") == true) fetchedImdb else null
                 } catch (e: Exception) { 
-                    println("[StremioC v1.127-TRACKING] ERROR: Kitsu API 파싱 실패 - ${e.message}")
+                    println("[StremioC v1.123-TRACKING] ERROR: Kitsu API 파싱 실패 - ${e.message}")
                     null 
                 }
             }
@@ -420,7 +403,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val imdbId = preFetchedTmdbDetail?.external_ids?.imdb_id ?: kitsuImdbId
         if (!imdbId.isNullOrBlank() && imdbId.startsWith("tt")) {
             finalProcessedId = imdbId
-            println("[StremioC v1.127-TRACKING] ✅ TMDB/Kitsu -> IMDb ID($imdbId) 번역 완료")
+            println("[StremioC v1.123-TRACKING] ✅ TMDB/Kitsu -> IMDb ID($imdbId) 번역 완료")
         }
 
         return@coroutineScope res.toLoadResponse(this@StremioC, finalProcessedId, addonDeferred, preFetchedTmdbDetail)
@@ -430,7 +413,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
         val loadData = try { parseJson<LoadData>(data) } catch (e: Exception) { null } ?: return false
         
         val primaryId = if (loadData.id?.startsWith("tmdb:") == true && !loadData.imdbId.isNullOrBlank()) {
-            println("[StremioC v1.127-TRACKING] 🔄 메인 애드온 요청용 ID 치환 (tmdb -> imdb): ${loadData.id} -> ${loadData.imdbId}")
+            println("[StremioC v1.123-TRACKING] 🔄 메인 애드온 요청용 ID 치환 (tmdb -> imdb): ${loadData.id} -> ${loadData.imdbId}")
             loadData.imdbId
         } else {
             loadData.id ?: ""
@@ -455,20 +438,20 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     val url = buildUrl("/stream/$targetType/$encodedPrimaryId.json")
                     val res = customSession.get(url, timeout = 120L).parsedSafe<StreamsResponse>()
                     if (!res?.streams.isNullOrEmpty()) {
-                        println("[StremioC v1.127-TRACKING] ✅ 메인 애드온 스트림 탐색 성공 (ID: $primaryId)")
+                        println("[StremioC v1.123-TRACKING] ✅ 메인 애드온 스트림 탐색 성공 (ID: $primaryId)")
                         res?.streams?.forEach { stream -> stream.runCallback(this@StremioC, subtitleCallback, callback) }
                     } else {
-                        println("[StremioC v1.127-TRACKING] ⚠️ 메인 애드온 실패, 외부 애드온(글로벌 ID) 교차 탐색 시작")
+                        println("[StremioC v1.123-TRACKING] ⚠️ 메인 애드온 실패, 외부 애드온(글로벌 ID) 교차 탐색 시작")
                         invokeStremioX(targetType, globalId, loadData.season, loadData.episode, subtitleCallback, callback)
                     }
                 } catch (e: Exception) {
-                    println("[StremioC v1.127-TRACKING] ERROR: 메인 애드온 스트림 탐색 및 교차 탐색 중 예외 발생 - ${e.message}")
+                    println("[StremioC v1.123-TRACKING] ERROR: 메인 애드온 스트림 탐색 및 교차 탐색 중 예외 발생 - ${e.message}")
                 }
             },
             { invokeWatchsomuch(loadData.imdbId, loadData.season, loadData.episode, subtitleCallback) },
             { invokeOpenSubs(loadData.imdbId, loadData.season, loadData.episode, subtitleCallback) },
             { 
-                println("[StremioC v1.127-TRACKING] 💬 자막 애드온 호출 (글로벌 ID): $globalId")
+                println("[StremioC v1.123-TRACKING] 💬 자막 애드온 호출 (글로벌 ID): $globalId")
                 invokeStremioSubtitles(targetType, globalId, loadData.season, loadData.episode, subtitleCallback) 
             }
         )
@@ -488,7 +471,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                         val res = customSession.get(url, timeout = 120L).parsedSafe<StreamsResponse>()
                         res?.streams?.forEach { stream -> stream.runCallback(this@StremioC, subtitleCallback, callback) }
                     } catch (e: Exception) {
-                        println("[StremioC v1.127-TRACKING] ERROR: 외부 애드온(${site.name}) 스트림 탐색 예외 - ${e.message}")
+                        println("[StremioC v1.123-TRACKING] ERROR: 외부 애드온(${site.name}) 스트림 탐색 예외 - ${e.message}")
                     }
                 }
             }.awaitAll()
@@ -526,7 +509,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             }
                         }
                     } catch (e: Exception) {
-                        println("[StremioC v1.127-TRACKING] ERROR: 자막 애드온 호출 실패 ($api) - ${e.message}")
+                        println("[StremioC v1.123-TRACKING] ERROR: 자막 애드온 호출 실패 ($api) - ${e.message}")
                     }
                 }
             }.awaitAll()
@@ -560,7 +543,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                                 parseJson<CatalogResponse>(req.text).metas ?: emptyList()
                             } else emptyList()
                         } catch (e: Exception) { 
-                            println("[StremioC v1.127-TRACKING] ERROR: 검색 쿼리 통신 예외 - ${e.message}")
+                            println("[StremioC v1.123-TRACKING] ERROR: 검색 쿼리 통신 예외 - ${e.message}")
                             emptyList() 
                         }
                     }
@@ -580,7 +563,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                                 parseJson<CatalogResponse>(req.text).metas ?: emptyList()
                             } else emptyList()
                         } catch (e: Exception) { 
-                            println("[StremioC v1.127-TRACKING] ERROR: 카탈로그 목록 반환 중 예외 - ${e.message}")
+                            println("[StremioC v1.123-TRACKING] ERROR: 카탈로그 목록 반환 중 예외 - ${e.message}")
                             emptyList() 
                         }
                     }
@@ -659,7 +642,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             }
                         } else emptyList()
                     } catch(e: Exception) { 
-                        println("[StremioC v1.127-TRACKING] ERROR: Trakt 관련 정보 파싱 실패 - ${e.message}")
+                        println("[StremioC v1.123-TRACKING] ERROR: Trakt 관련 정보 파싱 실패 - ${e.message}")
                         emptyList() 
                     }
                 }
@@ -696,7 +679,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                                                     if (fetchedTmdbId > 0) Pair(fetchedTmdbId, itemTmdbType) else null
                                                 } else null
                                             } catch(e: Exception) { 
-                                                println("[StremioC v1.127-TRACKING] ERROR: Simkl 상세 조회 실패 - ${e.message}")
+                                                println("[StremioC v1.123-TRACKING] ERROR: Simkl 상세 조회 실패 - ${e.message}")
                                                 null 
                                             }
                                         } else null
@@ -705,7 +688,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             }
                         } else emptyList()
                     } catch(e: Exception) { 
-                        println("[StremioC v1.127-TRACKING] ERROR: Simkl 메타 조회 실패 - ${e.message}")
+                        println("[StremioC v1.123-TRACKING] ERROR: Simkl 메타 조회 실패 - ${e.message}")
                         emptyList() 
                     }
                 }
@@ -716,7 +699,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             val recUrl = provider.buildTmdbUrl("/$tmdbMediaType/$tmdbIdStr/recommendations", "page" to page.toString())
                             provider.customSession.get(recUrl, timeout = 15).parsedSafe<TmdbRecommendations>()?.results ?: emptyList()
                         } catch (e: Exception) { 
-                            println("[StremioC v1.127-TRACKING] ERROR: TMDB 추천 조회 실패 - ${e.message}")
+                            println("[StremioC v1.123-TRACKING] ERROR: TMDB 추천 조회 실패 - ${e.message}")
                             emptyList<TmdbMedia>() 
                         }
                     }
@@ -727,7 +710,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                         val colUrl = provider.buildTmdbUrl("/collection/${detailRes.belongs_to_collection.id}")
                         provider.customSession.get(colUrl).parsedSafe<TmdbCollectionDetail>()?.parts ?: emptyList()
                     } catch (e: Exception) { 
-                        println("[StremioC v1.127-TRACKING] ERROR: TMDB 컬렉션 조회 실패 - ${e.message}")
+                        println("[StremioC v1.123-TRACKING] ERROR: TMDB 컬렉션 조회 실패 - ${e.message}")
                         emptyList() 
                     }
                 } else emptyList()
@@ -754,7 +737,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             val res = provider.customSession.get(provider.buildTmdbUrl("/$currentType/$missingId"), timeout = 10).parsedSafe<TmdbDetailResponse>()
                             res?.toTmdbMedia(currentType)
                         } catch(e:Exception) { 
-                            println("[StremioC v1.127-TRACKING] ERROR: 누락된 미디어 병합 조회 실패 - ${e.message}")
+                            println("[StremioC v1.123-TRACKING] ERROR: 누락된 미디어 병합 조회 실패 - ${e.message}")
                             null 
                         }
                     }
@@ -838,7 +821,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                                         }
                                     }
                                 } catch (e: Exception) {
-                                    println("[StremioC v1.127-TRACKING] ERROR: 시즌 정보 호출 실패 - ${e.message}")
+                                    println("[StremioC v1.123-TRACKING] ERROR: 시즌 정보 호출 실패 - ${e.message}")
                                 }
                             }
                         }.awaitAll()
@@ -913,7 +896,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
             if (finalImdbId == null) {
                 finalImdbId = logo?.let { IMDB_ID_REGEX.find(it)?.value } ?: poster?.let { IMDB_ID_REGEX.find(it)?.value } ?: background?.let { IMDB_ID_REGEX.find(it)?.value }
                 if (finalImdbId != null) {
-                    println("[StremioC v1.127-TRACKING] 🔍 로컬 이미지 URL 정규식 검사로 숨겨진 IMDb ID($finalImdbId) 0.001초 발굴 성공")
+                    println("[StremioC v1.123-TRACKING] 🔍 로컬 이미지 URL 정규식 검사로 숨겨진 IMDb ID($finalImdbId) 0.001초 발굴 성공")
                 }
             }
 
@@ -933,7 +916,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                             } else null
                         }
                     } catch (e: Exception) { 
-                        println("[StremioC v1.127-TRACKING] ERROR: TMDB ID 검색 실패 - ${e.message}")
+                        println("[StremioC v1.123-TRACKING] ERROR: TMDB ID 검색 실패 - ${e.message}")
                         null 
                     }
                 }
@@ -976,7 +959,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     val refinedMediaType = foundMediaType ?: if (isSingleMovieVideo || finalType == "movie" || finalVideos.isNullOrEmpty()) "movie" else "tv"
                     tmdbData = fetchTmdbDetails(provider, refinedMediaType, tmdbIdStr, refinedMediaType == "movie", finalImdbId, finalType, finalVideos, preFetchedDetail)
                 } catch (e: Exception) {
-                    println("[StremioC v1.127-TRACKING] ERROR: fetchTmdbDetails 처리 중 예외 - ${e.message}")
+                    println("[StremioC v1.123-TRACKING] ERROR: fetchTmdbDetails 처리 중 예외 - ${e.message}")
                 }
             }
 
