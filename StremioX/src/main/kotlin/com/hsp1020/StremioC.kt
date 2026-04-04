@@ -755,7 +755,7 @@ class StremioC(override var mainUrl: String, override var name: String) : MainAP
                     if (media.id in simklIds) score += 2.0 
                     if (media.id in tmdbRecsIds) score += 1.7 
                     Pair(media, score)
-                }.sortedByDescending { it.second }.map { it.first }.take(50) 
+                }.sortedByDescending { it.second }.map { it.first }.take(15) 
 
                 fetchedRecommendations = finalCombinedMedia.mapNotNull { media ->
                     val recTitle = media.title ?: media.name ?: media.originalTitle ?: return@mapNotNull null
