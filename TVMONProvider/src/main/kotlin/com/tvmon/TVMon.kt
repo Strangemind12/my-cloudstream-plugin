@@ -136,10 +136,11 @@ class TVMon : MainAPI() {
         }
     }
 
+    // v1.8.1: 검색 로직 폴백 구조 변경 (try-catch 블록 활용 및 delay 제거)
     override suspend fun search(query: String): List<SearchResponse> {
-        println("[TVMon][v1.8] 검색 실행: $query")
+        println("[TVMon][v1.8.1] 검색 실행: $query")
         
-        // [v1.8 추가] 검색어 한글 URL 인코딩 처리
+        // 검색어 한글 URL 인코딩 처리
         val encodedQuery = try {
             URLEncoder.encode(query, "UTF-8")
         } catch (e: Exception) {
@@ -147,43 +148,46 @@ class TVMon : MainAPI() {
         }
         
         val searchUrl = "$mainUrl/search?stx=$encodedQuery"
-        
+        val searchHeaders = commonHeaders.toMutableMap()
+        searchHeaders["Referer"] = "$mainUrl/"
+
         return try {
-            val searchHeaders = commonHeaders.toMutableMap()
-            searchHeaders["Referer"] = "$mainUrl/"
-
-            println("[TVMon][v1.8] 1차 검색 요청 시도: $searchUrl")
-            var response = app.get(searchUrl, headers = searchHeaders)
-            var doc = response.document
-            
-            // [v1.8 핵심 추가] 520 에러 확인 로직: HTTP 코드 또는 문서 내용 기반 감지
-            if (response.code == 520 || doc.title().contains("520: Web server is returning an unknown error") || doc.text().contains("Error 520")) {
-                println("[TVMon][v1.8] 520 에러 감지됨. 세션/쿠키 획득을 위해 메인 페이지 핑 시도.")
-                
-                // 1. 메인 페이지를 1회 호출하여 정상적인 쿠키와 세션 강제 발급 유도
-                app.get("$mainUrl/", headers = commonHeaders)
-                delay(500) // 쿠키 발급 후 약간의 지연 시간 부여
-                
-                // 2. 확보된 쿠키를 바탕으로 2차 검색 재요청
-                println("[TVMon][v1.8] 세션 획득 완료. 2차 검색 재요청 실행")
-                response = app.get(searchUrl, headers = searchHeaders)
-                doc = response.document
-            }
-
-            var items = doc.select("ul#mov_con_list li").mapNotNull { it.toSearchResponse() }
-            if (items.isEmpty()) {
-                 items = doc.select(".mov_list ul li, .item").mapNotNull { it.toSearchResponse() }
-            }
-            
-            println("[TVMon][v1.8] 검색 결과 파싱 완료. 개수: ${items.size}")
-            items
+            println("[TVMon][v1.8.1] 1차 검색 요청 시도: $searchUrl")
+            val response = app.get(searchUrl, headers = searchHeaders)
+            parseSearchResponse(response.document) // 헬퍼 함수로 전달
         } catch (e: Exception) {
             if (e is CancellationException) throw e
-            println("[TVMon][v1.8] 검색 중 에러 발생: ${e.message}")
-            emptyList()
+            
+            // 핵심: 520 에러 시 app.get()이 곧바로 Exception을 던지므로 여기서 폴백 로직 수행
+            println("[TVMon][v1.8.1] 1차 검색 실패 감지(가설: 520 에러 및 세션 누락). 에러: ${e.message}")
+            println("[TVMon][v1.8.1] 타임아웃 방지를 위해 delay 없이 즉시 메인 페이지 접속 시도")
+            
+            try {
+                // 세션 및 쿠키 획득을 위한 메인 페이지 핑
+                app.get("$mainUrl/", headers = commonHeaders)
+                println("[TVMon][v1.8.1] 세션 확보 완료. 2차 검색 재요청 실행")
+                
+                // 확보된 세션으로 2차 검색
+                val fallbackResponse = app.get(searchUrl, headers = searchHeaders)
+                parseSearchResponse(fallbackResponse.document)
+            } catch (fallbackError: Exception) {
+                if (fallbackError is CancellationException) throw fallbackError
+                println("[TVMon][v1.8.1] 2차 검색 마저 실패: ${fallbackError.message}")
+                emptyList()
+            }
         }
     }
 
+    // [v1.8.1 추가] 중복되는 파싱 로직을 분리한 헬퍼 함수
+    private fun parseSearchResponse(doc: Document): List<SearchResponse> {
+        var items = doc.select("ul#mov_con_list li").mapNotNull { it.toSearchResponse() }
+        if (items.isEmpty()) {
+            items = doc.select(".mov_list ul li, .item").mapNotNull { it.toSearchResponse() }
+        }
+        println("[TVMon][v1.8.1] 검색 결과 파싱 완료. 개수: ${items.size}")
+        return items
+    }
+    
     override suspend fun load(url: String): LoadResponse {
         println("[TVMon][v1.8] 상세 페이지 load 진입: $url")
 
