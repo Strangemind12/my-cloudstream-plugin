@@ -135,7 +135,7 @@ class TVWiki : MainAPI() {
             val startNum = match?.groupValues?.get(1)?.toIntOrNull() ?: 7
             
             println("[TVWiki v2.6] 번호 순차 스캔 시작 (tvwiki$startNum 부터)")
-            for (i in startNum..startNum + 20) {
+            for (i in startNum..startNum + 50) {
                 val testDomain = "https://tvwiki$i.net"
                 val testUrl = "$testDomain$testPath"
                 println("[TVWiki v2.6] 스캔 시도: $testUrl")
