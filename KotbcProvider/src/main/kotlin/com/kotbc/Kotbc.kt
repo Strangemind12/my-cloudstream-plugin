@@ -100,7 +100,7 @@ class Kotbc : MainAPI() {
             val startNum = match?.groupValues?.get(1)?.toIntOrNull() ?: 142
             
             println("[Kotbc v4.3] 도메인 번호 순차 스캔 시작 (m$startNum 부터)")
-            for (i in startNum..startNum + 20) {
+            for (i in startNum..startNum + 50) {
                 val testUrl = "https://m$i.kotbc2.com"
                 println("[Kotbc v4.3] 스캔 시도: $testUrl")
                 try {
