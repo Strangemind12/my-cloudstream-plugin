@@ -18,7 +18,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.CancellationException
 
 /**
- * TVMon Provider v1.10
+ * TVMon Provider v1.11
  * [변경 이력]
  * - v1.4: 상세 정보 태그화 도입
  * - v1.5: "공개일" 값이 사라지는 버그 수정 (정규식 정교화 및 태그 정제 로직 보완)
@@ -27,6 +27,7 @@ import kotlinx.coroutines.CancellationException
  * - v1.8: 검색 시 발생하는 520 에러 수정 (검색어 URL 인코딩 명시 및 쿠키/세션 누락 방지를 위한 메인 페이지 사전 방문 로직 추가)
  * - v1.9: 200 응답 코드로 위장한 520/봇 방어 페이지 대응 HTML 파싱 조건 및 Exception 기반 폴백 로직 통합, 딜레이 제거, 상세 디버깅 로그 복구
  * - v1.10: 봇 방어 감지 로직을 텍스트 기반에서 '구조 기반(HTML 태그 유무)'으로 전면 교체하여 우회 폴백 정확도 향상
+ * - v1.11: 방어 페이지 판별 불가에 따른 로직 개편. 조건부 폴백을 폐기하고, 검색 전 무조건 메인 페이지를 선행 방문(사전 핑)하여 세션을 강제 획득하는 방식을 1차 로직으로 고정.
  */
 class TVMon : MainAPI() {
     override var mainUrl = "https://tvmon.site"
@@ -78,7 +79,7 @@ class TVMon : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = "$mainUrl${request.data}?page=$page"
-        println("[TVMon][v1.10] getMainPage 요청: $url")
+        println("[TVMon][v1.11] getMainPage 요청: $url")
         
         return try {
             val doc = requestMutex.withLock {
@@ -138,12 +139,12 @@ class TVMon : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        println("[TVMon][v1.10] 검색 실행: $query")
+        println("[TVMon][v1.11] 검색 실행: $query")
         
         val encodedQuery = try {
             URLEncoder.encode(query, "UTF-8")
         } catch (e: Exception) {
-            println("[TVMon][v1.10] URL 인코딩 실패, 원본 쿼리 사용")
+            println("[TVMon][v1.11] URL 인코딩 실패, 원본 쿼리 사용")
             query
         }
         
@@ -152,60 +153,30 @@ class TVMon : MainAPI() {
         searchHeaders["Referer"] = "$mainUrl/"
 
         return try {
-            println("[TVMon][v1.10] 1차 검색 요청: $searchUrl")
-            var response = app.get(searchUrl, headers = searchHeaders)
-            var doc = response.document
+            // [v1.11 핵심 개편] 조건부 판별을 버리고 무조건 메인 페이지 사전 핑 강제
+            println("[TVMon][v1.11] 봇 방어 우회를 위한 메인 페이지 사전 핑(Ping) 1회 실행")
+            app.get("$mainUrl/", headers = commonHeaders)
             
-            // [v1.10 핵심 수정] 텍스트가 아닌 구조(HTML 클래스/ID 유무) 기반 봇 방어 감지
-            val isErrorPage = response.code != 200 || doc.select(".mov_list, #mov_con_list, #bo_v_movinfo").isEmpty()
-                              
-            if (isErrorPage) {
-                println("[TVMon][v1.10] 1차 응답에서 비정상 구조(봇 방어 레이아웃) 감지됨 (HTTP 코드: ${response.code})")
-                println("[TVMon][v1.10] 세션/쿠키 획득을 위해 메인 페이지 우회 핑 시도")
-                app.get("$mainUrl/", headers = commonHeaders)
-                
-                println("[TVMon][v1.10] 메인 페이지 핑 완료, 2차 검색 재요청 시도")
-                response = app.get(searchUrl, headers = searchHeaders)
-                doc = response.document
-            } else {
-                println("[TVMon][v1.10] 1차 검색 정상 응답 확인 (TVMon 레이아웃 존재)")
-            }
-
+            println("[TVMon][v1.11] 세션 확보 완료. 실제 검색 요청 시도: $searchUrl")
+            val response = app.get(searchUrl, headers = searchHeaders)
+            val doc = response.document
+            
             var items = doc.select("ul#mov_con_list li").mapNotNull { it.toSearchResponse() }
             if (items.isEmpty()) {
                  items = doc.select(".mov_list ul li, .item").mapNotNull { it.toSearchResponse() }
             }
             
-            println("[TVMon][v1.10] 검색 결과 파싱 완료. 개수: ${items.size}")
+            println("[TVMon][v1.11] 검색 결과 파싱 완료. 개수: ${items.size}")
             items
         } catch (e: Exception) {
             if (e is CancellationException) throw e
-            println("[TVMon][v1.10] 1차 검색 중 Exception 발생 (가설: Interceptor 강제 에러): ${e.message}")
-            
-            try {
-                println("[TVMon][v1.10] Exception 기반 폴백 로직 실행: 메인 페이지 핑 시도")
-                app.get("$mainUrl/", headers = commonHeaders)
-                
-                println("[TVMon][v1.10] 메인 페이지 핑 완료, 2차 검색 재요청 시도")
-                val fallbackResponse = app.get(searchUrl, headers = searchHeaders)
-                val fallbackDoc = fallbackResponse.document
-                
-                var fallbackItems = fallbackDoc.select("ul#mov_con_list li").mapNotNull { it.toSearchResponse() }
-                if (fallbackItems.isEmpty()) {
-                     fallbackItems = fallbackDoc.select(".mov_list ul li, .item").mapNotNull { it.toSearchResponse() }
-                }
-                println("[TVMon][v1.10] 폴백 검색 결과 파싱 완료. 개수: ${fallbackItems.size}")
-                fallbackItems
-            } catch (fallbackError: Exception) {
-                if (fallbackError is CancellationException) throw fallbackError
-                println("[TVMon][v1.10] 폴백 검색마저 실패: ${fallbackError.message}")
-                emptyList()
-            }
+            println("[TVMon][v1.11] 검색 중 에러 발생: ${e.message}")
+            emptyList()
         }
     }
 
     override suspend fun load(url: String): LoadResponse {
-        println("[TVMon][v1.10] 상세 페이지 load 진입: $url")
+        println("[TVMon][v1.11] 상세 페이지 load 진입: $url")
 
         var passedPoster: String? = null
         var realUrl = url
@@ -314,7 +285,7 @@ class TVMon : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("[TVMon][v1.10] loadLinks 진입")
+        println("[TVMon][v1.11] loadLinks 진입")
         val doc = try {
             app.get(data, headers = commonHeaders).document
         } catch (e: Exception) {
@@ -336,7 +307,7 @@ class TVMon : MainAPI() {
         }
 
         try {
-            println("[TVMon][v1.10] WebViewResolver를 통한 동적 iframe 추출 시도")
+            println("[TVMon][v1.11] WebViewResolver를 통한 동적 iframe 추출 시도")
             val webViewInterceptor = WebViewResolver(
                 Regex("bunny-frame|googleapis"), 
                 timeout = 15000L
@@ -347,7 +318,7 @@ class TVMon : MainAPI() {
             val wbIframe = webViewDoc.selectFirst("iframe#view_iframe") ?: webViewDoc.selectFirst("iframe[src*='bunny-frame']")
             if (wbIframe != null) {
                 val playerUrl = wbIframe.attr("src")
-                println("[TVMon][v1.10] WebViewResolver 추출 성공: $playerUrl")
+                println("[TVMon][v1.11] WebViewResolver 추출 성공: $playerUrl")
                 if (playerUrl.contains("player.bunny-frame.online")) {
                      val extracted = BunnyPoorCdn().extract(fixUrl(playerUrl).replace("&amp;", "&"), data, subtitleCallback, callback, null)
                      if(extracted) return true
@@ -355,13 +326,13 @@ class TVMon : MainAPI() {
             }
         } catch (e: Exception) {
             if (e is CancellationException) throw e
-            println("[TVMon][v1.10] WebViewResolver 추출 예외: ${e.message}")
+            println("[TVMon][v1.11] WebViewResolver 추출 예외: ${e.message}")
         }
 
         val thumbnailHint = extractThumbnailHint(doc)
         if (thumbnailHint != null) {
             try {
-                println("[TVMon][v1.10] thumbnailHint를 이용한 우회 재생 시도")
+                println("[TVMon][v1.11] thumbnailHint를 이용한 우회 재생 시도")
                 val pathRegex = Regex("""/v/[a-z]/[a-zA-Z0-9]+""")
                 val pathMatch = pathRegex.find(thumbnailHint)
                 if (pathMatch != null) {
@@ -392,7 +363,7 @@ class TVMon : MainAPI() {
 
             if (sessionData.isNullOrEmpty()) return false
 
-            println("[TVMon][v1.10] 세션 API 요청 시도")
+            println("[TVMon][v1.11] 세션 API 요청 시도")
             val apiUrl = "$mainUrl/api/create_session.php"
             val headers = commonHeaders.toMutableMap()
             headers["Content-Type"] = "application/json"
@@ -405,7 +376,7 @@ class TVMon : MainAPI() {
 
             if (json != null && json.success && !json.playerUrl.isNullOrEmpty()) {
                 val fullUrl = "${json.playerUrl}?t=${json.t}&sig=${json.sig}"
-                println("[TVMon][v1.10] API 세션 획득 성공. Player URL: $fullUrl")
+                println("[TVMon][v1.11] API 세션 획득 성공. Player URL: $fullUrl")
                 if (fullUrl.contains("player.bunny-frame.online")) {
                     return BunnyPoorCdn().extract(fullUrl, refererUrl, subtitleCallback, callback, null)
                 }
