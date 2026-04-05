@@ -12,20 +12,20 @@ import java.net.URLEncoder
 import com.fasterxml.jackson.annotation.JsonProperty
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
-
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.CancellationException
 
 /**
- * TVMon Provider v1.8
+ * TVMon Provider v1.9
  * [변경 이력]
  * - v1.4: 상세 정보 태그화 도입
  * - v1.5: "공개일" 값이 사라지는 버그 수정 (정규식 정교화 및 태그 정제 로직 보완)
  * - v1.6: TVWiki와 동일하게 API 기반 세션 처리(create_session.php) 및 WebViewResolver 폴백 적용 (c.html 파싱 실패 오류 수정)
  * - v1.7: TVWiki의 안티봇 우회 로직(Mutex 직렬화 및 랜덤 지연) 및 코루틴 취소(CancellationException) 방어 로직 적용
  * - v1.8: 검색 시 발생하는 520 에러 수정 (검색어 URL 인코딩 명시 및 쿠키/세션 누락 방지를 위한 메인 페이지 사전 방문 로직 추가)
+ * - v1.9: 200 응답 코드로 위장한 520/봇 방어 페이지 대응 HTML 파싱 조건 및 Exception 기반 폴백 로직 통합, 딜레이 제거
  */
 class TVMon : MainAPI() {
     override var mainUrl = "https://tvmon.site"
@@ -136,11 +136,7 @@ class TVMon : MainAPI() {
         }
     }
 
-    // v1.8.1: 검색 로직 폴백 구조 변경 (try-catch 블록 활용 및 delay 제거)
     override suspend fun search(query: String): List<SearchResponse> {
-        println("[TVMon][v1.8.1] 검색 실행: $query")
-        
-        // 검색어 한글 URL 인코딩 처리
         val encodedQuery = try {
             URLEncoder.encode(query, "UTF-8")
         } catch (e: Exception) {
@@ -152,42 +148,45 @@ class TVMon : MainAPI() {
         searchHeaders["Referer"] = "$mainUrl/"
 
         return try {
-            println("[TVMon][v1.8.1] 1차 검색 요청 시도: $searchUrl")
-            val response = app.get(searchUrl, headers = searchHeaders)
-            parseSearchResponse(response.document) // 헬퍼 함수로 전달
+            var response = app.get(searchUrl, headers = searchHeaders)
+            var doc = response.document
+            
+            val isErrorPage = response.code == 520 || 
+                              doc.title().contains("520") || 
+                              doc.text().contains("Error 520") || 
+                              doc.title().contains("Just a moment")
+                              
+            if (isErrorPage) {
+                app.get("$mainUrl/", headers = commonHeaders)
+                response = app.get(searchUrl, headers = searchHeaders)
+                doc = response.document
+            }
+
+            var items = doc.select("ul#mov_con_list li").mapNotNull { it.toSearchResponse() }
+            if (items.isEmpty()) {
+                 items = doc.select(".mov_list ul li, .item").mapNotNull { it.toSearchResponse() }
+            }
+            
+            items
         } catch (e: Exception) {
             if (e is CancellationException) throw e
-            
-            // 핵심: 520 에러 시 app.get()이 곧바로 Exception을 던지므로 여기서 폴백 로직 수행
-            println("[TVMon][v1.8.1] 1차 검색 실패 감지(가설: 520 에러 및 세션 누락). 에러: ${e.message}")
-            println("[TVMon][v1.8.1] 타임아웃 방지를 위해 delay 없이 즉시 메인 페이지 접속 시도")
-            
             try {
-                // 세션 및 쿠키 획득을 위한 메인 페이지 핑
                 app.get("$mainUrl/", headers = commonHeaders)
-                println("[TVMon][v1.8.1] 세션 확보 완료. 2차 검색 재요청 실행")
-                
-                // 확보된 세션으로 2차 검색
                 val fallbackResponse = app.get(searchUrl, headers = searchHeaders)
-                parseSearchResponse(fallbackResponse.document)
+                val fallbackDoc = fallbackResponse.document
+                
+                var fallbackItems = fallbackDoc.select("ul#mov_con_list li").mapNotNull { it.toSearchResponse() }
+                if (fallbackItems.isEmpty()) {
+                     fallbackItems = fallbackDoc.select(".mov_list ul li, .item").mapNotNull { it.toSearchResponse() }
+                }
+                fallbackItems
             } catch (fallbackError: Exception) {
                 if (fallbackError is CancellationException) throw fallbackError
-                println("[TVMon][v1.8.1] 2차 검색 마저 실패: ${fallbackError.message}")
                 emptyList()
             }
         }
     }
 
-    // [v1.8.1 추가] 중복되는 파싱 로직을 분리한 헬퍼 함수
-    private fun parseSearchResponse(doc: Document): List<SearchResponse> {
-        var items = doc.select("ul#mov_con_list li").mapNotNull { it.toSearchResponse() }
-        if (items.isEmpty()) {
-            items = doc.select(".mov_list ul li, .item").mapNotNull { it.toSearchResponse() }
-        }
-        println("[TVMon][v1.8.1] 검색 결과 파싱 완료. 개수: ${items.size}")
-        return items
-    }
-    
     override suspend fun load(url: String): LoadResponse {
         println("[TVMon][v1.8] 상세 페이지 load 진입: $url")
 
