@@ -20,7 +20,6 @@ import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.suspendCancellableCoroutine
 import java.io.BufferedReader
 import java.io.InputStreamReader
@@ -136,7 +135,6 @@ class BunnyPoorCdn : ExtractorApi() {
         var webView: WebView? = null
         var detectedCUrl: String? = null
 
-        //[공통 개선] invokeOnCancellation 메모리 릭 방지
         cont.invokeOnCancellation {
             handler.post { try { webView?.destroy(); webView = null } catch(e: Exception){} }
         }
@@ -187,7 +185,6 @@ class BunnyPoorCdn : ExtractorApi() {
                         if (msg.startsWith("CapturedKeyHex:")) {
                             val key = msg.substringAfter("CapturedKeyHex:").removePrefix("[SET]").removePrefix("[CRYPTO]")
                             if (sessionKeys.add(key)) { 
-                                // [공통 개선] 7초 무의미한 딜레이 컷 - 1초 만에 키 찾으면 즉시 재생 (속도 향상)
                                 if (detectedCUrl != null && cont.isActive) {
                                     handler.removeCallbacksAndMessages(null)
                                     handler.post { try { webView?.destroy(); webView = null } catch(e: Exception){}; cont.resume(detectedCUrl) }
@@ -206,7 +203,6 @@ class BunnyPoorCdn : ExtractorApi() {
                     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                         val reqUrl = request?.url?.toString() ?: ""
                         
-                        // [고유 개선] JS 우회 실패(WASM 처리)를 대비한 네트워크 캡처 보조 로직
                         if (reqUrl.contains("/key.bin") || reqUrl.contains("key7")) {
                             thread {
                                 try {
@@ -225,7 +221,6 @@ class BunnyPoorCdn : ExtractorApi() {
                         if (reqUrl.contains("/c.html") && reqUrl.contains("token=")) {
                             detectedCUrl = reqUrl
                             view?.post { view.evaluateJavascript(hookScript, null) }
-                            // JS Hook 실패 시 Fallback (7초 -> 5초로 감소)
                             handler.postDelayed({
                                 if (cont.isActive) { try { webView?.destroy(); webView = null } catch (e: Exception) {}; cont.resume(detectedCUrl) }
                             }, 5000)
@@ -265,7 +260,11 @@ class BunnyPoorCdn : ExtractorApi() {
                 isRunning = true
                 CoroutineScope(Dispatchers.IO).launch {
                     while (isRunning && serverSocket != null && !serverSocket!!.isClosed) { 
-                        try { handleClient(serverSocket!!.accept()) } catch (e: Exception) {} 
+                        try { 
+                            val socket = serverSocket!!.accept()
+                            // [수정점] runBlocking 에러 해결을 위해 완전 비동기 코루틴으로 호출 처리
+                            launch { handleClient(socket) }
+                        } catch (e: Exception) {} 
                     } 
                 }
             } catch (e: Exception) { }
@@ -277,14 +276,14 @@ class BunnyPoorCdn : ExtractorApi() {
         fun setIv(iv: ByteArray) { currentIv = iv }
         fun setTestSegment(url: String) { if (testSegmentUrl == null) testSegmentUrl = url }
 
-        private fun handleClient(socket: Socket) {
+        // [수정점] suspend 함수로 변환하여 에러 발생 원천 차단
+        private suspend fun handleClient(socket: Socket) {
             try {
                 socket.soTimeout = 5000
                 val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
                 val path = reader.readLine()?.split(" ")?.getOrNull(1) ?: return
                 val output = socket.getOutputStream()
 
-                // [공통 개선] Connection: close, Content-Length
                 if (path.contains("playlist.m3u8")) {
                     val payload = currentPlaylist.toByteArray()
                     output.write("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nConnection: close\r\nContent-Length: ${payload.size}\r\nAccess-Control-Allow-Origin: *\r\n\r\n".toByteArray())
@@ -295,13 +294,14 @@ class BunnyPoorCdn : ExtractorApi() {
                     output.write("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nConnection: close\r\nContent-Length: ${keyPayload.size}\r\nAccess-Control-Allow-Origin: *\r\n\r\n".toByteArray())
                     output.write(keyPayload)
                 }
-                output.flush(); socket.close()
+                output.flush()
             } catch (e: Exception) { 
             } finally { try { socket.close() } catch(e: Exception) {} }
         }
 
-        private fun verifyMultipleKeys(): ByteArray? = runBlocking {
-            val url = testSegmentUrl ?: return@runBlocking null
+        //[수정점] runBlocking 제거하고 안전한 suspend 함수로 변환
+        private suspend fun verifyMultipleKeys(): ByteArray? {
+            val url = testSegmentUrl ?: return null
             val targetIv = currentIv ?: ByteArray(16)
             try {
                 val responseData = app.get(url, headers = currentHeaders).body.bytes()
@@ -318,14 +318,14 @@ class BunnyPoorCdn : ExtractorApi() {
                                 val decrypted = decryptAES(testChunk, keyBytes, targetIv)
                                 
                                 if (decrypted.size >= 377 && decrypted[0] == 0x47.toByte() && decrypted[188] == 0x47.toByte() && decrypted[376] == 0x47.toByte()) {
-                                    return@synchronized keyBytes
+                                    return keyBytes
                                 }
                             }
                         } catch (e: Exception) {}
                     }
-                    null
+                    return null
                 }
-            } catch (e: Exception) { null }
+            } catch (e: Exception) { return null }
         }
 
         private fun decryptAES(data: ByteArray, key: ByteArray, iv: ByteArray): ByteArray {
