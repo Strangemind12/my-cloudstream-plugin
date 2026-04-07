@@ -4,20 +4,15 @@ import android.util.Base64
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.SubtitleFile
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import java.io.*
 import java.net.*
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
-import kotlin.concurrent.thread
 
-/**
- * v124-6: 비디오 ID 파싱 정규식 개선 및 동적 호스트 지원
- * [변경 이력]
- * - v124-6: /v1/, /v2/, /v99/ 등 모든 버전 숫자에 동적으로 대응하도록 정규식(Regex("/v\\d+/")) 적용.
- * - v124-5: 도메인에 맞게 Referer/Origin 헤더 동적 생성.
- * - v124-4: 비디오 ID 파싱 디버깅 로그 추가.
- */
 class BcbcRedExtractor : ExtractorApi() {
     override val name = "MovieKingPlayer"
     override val mainUrl = "https://player-v2.bcbc.red"
@@ -29,21 +24,12 @@ class BcbcRedExtractor : ExtractorApi() {
     }
 
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
-        println("=== [MovieKing v124-6] getUrl Start (Hybrid Proxy 구조) ===")
-        println("[MovieKing v124-6] [DEBUG] 플레이어 원본 URL: $url")
-        
         try {
             val videoId = extractVideoIdDeep(url)
-            println("[MovieKing v124-6] [DEBUG] 최종 확정된 비디오 ID: $videoId")
-            
-            // v124-5 유지: 동적으로 호스트 추출하여 Referer와 Origin 설정
             val uri = URI(url)
             val hostUrl = "${uri.scheme}://${uri.host}"
-            println("[MovieKing v124-6] [DEBUG] 동적 추출된 호스트: $hostUrl")
-            
             val baseHeaders = mutableMapOf("Referer" to "$hostUrl/", "Origin" to hostUrl, "User-Agent" to DESKTOP_UA)
             
-            println("[MovieKing v124-6] 플레이어 HTML 및 원본 M3U8 요청 시작")
             val playerHtml = app.get(url, headers = baseHeaders).text
             val m3u8Url = Regex("""data-m3u8\s*=\s*['"]([^'"]+)['"]""").find(playerHtml)?.groupValues?.get(1)?.replace("\\/", "/") ?: return
             val playlistRes = app.get(m3u8Url, headers = baseHeaders).text
@@ -70,7 +56,6 @@ class BcbcRedExtractor : ExtractorApi() {
 
             if (firstSegmentUrl != null && candidates.isNotEmpty()) {
                 try {
-                    println("[MovieKing v124-6] 정답 키 조합을 위해 첫 세그먼트 단발성 다운로드: $firstSegmentUrl")
                     val firstSegBytes = app.get(firstSegmentUrl, headers = baseHeaders).body.bytes()
                     val ivs = getIvList(firstSeq, hexIv)
                     val checkSize = Math.min(firstSegBytes.size, 188 * 2)
@@ -83,7 +68,6 @@ class BcbcRedExtractor : ExtractorApi() {
                                 val head = cipher.update(firstSegBytes.take(checkSize).toByteArray())
                                 
                                 if (head.isNotEmpty() && head[0] == 0x47.toByte() && head.size > 188 && head[188] == 0x47.toByte()) {
-                                    println("[MovieKing v124-6] 정답 키 선행 검증 완료! Key#$keyIdx, IV_Type#$ivIdx")
                                     confirmedKey = key
                                     confirmedIvType = ivIdx
                                     break@outer
@@ -91,9 +75,7 @@ class BcbcRedExtractor : ExtractorApi() {
                             } catch (e: Exception) {}
                         }
                     }
-                } catch (e: Exception) {
-                    println("[MovieKing v124-6] 세그먼트 선행 다운로드 또는 복호화 에러: ${e.message}")
-                }
+                } catch (e: Exception) {}
             }
 
             proxyServer?.stop()
@@ -104,7 +86,6 @@ class BcbcRedExtractor : ExtractorApi() {
             for (line in lines) {
                 if (line.startsWith("#EXT-X-KEY")) {
                     var newKeyLine = """#EXT-X-KEY:METHOD=AES-128,URI="http://127.0.0.1:${proxyServer!!.port}/key.bin""""
-                    
                     if (confirmedIvType == 0 && hexIv != null) {
                         newKeyLine += """,IV=$hexIv"""
                     } else if (confirmedIvType == 2) {
@@ -123,52 +104,23 @@ class BcbcRedExtractor : ExtractorApi() {
             proxyServer!!.updateData(finalM3u8, confirmedKey)
             
             val finalUrl = "http://127.0.0.1:${proxyServer!!.port}/$videoId/playlist.m3u8"
-            println("[MovieKing v124-6] 클라우드스트림 플레이어로 하이브리드 링크 전달: $finalUrl")
             
-            callback(newExtractorLink(name, name, finalUrl, ExtractorLinkType.M3U8) { 
-                this.referer = "$hostUrl/" 
-            })
-        } catch (e: Exception) { 
-            println("[MovieKing v124-6] FATAL Error: $e") 
-        }
+            callback(newExtractorLink(name, name, finalUrl, ExtractorLinkType.M3U8) { this.referer = "$hostUrl/" })
+        } catch (e: Exception) {}
     }
 
     private fun extractVideoIdDeep(url: String): String {
-        println("[MovieKing v124-6] [DEBUG] extractVideoIdDeep 분석 시작. 입력 URL: $url")
         try {
-            // v124-6: 정규식을 사용하여 /v1/, /v2/, /v99/ 등 동적인 버전에 완벽 대응
             val parts = url.split(Regex("/v\\d+/"))
-            if (parts.size < 2) {
-                println("[MovieKing v124-6] [DEBUG] URL에 '/v숫자/' 패턴이 포함되어 있지 않습니다. 새로운 구조일 수 있습니다.")
-                return "ID_ERR"
-            }
-            
-            val tokenStr = parts[1]
-            println("[MovieKing v124-6] [DEBUG] /v숫자/ 이후 추출된 토큰 원본: $tokenStr")
-            
-            val tokenParts = tokenStr.split(".")
-            val payload = tokenParts.getOrNull(1)
-            
-            if (payload != null) {
-                println("[MovieKing v124-6] [DEBUG] JWT Payload 분리 성공: $payload")
-                
-                val decoded = String(Base64.decode(payload, Base64.URL_SAFE))
-                println("[MovieKing v124-6] [DEBUG] Base64 디코딩된 JSON 텍스트: $decoded")
-                
-                val idMatch = Regex(""""id"\s*:\s*(\d+)""").find(decoded)
-                if (idMatch != null) {
-                    val id = idMatch.groupValues[1]
-                    println("[MovieKing v124-6] [DEBUG] 'id' 정규식 매칭 성공: $id")
-                    return id
-                } else {
-                    println("[MovieKing v124-6] [DEBUG] 디코딩된 텍스트에서 '\"id\": 숫자' 패턴을 찾을 수 없습니다.")
+            if (parts.size >= 2) {
+                val payload = parts[1].split(".").getOrNull(1)
+                if (payload != null) {
+                    val decoded = String(Base64.decode(payload, Base64.URL_SAFE))
+                    val idMatch = Regex(""""id"\s*:\s*(\d+)""").find(decoded)
+                    if (idMatch != null) return idMatch.groupValues[1]
                 }
-            } else {
-                println("[MovieKing v124-6] [DEBUG] 토큰이 '.'으로 분리되지 않습니다. JWT 형식이 아닐 수 있습니다.")
             }
-        } catch (e: Exception) {
-            println("[MovieKing v124-6] [DEBUG] ID 파싱 중 예외 발생: ${e.message}")
-        }
+        } catch (e: Exception) {}
         return "ID_ERR"
     }
 
@@ -237,9 +189,7 @@ class BcbcRedExtractor : ExtractorApi() {
         for (i in list.indices) {
             val elem = list[i]
             val rest = list.take(i) + list.drop(i + 1)
-            for (p in generatePermutations(rest)) {
-                result.add(listOf(elem) + p)
-            }
+            for (p in generatePermutations(rest)) result.add(listOf(elem) + p)
         }
         return result
     }
@@ -262,13 +212,13 @@ class BcbcRedExtractor : ExtractorApi() {
                 serverSocket = ServerSocket(0)
                 port = serverSocket!!.localPort
                 isRunning = true
-                thread(isDaemon = true) { 
+                // [Fix] 코루틴으로 전환
+                CoroutineScope(Dispatchers.IO).launch { 
                     while (isRunning && serverSocket != null && !serverSocket!!.isClosed) { 
                         try { handleClient(serverSocket!!.accept()) } catch (e: Exception) {} 
                     } 
                 }
-                println("[MovieKing v124-6] 초경량 하이브리드 서버 시작 완료 (Port: $port)")
-            } catch (e: Exception) { println("[MovieKing v124-6] Server Start Failed: $e") }
+            } catch (e: Exception) {}
         }
 
         fun stop() {
@@ -276,19 +226,21 @@ class BcbcRedExtractor : ExtractorApi() {
             try { serverSocket?.close(); serverSocket = null } catch (e: Exception) {}
         }
         
-        private fun handleClient(socket: Socket) = thread {
+        private fun handleClient(socket: Socket) {
             try {
                 socket.soTimeout = 5000
                 val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
-                val line = reader.readLine() ?: return@thread
+                val line = reader.readLine() ?: return
                 val path = line.split(" ")[1]
                 val output = socket.getOutputStream()
 
+                // [Fix] 안정성: Connection close 및 Content-Length 적용
                 if (path.contains("/playlist.m3u8")) {
-                    val response = "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nAccess-Control-Allow-Origin: *\r\n\r\n" + finalM3u8
-                    output.write(response.toByteArray(charset("UTF-8")))
+                    val payload = finalM3u8.toByteArray(charset("UTF-8"))
+                    output.write("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nConnection: close\r\nContent-Length: ${payload.size}\r\nAccess-Control-Allow-Origin: *\r\n\r\n".toByteArray())
+                    output.write(payload)
                 } else if (path.contains("/key.bin")) {
-                    output.write("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nAccess-Control-Allow-Origin: *\r\n\r\n".toByteArray())
+                    output.write("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nConnection: close\r\nContent-Length: ${finalKey.size}\r\nAccess-Control-Allow-Origin: *\r\n\r\n".toByteArray())
                     output.write(finalKey)
                 }
                 output.flush()
