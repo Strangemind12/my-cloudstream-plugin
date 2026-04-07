@@ -1,4 +1,3 @@
-// v4.1 - True Ultra-Lightweight Hybrid Proxy (Memory Serving, Video ID Cache Collision Prevented)
 package com.anilife
 
 import android.util.Base64
@@ -7,12 +6,14 @@ import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.URI
-import kotlin.concurrent.thread
 
 class AnilifeProxyExtractor : ExtractorApi() {
     override val name = "Anilife"
@@ -54,8 +55,6 @@ class AnilifeProxyExtractor : ExtractorApi() {
         videoId: String = "unknown_id",
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        println("[Anilife][Extractor] v4.1 - True Ultra-Lightweight Memory Proxy 시작")
-        
         val cleanHeaders = mapOf(
             "User-Agent" to DESKTOP_UA,
             "Referer" to "https://anilife.live/",
@@ -94,10 +93,7 @@ class AnilifeProxyExtractor : ExtractorApi() {
                 }
             }
 
-            if (finalM3u8.isBlank()) {
-                println("[Anilife][Extractor] M3U8 주소 확보 실패")
-                return false
-            }
+            if (finalM3u8.isBlank()) return false
 
             var m3u8Content = app.get(finalM3u8, headers = cleanHeaders).text
             var baseUri = try { URI(finalM3u8) } catch (e: Exception) { null }
@@ -117,7 +113,6 @@ class AnilifeProxyExtractor : ExtractorApi() {
                 if (trimmed.isEmpty()) continue
                 
                 if (trimmed.startsWith("#EXT-X-KEY")) {
-                    println("[Anilife][Extractor] 가짜 키(Fake Key) 사전 제거됨: $trimmed")
                     continue
                 } else if (trimmed.startsWith("#")) {
                     sb.append(trimmed).append("\n")
@@ -136,9 +131,7 @@ class AnilifeProxyExtractor : ExtractorApi() {
             }
             currentProxyServer = proxy
 
-            // [핵심 변경] TVWiki, Movieking과 동일하게 URL에 videoId를 주입하여 ExoPlayer 캐시 꼬임 원천 차단
             val proxyUrl = "http://127.0.0.1:${proxy.port}/$videoId/playlist.m3u8"
-            println("[Anilife][Extractor] 초경량 메모리 프록시 세팅 완료 URL: $proxyUrl")
             
             callback(newExtractorLink(name, name, proxyUrl, ExtractorLinkType.M3U8) {
                 this.referer = "https://anilife.live/"
@@ -148,8 +141,6 @@ class AnilifeProxyExtractor : ExtractorApi() {
             return true
 
         } catch (e: Exception) {
-            e.printStackTrace()
-            println("[Anilife][Extractor] 에러 발생: ${e.message}")
             return false
         }
     }
@@ -176,12 +167,13 @@ class AnilifeProxyExtractor : ExtractorApi() {
             try {
                 serverSocket = ServerSocket(0).also { port = it.localPort }
                 isRunning = true
-                thread { 
+                // [Fix] 코루틴으로 전환
+                CoroutineScope(Dispatchers.IO).launch { 
                     while (isRunning && serverSocket != null && !serverSocket!!.isClosed) { 
                         try { handleClient(serverSocket!!.accept()) } catch (e: Exception) {} 
                     } 
                 }
-            } catch (e: Exception) { println("[Anilife][Proxy] Server Start Failed: $e") }
+            } catch (e: Exception) { }
         }
 
         fun stop() { 
@@ -203,11 +195,11 @@ class AnilifeProxyExtractor : ExtractorApi() {
 
                 val out = socket.getOutputStream()
 
-                // path가 포함하는 문자열로 판별하므로 videoId가 있어도 정상 서빙
                 if (path.contains("playlist.m3u8")) {
-                    println("[Anilife][Proxy] 초경량 M3U8 메모리 서빙 수행")
-                    out.write("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nAccess-Control-Allow-Origin: *\r\n\r\n".toByteArray())
-                    out.write(playlistData.toByteArray(charset("UTF-8")))
+                    val payload = playlistData.toByteArray(charset("UTF-8"))
+                    //[Fix] 안정성: Connection close 및 Content-Length 추가
+                    out.write("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nConnection: close\r\nContent-Length: ${payload.size}\r\nAccess-Control-Allow-Origin: *\r\n\r\n".toByteArray())
+                    out.write(payload)
                 } else {
                     out.write("HTTP/1.1 404 Not Found\r\n\r\n".toByteArray())
                 }
