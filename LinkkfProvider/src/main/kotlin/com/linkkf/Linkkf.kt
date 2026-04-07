@@ -13,9 +13,20 @@ class Linkkf : MainAPI() {
     override var lang = "ko"
     override val supportedTypes = setOf(TvType.Anime, TvType.OVA)
 
-    private val commonHeaders = mapOf("User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", "Referer" to "$mainUrl/")
+    private val commonHeaders = mapOf(
+        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", 
+        "Referer" to "$mainUrl/"
+    )
 
-    override val mainPage = mainPageOf("/label/topday" to "오늘의 인기순위", "/label/week" to "이번주 인기순위", "/label/month" to "이번달 인기순위", "/label/view" to "전체 인기순위", "/list/2/lang/TV" to "TV 애니메이션", "/list/2/lang/Movie" to "극장판", "/list/2/lang/OVA" to "OVA")
+    override val mainPage = mainPageOf(
+        "/label/topday" to "오늘의 인기순위", 
+        "/label/week" to "이번주 인기순위", 
+        "/label/month" to "이번달 인기순위", 
+        "/label/view" to "전체 인기순위", 
+        "/list/2/lang/TV" to "TV 애니메이션", 
+        "/list/2/lang/Movie" to "극장판", 
+        "/list/2/lang/OVA" to "OVA"
+    )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page == 1) "$mainUrl${request.data}/" else "${mainUrl}${if(request.data.endsWith("/")) request.data else "${request.data}/"}page/$page/"
@@ -29,8 +40,11 @@ class Linkkf : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        return try { app.get("$mainUrl/view/wd/$query/", headers = commonHeaders).document.select(".vod-item").mapNotNull { it.toSearchResponse() }
-        } catch (e: Exception) { if (e is CancellationException) throw e; emptyList() }
+        return try { 
+            app.get("$mainUrl/view/wd/$query/", headers = commonHeaders).document.select(".vod-item").mapNotNull { it.toSearchResponse() }
+        } catch (e: Exception) { 
+            if (e is CancellationException) throw e; emptyList() 
+        }
     }
 
     override suspend fun load(url: String): LoadResponse {
@@ -100,6 +114,18 @@ class Linkkf : MainAPI() {
             return true
         } catch (e: Exception) {
             if (e is CancellationException) throw e; return false
+        }
+    }
+
+    // [수정] 실수로 누락했던 파싱 확장 함수 복구
+    private fun Element.toSearchResponse(): SearchResponse? {
+        val aTag = this.selectFirst("a.vod-item-img") ?: return null
+        val title = this.selectFirst(".vod-item-title a")?.text()?.trim() ?: return null
+        val href = aTag.attr("href")
+        val poster = this.selectFirst(".img-wrapper")?.attr("data-original")?.ifEmpty { this.selectFirst("img")?.attr("src") }
+        
+        return newTvSeriesSearchResponse(title, href, TvType.Anime) { 
+            this.posterUrl = poster 
         }
     }
 }
