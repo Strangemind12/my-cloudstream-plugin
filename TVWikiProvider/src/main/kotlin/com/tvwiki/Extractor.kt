@@ -10,7 +10,6 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.webkit.CookieManager
-import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.AcraApplication
@@ -18,31 +17,29 @@ import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.mapper
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.suspendCancellableCoroutine
 import java.io.BufferedReader
 import java.io.InputStreamReader
-import java.net.HttpURLConnection
-import java.net.URL
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.URI
-import java.net.URLDecoder
 import java.util.Collections
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
-import kotlin.concurrent.thread
 import kotlin.coroutines.resume
 
 /**
- * Version: v2.0 (Hybrid Proxy & Dynamic Referer)
- * Modification:
- * 1. [PERF] 무거운 프록시 방식에서 하이브리드 프록시로 전환.
- * 2. [PERF] /seg 중계 엔드포인트 제거. TS 세그먼트는 ExoPlayer가 원본 CDN에서 직접 다운로드.
- * 3. [FIX] M3U8 리라이팅 시 세그먼트를 직접 링크로 주입하고, Key만 /key.bin으로 로컬 프록시 서빙.
- * 4. [v2.0 FIX] Referer 주입 시 현재 갱신된 최신 tvwiki 도메인으로 안전하게 우회하도록 수정
+ * Version: v2.1 (Hybrid Proxy & Dynamic Referer)
+ * Modification [v2.1]:
+ * 1. [STABILITY] 프록시 응답 헤더에 Connection: close 및 Content-Length 명시하여 ExoPlayer 무한 버퍼링 차단
+ * 2.[MEMORY] 코루틴 취소(사용자 뒤로가기) 시 백그라운드 WebView 누수(Leak) 명시적 파괴
+ * 3. [SPEED] JS 키 후킹 즉시 7초 딜레이 없이 즉시 반환하여 재생 시작 속도 비약적 향상
+ * 4. [PERF] Native Thread 대신 코루틴(Dispatchers.IO)으로 로컬 프록시 구동
  */
 class BunnyPoorCdn : ExtractorApi() {
     override val name = "TVWiki"
@@ -61,7 +58,6 @@ class BunnyPoorCdn : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        println("[TVWiki][v2.0] getUrl 호출됨. URL: $url")
         extract(url, referer, subtitleCallback, callback)
     }
 
@@ -74,26 +70,19 @@ class BunnyPoorCdn : ExtractorApi() {
     ): Boolean {
         synchronized(this) {
             if (currentProxyServer != null) {
-                println("[TVWiki][v2.0] 기존 실행 중인 프록시 서버 종료 시도.")
                 currentProxyServer?.stop()
                 currentProxyServer = null
             }
         }
 
-        println("[TVWiki][v2.0] extract() 로직 시작.")
         var cleanUrl = url.replace(Regex("[\\r\\n\\s]"), "").trim()
-        
-        // v2.0: 과거 도메인이 레퍼러로 들어오더라도 최신 갱신된 도메인으로 안전 치환
         val cleanReferer = if (referer.isNullOrEmpty() || (referer.contains("tvwiki") && !referer.contains(TVWiki.currentMainUrl))) {
             TVWiki.currentMainUrl + "/"
         } else {
             referer.replace(Regex("[\\r\\n\\s]"), "").trim()
         }
         
-        println("[TVWiki][v2.0] 최종 참조용 Referer: $cleanReferer")
-        
         if (!cleanUrl.contains("v/f/") && !cleanUrl.contains("v/e/") && !cleanUrl.contains("v/d/")) {
-            println("[TVWiki][v2.0] Referer 페이지($cleanReferer)에서 iframe 링크 탐색 시도.")
             try {
                 val refRes = app.get(cleanReferer, headers = mapOf("User-Agent" to DESKTOP_UA))
                 val iframeMatch = Regex("""src=['"](https://player\.bunny-frame\.online/[^"']+)['"]""").find(refRes.text)
@@ -101,23 +90,16 @@ class BunnyPoorCdn : ExtractorApi() {
                 
                 if (iframeMatch != null) {
                     cleanUrl = iframeMatch.groupValues[1].replace("&amp;", "&").trim()
-                    println("[TVWiki][v2.0] Iframe 링크 발견: $cleanUrl")
                 }
-            } catch (e: Exception) { 
-                println("[TVWiki][v2.0] Iframe 파싱 중 예외 발생: ${e.message}") 
-            }
+            } catch (e: Exception) { }
         }
 
         var capturedUrl: String? = cleanUrl
         val currentSessionKeys = Collections.synchronizedSet(mutableSetOf<String>())
 
         if (!cleanUrl.contains("/c.html")) {
-            println("[TVWiki][v2.0] WebView 훅 실행 필요. runWebViewHook 호출.")
             val webViewResult = runWebViewHook(cleanUrl, cleanReferer, currentSessionKeys)
-            if (webViewResult != null) {
-                capturedUrl = webViewResult
-                println("[TVWiki][v2.0] WebView 훅 성공. 캡처된 URL: $capturedUrl")
-            }
+            if (webViewResult != null) capturedUrl = webViewResult
         }
 
         if (capturedUrl != null) {
@@ -130,9 +112,7 @@ class BunnyPoorCdn : ExtractorApi() {
             if (!cookie.isNullOrEmpty()) headers["Cookie"] = cookie
 
             try {
-                println("[TVWiki][v2.0] M3U8 플레이리스트 분석 시작.")
                 var requestUrl = capturedUrl!!.substringBefore("#")
-                
                 var response = app.get(requestUrl, headers = headers)
                 var content = response.text.trim()
 
@@ -155,7 +135,6 @@ class BunnyPoorCdn : ExtractorApi() {
                 val isKey7 = content.lines().any { it.startsWith("#EXT-X-KEY") && it.contains("/v/key7") }
 
                 if (isKey7) {
-                    println("[TVWiki][v2.0] 암호화 감지됨. 하이브리드 로컬 프록시 구성 시작.")
                     val newProxy = ProxyWebServer(currentSessionKeys).apply { 
                         start()
                         updateSession(headers) 
@@ -172,7 +151,6 @@ class BunnyPoorCdn : ExtractorApi() {
                     val baseUri = try { URI(requestUrl) } catch (e: Exception) { null }
                     val sb = StringBuilder()
                     
-                    println("[TVWiki][v2.0] 하이브리드 M3U8 라인 리라이팅 시작.")
                     content.lines().forEach { line ->
                         val trimmed = line.trim()
                         if (trimmed.isEmpty()) return@forEach
@@ -194,28 +172,34 @@ class BunnyPoorCdn : ExtractorApi() {
                     newProxy.setPlaylist(sb.toString())
                     
                     val finalUrl = "http://127.0.0.1:${newProxy.port}/$videoId/playlist.m3u8"
-                    println("[TVWiki][v2.0] 하이브리드 URL 반환: $finalUrl")
                     
                     callback(newExtractorLink(name, name, finalUrl, ExtractorLinkType.M3U8) {
                         this.referer = "https://player.bunny-frame.online/"; this.headers = headers
                     })
                     return true
                 } else {
-                    println("[TVWiki][v2.0] 일반 영상 다이렉트 링크 반환.")
                     callback(newExtractorLink(name, name, requestUrl, ExtractorLinkType.M3U8) {
                         this.referer = "https://player.bunny-frame.online/"; this.headers = headers
                     })
                     return true
                 }
-            } catch (e: Exception) { 
-                println("[TVWiki][v2.0] 분석 치명적 오류: ${e.message}")
-            }
+            } catch (e: Exception) { }
         }
         return false
     }
 
     private suspend fun runWebViewHook(url: String, referer: String, sessionKeys: MutableSet<String>) = suspendCancellableCoroutine<String?> { cont ->
         val handler = Handler(Looper.getMainLooper())
+        var webView: WebView? = null
+        var detectedCUrl: String? = null
+
+        //[v2.1 Fix] 사용자 취소 시 WebView 메모리 누수 완벽 방지
+        cont.invokeOnCancellation {
+            handler.post {
+                try { webView?.destroy(); webView = null } catch (e: Exception) {}
+            }
+        }
+
         val hookScript = """
             (function() {
                 window.G = false;
@@ -251,69 +235,67 @@ class BunnyPoorCdn : ExtractorApi() {
 
         handler.post {
             try {
-                var detectedCUrl: String? = null
                 val context: Context = (AcraApplication.context ?: app) as Context
-                val webView = WebView(context)
+                webView = WebView(context)
                 
-                webView.settings.apply {
+                webView?.settings?.apply {
                     javaScriptEnabled = true; domStorageEnabled = true; userAgentString = DESKTOP_UA
                 }
 
                 val discoveryTimeout = Runnable {
                     if (cont.isActive) {
-                        try { webView.destroy() } catch (e: Exception) {}
+                        try { webView?.destroy(); webView = null } catch (e: Exception) {}
                         cont.resume(null)
                     }
                 }
                 handler.postDelayed(discoveryTimeout, 15000)
 
-                webView.webChromeClient = object : WebChromeClient() {
+                webView?.webChromeClient = object : WebChromeClient() {
                     override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
                         val msg = consoleMessage?.message() ?: ""
                         if (msg.startsWith("CapturedKeyHex:")) {
                             val key = msg.substringAfter("CapturedKeyHex:").removePrefix("[SET]").removePrefix("[CRYPTO]")
                             if (sessionKeys.add(key)) { 
-                                println("[TVWiki][v2.0] 키 캡처 성공! Key: $key")
+                                println("[TVWiki Extractor v2.1] 키 캡처 성공! Key: $key")
+                                //[v2.1 Fix] 키 발굴 즉시 무의미한 딜레이를 취소하고 곧바로 스트리밍 시작
+                                if (detectedCUrl != null && cont.isActive) {
+                                    handler.removeCallbacksAndMessages(null)
+                                    handler.post {
+                                        try { webView?.destroy(); webView = null } catch (e: Exception) {}
+                                        cont.resume(detectedCUrl)
+                                    }
+                                }
                             }
                         }
                         return true
                     }
                 }
 
-                webView.webViewClient = object : WebViewClient() {
+                webView?.webViewClient = object : WebViewClient() {
                     override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                         super.onPageStarted(view, url, favicon); view?.evaluateJavascript(hookScript, null)
                     }
 
                     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                         val reqUrl = request?.url?.toString() ?: ""
-                        
                         if (reqUrl.contains("/c.html") && reqUrl.contains("token=")) {
                             detectedCUrl = reqUrl
-                            handler.removeCallbacks(discoveryTimeout)
                             view?.post { view.evaluateJavascript(hookScript, null) }
                             
-                            thread {
-                                try {
-                                    runBlocking {
-                                        val checkRes = app.get(reqUrl, headers = mapOf("User-Agent" to DESKTOP_UA, "Referer" to "https://player.bunny-frame.online/"))
-                                        if (!checkRes.text.contains("/v/key7")) {
-                                            handler.post {
-                                                if (cont.isActive) {
-                                                    try { webView.destroy() } catch (e: Exception) {}
-                                                    cont.resume(detectedCUrl)
-                                                }
-                                            }
-                                        } else {
-                                            handler.postDelayed({
-                                                if (cont.isActive) {
-                                                    try { webView.destroy() } catch (e: Exception) {}
-                                                    cont.resume(detectedCUrl)
-                                                }
-                                            }, 7000) 
-                                        }
+                            if (sessionKeys.isNotEmpty() && cont.isActive) {
+                                handler.removeCallbacksAndMessages(null)
+                                handler.post {
+                                    try { webView?.destroy(); webView = null } catch (e: Exception) {}
+                                    cont.resume(detectedCUrl)
+                                }
+                            } else {
+                                // 기존 무조건 7초 딜레이 방식을 버리고 5초의 짧은 Fallback으로 단축
+                                handler.postDelayed({
+                                    if (cont.isActive) {
+                                        try { webView?.destroy(); webView = null } catch (e: Exception) {}
+                                        cont.resume(detectedCUrl)
                                     }
-                                } catch (e: Exception) {}
+                                }, 5000)
                             }
                         }
                         return super.shouldInterceptRequest(view, request)
@@ -323,7 +305,7 @@ class BunnyPoorCdn : ExtractorApi() {
                         super.onPageFinished(view, url); view?.evaluateJavascript(hookScript, null)
                     }
                 }
-                webView.loadUrl(url, mapOf("Referer" to referer))
+                webView?.loadUrl(url, mapOf("Referer" to referer))
             } catch (e: Exception) {
                 if (cont.isActive) cont.resume(null)
             }
@@ -353,14 +335,14 @@ class BunnyPoorCdn : ExtractorApi() {
             try {
                 serverSocket = ServerSocket(0).also { port = it.localPort }
                 isRunning = true
-                println("[TVWiki][v2.0] 초경량 하이브리드 프록시 서버 시작. Port: $port")
                 
-                thread(isDaemon = true) {
+                //[v2.1 Fix] Native Thread 대신 IO 코루틴을 사용하여 리소스 효율 극대화
+                CoroutineScope(Dispatchers.IO).launch {
                     while (isRunning) { 
                         try { handleClient(serverSocket!!.accept()) } catch (e: Exception) {} 
                     } 
                 }
-            } catch (e: Exception) { println("[TVWiki][v2.0] 프록시 시작 실패: ${e.message}") }
+            } catch (e: Exception) { }
         }
 
         fun stop() { 
@@ -387,18 +369,19 @@ class BunnyPoorCdn : ExtractorApi() {
 
                 when {
                     path.contains("playlist.m3u8") -> {
-                        println("[TVWiki][v2.0] 플레이어가 하이브리드 M3U8을 요청함")
-                        output.write("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nAccess-Control-Allow-Origin: *\r\n\r\n".toByteArray())
-                        output.write(currentPlaylist.toByteArray())
+                        val payload = currentPlaylist.toByteArray()
+                        // [v2.1 Fix] Connection: close와 Content-Length로 ExoPlayer의 무한대기 현상 해결
+                        output.write("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nConnection: close\r\nContent-Length: ${payload.size}\r\nAccess-Control-Allow-Origin: *\r\n\r\n".toByteArray())
+                        output.write(payload)
                     }
                     path.contains("/key.bin") -> {
-                        println("[TVWiki][v2.0] 플레이어가 복호화 Key를 요청함")
                         if (verifiedKey == null) {
                             verifiedKey = verifyMultipleKeys()
                         }
                         
-                        output.write("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nAccess-Control-Allow-Origin: *\r\n\r\n".toByteArray())
-                        output.write(verifiedKey ?: ByteArray(16))
+                        val keyPayload = verifiedKey ?: ByteArray(16)
+                        output.write("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nConnection: close\r\nContent-Length: ${keyPayload.size}\r\nAccess-Control-Allow-Origin: *\r\n\r\n".toByteArray())
+                        output.write(keyPayload)
                     }
                 }
                 output.flush(); socket.close()
@@ -408,8 +391,6 @@ class BunnyPoorCdn : ExtractorApi() {
         private fun verifyMultipleKeys(): ByteArray? = runBlocking {
             val url = testSegmentUrl ?: return@runBlocking null
             val targetIv = currentIv ?: ByteArray(16)
-            
-            println("[TVWiki][v2.0] 키 1회 선행 검증 시작. 대상 URL: $url")
             
             try {
                 val responseData = app.get(url, headers = currentHeaders).body.bytes()
@@ -426,13 +407,11 @@ class BunnyPoorCdn : ExtractorApi() {
                                 val decrypted = decryptAES(testChunk, keyBytes, targetIv)
                                 
                                 if (decrypted.size >= 377 && decrypted[0] == 0x47.toByte() && decrypted[188] == 0x47.toByte() && decrypted[376] == 0x47.toByte()) {
-                                    println("[TVWiki][v2.0] 정답 키 매칭 성공! Key: $hexKey")
                                     return@synchronized keyBytes
                                 }
                             }
                         } catch (e: Exception) {}
                     }
-                    println("[TVWiki][v2.0] 키 매칭 실패")
                     null
                 }
             } catch (e: Exception) { 
