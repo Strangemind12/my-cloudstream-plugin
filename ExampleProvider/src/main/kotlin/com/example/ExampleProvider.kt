@@ -2,6 +2,7 @@ package com.example
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.loadExtractor
 import org.jsoup.nodes.Element
 
 class ExampleProvider : MainAPI() { 
@@ -11,7 +12,6 @@ class ExampleProvider : MainAPI() {
     override var lang = "en"
     override val hasMainPage = true
 
-    // This finds movies on your home page
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         val document = app.get(mainUrl).document
         val home = document.select("div.movie-card, div.item").mapNotNull {
@@ -20,7 +20,6 @@ class ExampleProvider : MainAPI() {
         return newHomePageResponse(request.name, home)
     }
 
-    // This makes the search bar work
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/?s=$query"
         val document = app.get(url).document
@@ -29,7 +28,6 @@ class ExampleProvider : MainAPI() {
         }
     }
 
-    // Helper to turn your site's HTML into CloudStream data
     private fun Element.toSearchResult(): SearchResponse? {
         val title = this.selectFirst("h2, h3, .title")?.text() ?: return null
         val href = this.selectFirst("a")?.attr("href") ?: return null
@@ -39,7 +37,6 @@ class ExampleProvider : MainAPI() {
         }
     }
 
-    // This gets the video link when a user clicks a movie
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
