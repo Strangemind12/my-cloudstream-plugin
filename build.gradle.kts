@@ -13,8 +13,7 @@ buildscript {
     dependencies {
         classpath("com.android.tools.build:gradle:8.7.3")
         classpath("com.github.recloudstream:gradle:-SNAPSHOT")
-        // Force update to Kotlin 2.1.10 to handle 2.3.0 metadata
-        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.1.10")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.1.0")
     }
 }
 
@@ -52,7 +51,12 @@ subprojects {
         tasks.withType<KotlinJvmCompile> {
             compilerOptions {
                 jvmTarget.set(JvmTarget.JVM_1_8)
-                freeCompilerArgs.addAll("-Xno-call-assertions", "-Xno-param-assertions", "-Xno-receiver-assertions")
+                freeCompilerArgs.addAll(
+                    "-Xno-call-assertions",
+                    "-Xno-param-assertions",
+                    "-Xno-receiver-assertions",
+                    "-Xskip-metadata-version-check" // This forces the build to ignore the version error
+                )
             }
         }
     }
@@ -61,8 +65,7 @@ subprojects {
         val cloudstream by configurations
         val implementation by configurations
         cloudstream("com.lagradost:cloudstream3:pre-release")
-        // Match stdlib to 2.1.10
-        implementation(kotlin("stdlib", "2.1.10")) 
+        implementation(kotlin("stdlib")) 
         implementation("com.github.Blatzar:NiceHttp:0.4.11") 
         implementation("org.jsoup:jsoup:1.18.3") 
         implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.13.1") 
