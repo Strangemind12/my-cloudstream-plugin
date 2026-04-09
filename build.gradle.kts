@@ -13,8 +13,8 @@ buildscript {
     dependencies {
         classpath("com.android.tools.build:gradle:8.7.3")
         classpath("com.github.recloudstream:gradle:-SNAPSHOT")
-        // Fix: Updated Kotlin Gradle Plugin to 2.0.20
-        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.0.20")
+        // Force update to Kotlin 2.1.10 to handle 2.3.0 metadata
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.1.10")
     }
 }
 
@@ -61,8 +61,8 @@ subprojects {
         val cloudstream by configurations
         val implementation by configurations
         cloudstream("com.lagradost:cloudstream3:pre-release")
-        // Fix: Updated Kotlin stdlib to 2.0.20
-        implementation(kotlin("stdlib", "2.0.20")) 
+        // Match stdlib to 2.1.10
+        implementation(kotlin("stdlib", "2.1.10")) 
         implementation("com.github.Blatzar:NiceHttp:0.4.11") 
         implementation("org.jsoup:jsoup:1.18.3") 
         implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.13.1") 
