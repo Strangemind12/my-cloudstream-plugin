@@ -6,7 +6,7 @@ import com.lagradost.cloudstream3.utils.loadExtractor
 import org.jsoup.nodes.Element
 
 class ExampleProvider : MainAPI() { 
-    override var mainUrl = "https://lovable.app" 
+    override var mainUrl = "https://muviex.lovable.app/" 
     override var name = "Muviex"
     override val supportedTypes = setOf(TvType.Movie)
     override var lang = "en"
