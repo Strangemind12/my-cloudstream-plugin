@@ -1,22 +1,17 @@
 [
     {
-        "iconUrl": "https://upload.wikimedia.org/wikipedia/commons/2/2f/Korduene_Logo.png",
+                "iconUrl": "https://upload.wikimedia.org/wikipedia/commons/2/2f/Korduene_Logo.png",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/Strangemind12/my-cloudstream-plugin",
-        "fileSize": 11420,
+        "fileSize": 12500,
         "status": 1,
         "language": "en",
-        "authors": [
-            "Cloudburst",
-            "Luna712"
-        ],
-        "tvTypes": [
-            "Movie"
-        ],
-        "version": 1,
-        "internalName": "ExampleProvider",
-        "description": "Lorem ipsum",
+        "authors": ["DevTeam-2026"],
+        "tvTypes": ["Movie"],
+        "version": 2,
+        "internalName": "muvieX_EN",
+        "description": "Multi-Quality 1080p/720p/480p",
         "url": "https://raw.githubusercontent.com/Strangemind12/my-cloudstream-plugin/builds/muviex.lovable.app",
-        "name": "muvieX"
+        "name": "muvieX [English] "
     }
-]
+    
