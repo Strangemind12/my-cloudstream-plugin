@@ -1,7 +1,7 @@
 {
   "name": "My Custom Repo",
   "description": "My personal CloudStream extensions",
-  "manifestVersion": 1,
+  "manifestVersion": 2,
   "pluginLists": [
     "https://raw.githubusercontent.com/Strangemind12/my-cloudstream-plugin/builds/plugins.json"
   ]
