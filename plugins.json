@@ -16,7 +16,7 @@
         "version": 1,
         "internalName": "ExampleProvider",
         "description": "Lorem ipsum",
-        "url": "https://raw.githubusercontent.com/Strangemind12/my-cloudstream-plugin/builds/muviex.lovable.app"
+        "url": "https://raw.githubusercontent.com/Strangemind12/my-cloudstream-plugin/builds/muviex.lovable.app",
         "name": "muvieX"
     }
 ]
